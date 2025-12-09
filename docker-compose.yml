@@ -11,7 +11,7 @@ services:
       - NODE_ENV=production
       - PORT=3000
       - DATABASE_URL=postgresql://mevu_user:mevu_password@postgres:5432/mevu_db
-      - SWAGGER_BASE_URL=http://localhost:3000
+      - SWAGGER_BASE_URL=https://dev.api.mevu.com
     depends_on:
       - postgres
     restart: unless-stopped

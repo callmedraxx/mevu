@@ -205,7 +205,7 @@ export class SportsWebSocketService {
   /**
    * Handle incoming messages
    */
-  private handleMessage(message: SportsWebSocketMessage | SportsGameUpdate): void {
+  private async handleMessage(message: SportsWebSocketMessage | SportsGameUpdate): Promise<void> {
     // Check if this is a game update
     if ('gameId' in message && 'score' in message) {
       const gameUpdate = message as SportsGameUpdate;

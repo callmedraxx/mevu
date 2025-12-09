@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import logosRouter from './logos';
+import gamesRouter from './games';
+import teamsRouter from './teams';
 
 const router = Router();
 
@@ -30,5 +32,10 @@ router.get('/', (req, res) => {
 // Logo routes
 router.use('/logos', logosRouter);
 
-export default router;
+// Games routes (live games, SSE, frontend format)
+router.use('/games', gamesRouter);
 
+// Teams routes
+router.use('/teams', teamsRouter);
+
+export default router;

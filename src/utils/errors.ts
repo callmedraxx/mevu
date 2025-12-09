@@ -22,6 +22,11 @@ export enum ErrorCode {
   // Database errors
   DATABASE_ERROR = 'DATABASE_ERROR',
   DATABASE_CONNECTION_ERROR = 'DATABASE_CONNECTION_ERROR',
+  
+  // Cache errors
+  CACHE_ERROR = 'CACHE_ERROR',
+  CACHE_WRITE_FAILED = 'CACHE_WRITE_FAILED',
+  CACHE_READ_FAILED = 'CACHE_READ_FAILED',
 }
 
 /**
@@ -76,3 +81,11 @@ export class DatabaseError extends AppError {
   }
 }
 
+/**
+ * Cache error
+ */
+export class CacheError extends AppError {
+  constructor(code: ErrorCode, message: string, details?: any) {
+    super(code, message, 500, details);
+  }
+}

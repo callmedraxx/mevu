@@ -6,6 +6,11 @@ import swaggerJsdoc from 'swagger-jsdoc';
 import { swaggerOptions } from './config/swagger';
 import apiRouter from './routes';
 import { logoMappingService } from './services/espn/logo-mapping.service';
+import { liveGamesService } from './services/polymarket/live-games.service';
+import { teamsService } from './services/polymarket/teams.service';
+import { sportsWebSocketService } from './services/polymarket/sports-websocket.service';
+import { initializeProbabilityHistoryTable, cleanupOldProbabilityHistory } from './services/polymarket/probability-history.service';
+import { logger } from './config/logger';
 
 // Load environment variables
 dotenv.config();
@@ -59,11 +64,52 @@ app.get('/health', (req, res) => {
 // API routes
 app.use('/api', apiRouter);
 
+// Initialize services on startup
+async function initializeServices() {
+  try {
+    // Initialize probability history table
+    logger.info({ message: 'Initializing probability history table...' });
+    await initializeProbabilityHistoryTable();
+    
+    // Start live games polling service
+    logger.info({ message: 'Starting live games service...' });
+    liveGamesService.start();
+    
+    // Start sports WebSocket for live updates
+    logger.info({ message: 'Starting sports WebSocket service...' });
+    sportsWebSocketService.connect().catch((error) => {
+      logger.error({
+        message: 'Failed to connect sports WebSocket',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+    
+    // Set up periodic cleanup of old probability history (every 6 hours)
+    setInterval(() => {
+      cleanupOldProbabilityHistory(7).catch((error) => {
+        logger.error({
+          message: 'Error cleaning up probability history',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, 6 * 60 * 60 * 1000);
+    
+    logger.info({ message: 'Services initialized successfully' });
+  } catch (error) {
+    logger.error({
+      message: 'Error initializing services',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 // Start server
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
   console.log(`Swagger documentation available at http://localhost:${PORT}/api-docs`);
+  
+  // Initialize services after server starts
+  initializeServices();
 });
 
 export default app;
-

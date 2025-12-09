@@ -436,6 +436,65 @@ export class TeamsService {
   }
 
   /**
+   * Get team by abbreviation
+   * @param league - League name
+   * @param abbreviation - Team abbreviation (e.g., 'LAL', 'NYK')
+   * @returns Team or null if not found
+   */
+  async getTeamByAbbreviation(league: string, abbreviation: string): Promise<Team | null> {
+    if (useDatabase) {
+      return this.getTeamByAbbreviationFromDatabase(league, abbreviation);
+    } else {
+      return this.getTeamByAbbreviationFromMemory(league, abbreviation);
+    }
+  }
+
+  /**
+   * Get team by abbreviation from database
+   */
+  private async getTeamByAbbreviationFromDatabase(league: string, abbreviation: string): Promise<Team | null> {
+    const client = await pool.connect();
+
+    try {
+      const result = await client.query(
+        `SELECT id, name, league, record, logo, abbreviation, alias, 
+                provider_id as "providerId", color, 
+                api_created_at as "createdAt", api_updated_at as "updatedAt"
+         FROM teams 
+         WHERE LOWER(league) = LOWER($1) AND UPPER(abbreviation) = UPPER($2)
+         LIMIT 1`,
+        [league, abbreviation]
+      );
+
+      if (result.rows.length === 0) {
+        return null;
+      }
+
+      const team = result.rows[0] as Team;
+      return this.replaceLogoUrl(team);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Get team by abbreviation from memory
+   */
+  private getTeamByAbbreviationFromMemory(league: string, abbreviation: string): Team | null {
+    const leagueTeams = inMemoryTeams.get(league.toLowerCase());
+    if (!leagueTeams) return null;
+
+    const upperAbbr = abbreviation.toUpperCase();
+    for (const team of leagueTeams.values()) {
+      if (team.abbreviation.toUpperCase() === upperAbbr) {
+        return this.replaceLogoUrl(team);
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Refresh teams for a specific league
    * Fetches from API and updates storage
    * @param league - League name
