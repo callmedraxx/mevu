@@ -1,0 +1,28 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install all dependencies (including dev dependencies for build)
+RUN npm ci
+
+# Build TypeScript
+RUN npm run build
+
+# Remove dev dependencies
+RUN npm prune --production
+
+# Copy source code
+COPY . .
+
+# Build TypeScript
+RUN npm run build
+
+# Expose port
+EXPOSE 3000
+
+# Start the application
+CMD ["npm", "start"]
+
