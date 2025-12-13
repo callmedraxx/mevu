@@ -67,14 +67,15 @@ function formatLiquidity(value: number | undefined | null): string {
 }
 
 /**
- * Parse score string (e.g., "87-92") into individual scores
+ * Parse score string (e.g., "99-82") into individual scores
+ * Polymarket format: "home-away" (first number is home team score)
  */
 function parseScore(scoreStr: string | undefined): { home?: number; away?: number } {
   if (!scoreStr) return {};
   
   const parts = scoreStr.split('-').map(s => parseInt(s.trim(), 10));
   if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
-    return { away: parts[0], home: parts[1] };
+    return { home: parts[0], away: parts[1] };
   }
   return {};
 }
@@ -100,6 +101,40 @@ function formatGameTime(dateStr: string | undefined): string {
 }
 
 /**
+ * Format elapsed time for display
+ * Handles various formats: "7" (minutes), "0:42" (minutes:seconds), "15:50" (minutes:seconds)
+ * Returns consistent "M:SS" or "MM:SS" format
+ */
+function formatElapsedTime(elapsed: string | undefined): string | undefined {
+  if (!elapsed) return undefined;
+  
+  // If it already has a colon, assume it's in MM:SS format
+  if (elapsed.includes(':')) {
+    const parts = elapsed.split(':');
+    if (parts.length === 2) {
+      const minutes = parseInt(parts[0], 10);
+      const seconds = parseInt(parts[1], 10);
+      if (!isNaN(minutes) && !isNaN(seconds)) {
+        // Format as M:SS or MM:SS
+        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+      }
+    }
+    // If parsing fails, return as-is
+    return elapsed;
+  }
+  
+  // If it's just a number, assume it's minutes elapsed in the period
+  const numValue = parseInt(elapsed, 10);
+  if (!isNaN(numValue)) {
+    // Format as M:00 or MM:00
+    return `${numValue}:00`;
+  }
+  
+  // If we can't parse it, return as-is
+  return elapsed;
+}
+
+/**
  * Format period/quarter for display
  */
 function formatQuarter(period: string | undefined): string | undefined {
@@ -112,8 +147,19 @@ function formatQuarter(period: string | undefined): string | undefined {
   if (periodLower === 'q2' || periodLower === '2q' || periodLower === '2nd') return '2Q';
   if (periodLower === 'q3' || periodLower === '3q' || periodLower === '3rd') return '3Q';
   if (periodLower === 'q4' || periodLower === '4q' || periodLower === '4th') return '4Q';
+  
+  // Handle NHL periods (P1, P2, P3)
+  if (periodLower === 'p1' || periodLower === '1p' || periodLower === 'period 1') return 'P1';
+  if (periodLower === 'p2' || periodLower === '2p' || periodLower === 'period 2') return 'P2';
+  if (periodLower === 'p3' || periodLower === '3p' || periodLower === 'period 3') return 'P3';
+  
+  // Handle overtime
   if (periodLower === 'ot' || periodLower === 'overtime') return 'OT';
+  
+  // Handle halftime
   if (periodLower === 'ht' || periodLower === 'halftime' || periodLower === 'half') return 'HT';
+  
+  // Handle halves
   if (periodLower === '1h' || periodLower === '1st half') return '1H';
   if (periodLower === '2h' || periodLower === '2nd half') return '2H';
   
@@ -125,9 +171,44 @@ function formatQuarter(period: string | undefined): string | undefined {
  */
 function extractTeamsFromTitle(title: string): { home?: string; away?: string } {
   // Try "Team1 vs Team2" or "Team1 @ Team2" format
+  // Format: "Away vs Home" or "Away @ Home" -> team1 is away, team2 is home
   const vsMatch = title.match(/(.+?)\s+(?:vs\.?|@|at)\s+(.+?)(?:\s*[-–—]|$)/i);
   if (vsMatch) {
+    // For "vs" format: "Away vs Home" -> team1 is away, team2 is home
+    // For "@" format: "Away @ Home" -> team1 is away, team2 is home
     return { away: vsMatch[1].trim(), home: vsMatch[2].trim() };
+  }
+  
+  return {};
+}
+
+/**
+ * Extract team abbreviations from slug (format: sport-away-home-date)
+ * Returns { away: 'SEA', home: 'UTA' } for slug like 'nhl-sea-utah-2025-12-13'
+ */
+function extractAbbrevsFromSlug(slug: string | undefined): { away?: string; home?: string } {
+  if (!slug) return {};
+  
+  const slugParts = slug.split('-');
+  const teamAbbrevs: string[] = [];
+  
+  // Common sport identifiers to skip
+  const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+  
+  for (const part of slugParts) {
+    // Skip numbers (dates)
+    if (/^\d+$/.test(part)) continue;
+    // Skip sport identifier (first part is usually sport)
+    if (slugParts.indexOf(part) === 0 && sportIdentifiers.has(part.toLowerCase())) continue;
+    // Match team abbreviations (2-5 letters)
+    if (part.length >= 2 && part.length <= 5 && /^[a-z]+$/i.test(part)) {
+      teamAbbrevs.push(part.toUpperCase());
+    }
+  }
+  
+  if (teamAbbrevs.length >= 2) {
+    // Slug format: sport-away-home-date, so first team is away, second is home
+    return { away: teamAbbrevs[0], home: teamAbbrevs[1] };
   }
   
   return {};
@@ -367,6 +448,9 @@ export async function transformToFrontendGame(
   // Extract team names from title if no team data
   const titleTeams = extractTeamsFromTitle(game.title);
   
+  // Extract team abbreviations from slug as fallback (format: sport-away-home-date)
+  const slugAbbrevs = extractAbbrevsFromSlug(game.slug);
+  
   // Generate chart data based on home team's win probability
   // Use game.id as seed for consistent mock data (TODO: use real historical data)
   const chartData = generateChartData(prices.homeProb, game.id);
@@ -404,8 +488,8 @@ export async function transformToFrontendGame(
     time: formatGameTime(endDateStr), // Display-friendly time from endDate
     volume: formatVolume(game.totalVolume || game.volume),
     awayTeam: {
-      abbr: awayTeam?.abbreviation || game.teamIdentifiers?.away || titleTeams.away?.substring(0, 3).toUpperCase() || 'AWY',
-      name: awayTeam?.name || titleTeams.away || 'Away Team',
+      abbr: awayTeam?.abbreviation || slugAbbrevs.away || game.teamIdentifiers?.away?.substring(0, 3).toUpperCase() || titleTeams.away?.substring(0, 3).toUpperCase() || 'AWY',
+      name: awayTeam?.name || game.teamIdentifiers?.away || titleTeams.away || 'Away Team',
       record: awayTeam?.record || '0-0',
       probability: prices.awayProb,  // Raw YES probability (e.g., 35.5)
       buyPrice: prices.awayBuy,      // YES price rounded up (e.g., 36)
@@ -413,8 +497,8 @@ export async function transformToFrontendGame(
       score: game.live ? scores.away : undefined,
     },
     homeTeam: {
-      abbr: homeTeam?.abbreviation || game.teamIdentifiers?.home || titleTeams.home?.substring(0, 3).toUpperCase() || 'HME',
-      name: homeTeam?.name || titleTeams.home || 'Home Team',
+      abbr: homeTeam?.abbreviation || slugAbbrevs.home || game.teamIdentifiers?.home?.substring(0, 3).toUpperCase() || titleTeams.home?.substring(0, 3).toUpperCase() || 'HME',
+      name: homeTeam?.name || game.teamIdentifiers?.home || titleTeams.home || 'Home Team',
       record: homeTeam?.record || '0-0',
       probability: prices.homeProb,  // Raw YES probability (e.g., 64.5)
       buyPrice: prices.homeBuy,      // YES price rounded up (e.g., 65)
@@ -428,7 +512,7 @@ export async function transformToFrontendGame(
     spread: calculateSpread(prices.homeBuy, prices.homeSell),
     isLive: game.live,
     quarter: game.live ? formatQuarter(game.period) : undefined,
-    gameTime: game.live ? game.elapsed : undefined,
+    gameTime: game.live ? formatElapsedTime(game.elapsed) : undefined,
     sport: game.sport,
     league: game.league,
     slug: game.slug,

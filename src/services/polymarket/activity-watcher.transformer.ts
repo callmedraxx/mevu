@@ -1,0 +1,117 @@
+import { logger } from '../../config/logger';
+import { FrontendTeam, transformToFrontendGame } from './frontend-game.transformer';
+import { LiveGame } from './live-games.service';
+import { TransformedMarket, TransformedOutcome } from './polymarket.types';
+
+export interface ActivityWatcherOutcome {
+  label: string;
+  shortLabel?: string;
+  price: number;
+  probability: number;
+}
+
+export interface ActivityWatcherMarket {
+  id: string;
+  title: string;
+  volume: string;
+  liquidity: string;
+  outcomes: ActivityWatcherOutcome[];
+}
+
+export interface ActivityWatcherGame {
+  id: string;
+  slug?: string;
+  sport?: string;
+  league?: string;
+  homeTeam: FrontendTeam;
+  awayTeam: FrontendTeam;
+  markets: ActivityWatcherMarket[];
+}
+
+function formatCurrency(value: number | string | undefined | null): string {
+  const numeric = Number(value ?? 0);
+  if (!Number.isFinite(numeric)) return '$0';
+
+  if (numeric >= 1000000) {
+    return `$${(numeric / 1000000).toFixed(2)}M`;
+  }
+  if (numeric >= 1000) {
+    return `$${(numeric / 1000).toFixed(1)}k`;
+  }
+  return `$${numeric.toFixed(0)}`;
+}
+
+function deriveProbability(outcome: TransformedOutcome): number {
+  // Use probability if available
+  if (outcome.probability !== undefined && outcome.probability !== null) {
+    return Number(outcome.probability.toFixed(2));
+  }
+
+  // Fall back to price if probability not available
+  if (outcome.price !== undefined && outcome.price !== null) {
+    const price = Number(outcome.price);
+    if (Number.isFinite(price)) {
+      return Number(price.toFixed(2));
+    }
+  }
+
+  return 0;
+}
+
+function transformOutcome(outcome: TransformedOutcome): ActivityWatcherOutcome {
+  const probability = deriveProbability(outcome);
+  const price = Number(outcome.price || probability);
+
+  return {
+    label: outcome.label || 'Unknown',
+    shortLabel: outcome.shortLabel,
+    price: Number(price.toFixed(2)),
+    probability,
+  };
+}
+
+function simplifyMarket(market: TransformedMarket): ActivityWatcherMarket | null {
+  if (!market.structuredOutcomes || market.structuredOutcomes.length === 0) {
+    logger.warn({
+      message: 'Market has no structured outcomes',
+      marketId: market.id,
+    });
+    return null;
+  }
+
+  try {
+    const outcomes = market.structuredOutcomes.map(transformOutcome);
+
+    return {
+      id: market.id,
+      title: market.question || market.slug || market.id,
+      volume: formatCurrency(market.volume || market.volume24Hr || 0),
+      liquidity: formatCurrency(market.liquidity ?? 0),
+      outcomes,
+    };
+  } catch (error) {
+    logger.warn({
+      message: 'Failed to simplify market for activity watcher',
+      marketId: market.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+export async function transformToActivityWatcherGame(game: LiveGame): Promise<ActivityWatcherGame> {
+  const frontendGame = await transformToFrontendGame(game);
+  const markets = (game.markets || [])
+    .map(simplifyMarket)
+    .filter((m): m is ActivityWatcherMarket => m !== null);
+
+  return {
+    id: game.id,
+    slug: game.slug,
+    sport: game.sport,
+    league: game.league,
+    homeTeam: frontendGame.homeTeam,
+    awayTeam: frontendGame.awayTeam,
+    markets,
+  };
+}

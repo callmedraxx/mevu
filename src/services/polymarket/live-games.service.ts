@@ -164,6 +164,7 @@ export interface LiveGame extends Omit<TransformedEvent, 'createdAt' | 'updatedA
   elapsed?: string;
   live?: boolean;
   ended?: boolean;
+  periodScores?: Record<string, { home: number; away: number }>;
   homeTeam?: Team;
   awayTeam?: Team;
   teamIdentifiers?: {
@@ -299,9 +300,12 @@ function extractTeamsFromEvent(event: TransformedEvent): { home?: string; away?:
       const team2 = parts[1].trim().replace(/\s*\(.*?\)\s*$/, '');
       
       if (separator.includes('@') || separator.includes('at')) {
+        // "@" format: "Away @ Home" -> team1 is away, team2 is home
         return { away: team1, home: team2 };
       } else {
-        return { home: team1, away: team2 };
+        // "vs" format: "Away vs Home" -> team1 is away, team2 is home
+        // This matches the slug format: sport-away-home-date
+        return { away: team1, home: team2 };
       }
     }
   }
@@ -310,14 +314,22 @@ function extractTeamsFromEvent(event: TransformedEvent): { home?: string; away?:
   const slugParts = slug.split('-');
   const teamAbbrevs: string[] = [];
   
+  // Common sport identifiers to skip
+  const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+  
   for (const part of slugParts) {
+    // Skip numbers
     if (/^\d+$/.test(part)) continue;
+    // Skip sport identifier (first part is usually sport)
+    if (slugParts.indexOf(part) === 0 && sportIdentifiers.has(part.toLowerCase())) continue;
+    // Match team abbreviations (2-5 letters)
     if (part.length >= 2 && part.length <= 5 && /^[a-z]+$/i.test(part)) {
       teamAbbrevs.push(part.toUpperCase());
     }
   }
   
   if (teamAbbrevs.length >= 2) {
+    // Slug format: sport-away-home-date, so first team is away, second is home
     return { away: teamAbbrevs[0], home: teamAbbrevs[1] };
   }
   
@@ -887,12 +899,26 @@ export async function getLiveGameById(id: string): Promise<LiveGame | null> {
   }
 }
 
+export async function getLiveGameBySlug(slug: string): Promise<LiveGame | null> {
+  if (!slug) return null;
+  const target = slug.toLowerCase();
+  const games = await getAllLiveGames();
+  
+  return games.find((game) => {
+    const slugMatch = game.slug && game.slug.toLowerCase() === target;
+    const tickerMatch = game.ticker && game.ticker.toLowerCase() === target;
+    const idMatch = game.id.toLowerCase() === target;
+    const rawSlugMatch = game.rawData?.slug && String(game.rawData.slug).toLowerCase() === target;
+    return slugMatch || tickerMatch || idMatch || rawSlugMatch;
+  }) || null;
+}
+
 async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null> {
   const client = await pool.connect();
   
   try {
     const result = await client.query(
-      `SELECT transformed_data, raw_data FROM live_games WHERE id = $1`,
+      `SELECT transformed_data, raw_data, period_scores FROM live_games WHERE id = $1`,
       [id]
     );
     
@@ -905,11 +931,28 @@ async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null>
         : row.transformed_data;
       if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
       if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
+      
+      // Add period_scores from database if available
+      if (row.period_scores) {
+        game.periodScores = typeof row.period_scores === 'string'
+          ? JSON.parse(row.period_scores)
+          : row.period_scores;
+      }
+      
       return game as LiveGame;
     }
     
     const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
-    return { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
+    const game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
+    
+    // Add period_scores from database if available
+    if (row.period_scores) {
+      game.periodScores = typeof row.period_scores === 'string'
+        ? JSON.parse(row.period_scores)
+        : row.period_scores;
+    }
+    
+    return game;
   } finally {
     client.release();
   }
@@ -920,7 +963,7 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
   
   try {
     const result = await client.query(
-      `SELECT transformed_data, raw_data FROM live_games
+      `SELECT transformed_data, raw_data, period_scores FROM live_games
        WHERE active = true AND closed = false AND (ended = false OR ended IS NULL)
          AND (end_date IS NULL OR DATE(end_date) >= CURRENT_DATE)
       ORDER BY volume_24hr DESC NULLS LAST, created_at DESC`
@@ -933,12 +976,41 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
           : row.transformed_data;
         if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
         if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
+        
+        // Add period_scores from database if available
+        if (row.period_scores) {
+          game.periodScores = typeof row.period_scores === 'string'
+            ? JSON.parse(row.period_scores)
+            : row.period_scores;
+        }
+        
         return game as LiveGame;
       }
       
       const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
-      return { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
+      const game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
+      
+      // Add period_scores from database if available
+      if (row.period_scores) {
+        game.periodScores = typeof row.period_scores === 'string'
+          ? JSON.parse(row.period_scores)
+          : row.period_scores;
+      }
+      
+      return game;
     });
+  } catch (error) {
+    // If table doesn't exist, return empty array to trigger auto-population
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (errorMessage.includes('does not exist') || (errorMessage.includes('relation') && errorMessage.includes('live_games'))) {
+      logger.warn({
+        message: 'live_games table does not exist, will trigger auto-population',
+        error: errorMessage,
+      });
+      return [];
+    }
+    // Re-throw other errors
+    throw error;
   } finally {
     client.release();
   }
@@ -964,11 +1036,106 @@ export async function updateGameByGameId(gameId: number, updates: Partial<LiveGa
   }
 }
 
+/**
+ * Normalize period string to a consistent key format
+ * Q1, Q2, Q3, Q4 -> q1, q2, q3, q4
+ * P1, P2, P3 -> p1, p2, p3
+ * 1H, 2H -> 1h, 2h
+ * OT -> ot
+ */
+function normalizePeriodKey(period: string | undefined): string | null {
+  if (!period) return null;
+  
+  const periodLower = period.toLowerCase().trim();
+  
+  // Handle quarters (NBA, NFL)
+  if (periodLower === 'q1' || periodLower === '1q' || periodLower === '1st') return 'q1';
+  if (periodLower === 'q2' || periodLower === '2q' || periodLower === '2nd') return 'q2';
+  if (periodLower === 'q3' || periodLower === '3q' || periodLower === '3rd') return 'q3';
+  if (periodLower === 'q4' || periodLower === '4q' || periodLower === '4th') return 'q4';
+  
+  // Handle periods (NHL)
+  if (periodLower === 'p1' || periodLower === '1p' || periodLower === 'period 1') return 'p1';
+  if (periodLower === 'p2' || periodLower === '2p' || periodLower === 'period 2') return 'p2';
+  if (periodLower === 'p3' || periodLower === '3p' || periodLower === 'period 3') return 'p3';
+  
+  // Handle halves (Soccer)
+  if (periodLower === '1h' || periodLower === '1st half' || periodLower === 'first half') return '1h';
+  if (periodLower === '2h' || periodLower === '2nd half' || periodLower === 'second half') return '2h';
+  
+  // Handle overtime
+  if (periodLower === 'ot' || periodLower === 'overtime') return 'ot';
+  
+  // Return lowercase version if no match
+  return periodLower;
+}
+
+/**
+ * Parse score string (e.g., "99-82") into individual scores
+ * Polymarket format: "home-away" (first number is home team score)
+ */
+function parseScoreString(scoreStr: string | undefined): { home: number; away: number } | null {
+  if (!scoreStr) return null;
+  
+  const parts = scoreStr.split('-').map(s => parseInt(s.trim(), 10));
+  if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+    return { home: parts[0], away: parts[1] };
+  }
+  return null;
+}
+
+/**
+ * Calculate period scores from current total and previous period scores
+ */
+function calculatePeriodScores(
+  currentScore: { home: number; away: number },
+  currentPeriod: string,
+  previousPeriodScores: Record<string, { home: number; away: number }> | null
+): Record<string, { home: number; away: number }> {
+  const periodKey = normalizePeriodKey(currentPeriod);
+  if (!periodKey) return previousPeriodScores || {};
+  
+  // If period already exists, don't recalculate (period score is final when period ends)
+  if (previousPeriodScores && previousPeriodScores[periodKey]) {
+    return previousPeriodScores;
+  }
+  
+  // Calculate sum of previous periods
+  let previousHomeTotal = 0;
+  let previousAwayTotal = 0;
+  
+  if (previousPeriodScores) {
+    for (const periodScore of Object.values(previousPeriodScores)) {
+      previousHomeTotal += periodScore.home;
+      previousAwayTotal += periodScore.away;
+    }
+  }
+  
+  // Current period score = current total - sum of previous periods
+  const periodScore = {
+    home: currentScore.home - previousHomeTotal,
+    away: currentScore.away - previousAwayTotal,
+  };
+  
+  // Only add if scores are non-negative (sanity check)
+  if (periodScore.home >= 0 && periodScore.away >= 0) {
+    return {
+      ...(previousPeriodScores || {}),
+      [periodKey]: periodScore,
+    };
+  }
+  
+  return previousPeriodScores || {};
+}
+
 async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<LiveGame>): Promise<void> {
   const client = await pool.connect();
   
   try {
-    const findResult = await client.query('SELECT id, transformed_data FROM live_games WHERE game_id = $1', [gameId]);
+    const findResult = await client.query(
+      'SELECT id, transformed_data, period, score, period_scores FROM live_games WHERE game_id = $1',
+      [gameId]
+    );
     
     if (findResult.rows.length === 0) return;
     
@@ -978,6 +1145,32 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
           ? JSON.parse(findResult.rows[0].transformed_data) 
           : findResult.rows[0].transformed_data)
       : {};
+    
+    const previousPeriod = findResult.rows[0].period;
+    const previousScore = findResult.rows[0].score;
+    const previousPeriodScores = findResult.rows[0].period_scores 
+      ? (typeof findResult.rows[0].period_scores === 'string'
+          ? JSON.parse(findResult.rows[0].period_scores)
+          : findResult.rows[0].period_scores)
+      : null;
+    
+    // Check if period changed
+    const periodChanged = updates.period !== undefined && updates.period !== previousPeriod;
+    const scoreChanged = updates.score !== undefined && updates.score !== previousScore;
+    
+    // Calculate period scores if period or score changed
+    let newPeriodScores = previousPeriodScores;
+    if ((periodChanged || scoreChanged) && updates.score && updates.period && updates.period !== 'NS') {
+      const currentScore = parseScoreString(updates.score);
+      if (currentScore) {
+        newPeriodScores = calculatePeriodScores(
+          currentScore,
+          updates.period,
+          previousPeriodScores
+        );
+        updates.periodScores = newPeriodScores;
+      }
+    }
     
     const updated = { ...current, ...updates, updatedAt: new Date() };
     
@@ -992,6 +1185,10 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
     if (updates.ended !== undefined) { updateFields.push(`ended = $${paramIndex++}`); values.push(updates.ended); }
     if (updates.active !== undefined) { updateFields.push(`active = $${paramIndex++}`); values.push(updates.active); }
     if (updates.closed !== undefined) { updateFields.push(`closed = $${paramIndex++}`); values.push(updates.closed); }
+    if (newPeriodScores !== null) {
+      updateFields.push(`period_scores = $${paramIndex++}`);
+      values.push(JSON.stringify(newPeriodScores));
+    }
     
     updateFields.push(`transformed_data = $${paramIndex++}`);
     values.push(JSON.stringify(updated));
@@ -1001,6 +1198,9 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
     await client.query(`UPDATE live_games SET ${updateFields.join(', ')} WHERE id = $${paramIndex}`, values);
     
     const updatedGame = updated as LiveGame;
+    if (newPeriodScores) {
+      updatedGame.periodScores = newPeriodScores;
+    }
     gamesCache.set(eventId, updatedGame);
     
     if (liveGamesService) {
@@ -1014,6 +1214,24 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
 function updateGameByGameIdInMemory(gameId: number, updates: Partial<LiveGame>): void {
   for (const [eventId, game] of inMemoryGames.entries()) {
     if (game.gameId === gameId) {
+      // Check if period changed
+      const periodChanged = updates.period !== undefined && updates.period !== game.period;
+      const scoreChanged = updates.score !== undefined && updates.score !== game.score;
+      
+      // Calculate period scores if period or score changed
+      let newPeriodScores = game.periodScores;
+      if ((periodChanged || scoreChanged) && updates.score && updates.period && updates.period !== 'NS') {
+        const currentScore = parseScoreString(updates.score);
+        if (currentScore) {
+          newPeriodScores = calculatePeriodScores(
+            currentScore,
+            updates.period,
+            game.periodScores || null
+          );
+          updates.periodScores = newPeriodScores;
+        }
+      }
+      
       const updatedGame = { ...game, ...updates, updatedAt: new Date() };
       inMemoryGames.set(eventId, updatedGame);
       
@@ -1137,8 +1355,8 @@ export function getInMemoryStats(): { count: number; games: LiveGame[] } {
 export class LiveGamesService {
   private pollingInterval: NodeJS.Timeout | null = null;
   private isRunning: boolean = false;
-  private sseBroadcastCallback: ((games: LiveGame[]) => void) | null = null;
-  private ssePartialBroadcastCallback: ((game: LiveGame) => void) | null = null;
+  private sseBroadcastCallbacks: Set<(games: LiveGame[]) => void> = new Set();
+  private ssePartialBroadcastCallbacks: Set<(game: LiveGame) => void> = new Set();
 
   start(): void {
     if (this.isRunning) return;
@@ -1177,11 +1395,19 @@ export class LiveGamesService {
   }
 
   setSSEBroadcastCallback(callback: (games: LiveGame[]) => void): void {
-    this.sseBroadcastCallback = callback;
+    this.sseBroadcastCallbacks.add(callback);
+  }
+
+  addSSEBroadcastCallback(callback: (games: LiveGame[]) => void): void {
+    this.sseBroadcastCallbacks.add(callback);
   }
 
   setSSEPartialBroadcastCallback(callback: (game: LiveGame) => void): void {
-    this.ssePartialBroadcastCallback = callback;
+    this.ssePartialBroadcastCallbacks.add(callback);
+  }
+
+  addSSEPartialBroadcastCallback(callback: (game: LiveGame) => void): void {
+    this.ssePartialBroadcastCallbacks.add(callback);
   }
 
   getStatus(): { isRunning: boolean; intervalMinutes: number } {
@@ -1189,14 +1415,28 @@ export class LiveGamesService {
   }
 
   broadcastUpdate(games: LiveGame[]): void {
-    if (this.sseBroadcastCallback) {
-      this.sseBroadcastCallback(games);
+    for (const callback of this.sseBroadcastCallbacks) {
+      try {
+        callback(games);
+      } catch (error) {
+        logger.warn({
+          message: 'Error in SSE broadcast callback',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   }
 
   broadcastPartialUpdate(game: LiveGame): void {
-    if (this.ssePartialBroadcastCallback) {
-      this.ssePartialBroadcastCallback(game);
+    for (const callback of this.ssePartialBroadcastCallbacks) {
+      try {
+        callback(game);
+      } catch (error) {
+        logger.warn({
+          message: 'Error in SSE partial broadcast callback',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   }
 }
