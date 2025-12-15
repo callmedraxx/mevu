@@ -13,6 +13,7 @@ import {
 } from '../services/polymarket/live-games.service';
 import { sportsWebSocketService } from '../services/polymarket/sports-websocket.service';
 import { gamesWebSocketService } from '../services/polymarket/games-websocket.service';
+import { clobPriceUpdateService } from '../services/polymarket/clob-price-update.service';
 import { getProbabilityHistoryStats } from '../services/polymarket/probability-history.service';
 import { transformToFrontendGames, transformToFrontendGame, FrontendGame } from '../services/polymarket/frontend-game.transformer';
 import { teamsService } from '../services/polymarket/teams.service';
@@ -304,6 +305,7 @@ router.get('/status', async (req: Request, res: Response) => {
   const liveGamesStatus = liveGamesService.getStatus();
   const webSocketStatus = sportsWebSocketService.getStatus();
   const gamesWsStatus = gamesWebSocketService.getStatus();
+  const clobPriceStatus = clobPriceUpdateService.getStatus();
   const probHistoryStats = await getProbabilityHistoryStats();
   
   res.json({
@@ -314,6 +316,7 @@ router.get('/status', async (req: Request, res: Response) => {
     },
     webSocket: webSocketStatus,
     gamesWebSocket: gamesWsStatus,
+    clobPriceUpdate: clobPriceStatus,
     probabilityHistory: probHistoryStats,
   });
 });

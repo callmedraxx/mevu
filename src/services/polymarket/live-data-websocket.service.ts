@@ -47,17 +47,17 @@ export class LiveDataWebSocketService {
       });
       return;
     }
-
+// 
     // Reset state for new connection
     this.isConnecting = true;
     this.isConnected = false;
     this.reconnectAttempts = 0;
-
+// 
     try {
-      logger.info({
-        message: 'Connecting to Live Data WebSocket',
-        url: LIVE_DATA_WS_URL,
-      });
+      // logger.info({
+      //   message: 'Connecting to Live Data WebSocket',
+      //   url: LIVE_DATA_WS_URL,
+      // });
 
       this.ws = new WebSocket(LIVE_DATA_WS_URL, {
         headers: {
@@ -76,7 +76,7 @@ export class LiveDataWebSocketService {
       throw error;
     }
   }
-
+// 
   /**
    * Setup WebSocket event handlers
    */
@@ -87,15 +87,15 @@ export class LiveDataWebSocketService {
       this.isConnecting = false;
       this.isConnected = true;
       this.reconnectAttempts = 0;
-      
-      logger.info({
-        message: 'Live Data WebSocket connected',
-        url: LIVE_DATA_WS_URL,
-      });
 
-      logger.info({
-        message: 'Waiting for connection_id and ready to subscribe...',
-      });
+      // logger.info({
+      //   message: 'Live Data WebSocket connected',
+      //   url: LIVE_DATA_WS_URL,
+      // });
+
+      // logger.info({
+      //   message: 'Waiting for connection_id and ready to subscribe...',
+      // });
     });
 
     this.ws.on('message', (data: WebSocket.Data) => {
@@ -124,15 +124,15 @@ export class LiveDataWebSocketService {
       this.isConnecting = false;
 
       const reasonStr = reason.length > 0 ? reason.toString() : 'No reason provided';
-      
-      logger.warn({
-        message: 'Live Data WebSocket closed',
-        code,
-        reason: reasonStr,
-        codeMeaning: this.getCloseCodeMeaning(code),
-        reconnectAttempts: this.reconnectAttempts,
-      });
-    });
+
+    //   logger.warn({
+    //     message: 'Live Data WebSocket closed',
+    //     code,
+    //     reason: reasonStr,
+    //     codeMeaning: this.getCloseCodeMeaning(code),
+    //     reconnectAttempts: this.reconnectAttempts,
+    //   });
+     });
 
     this.ws.on('ping', (data: Buffer) => {
       logger.debug({
@@ -162,7 +162,7 @@ export class LiveDataWebSocketService {
   private parseMessage(data: WebSocket.Data): LiveDataMessage {
     // Handle different data types
     let rawString: string;
-    
+
     if (Buffer.isBuffer(data)) {
       rawString = data.toString('utf8');
     } else if (typeof data === 'string') {
@@ -172,12 +172,12 @@ export class LiveDataWebSocketService {
     } else {
       rawString = String(data);
     }
-    
+
     // Check if it's a PING message (text)
     if (rawString === 'PING' || rawString.trim() === 'PING') {
-      logger.debug({
-        message: 'Received PING text message from Live Data server',
-      });
+      // logger.debug({
+      //   message: 'Received PING text message from Live Data server',
+      // });
       // Respond with PONG
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send('PONG');
@@ -190,7 +190,7 @@ export class LiveDataWebSocketService {
         raw: rawString,
       };
     }
-    
+
     // Try to parse as JSON
     try {
       const parsed = JSON.parse(rawString);
@@ -219,32 +219,32 @@ export class LiveDataWebSocketService {
     // Extract connection_id if present
     if (message.connection_id) {
       this.connectionId = message.connection_id;
-      logger.info({
-        message: 'Received connection_id',
-        connectionId: this.connectionId,
-      });
+      // logger.info({
+      //   message: 'Received connection_id',
+      //   connectionId: this.connectionId,
+      // });
     }
 
     // Log the message with details
-    logger.info({
-      message: 'Live Data WebSocket message received',
-      topic: message.topic,
-      type: message.type,
-      connectionId: message.connection_id,
-      hasPayload: !!message.payload,
-      payloadKeys: message.payload ? Object.keys(message.payload) : [],
-      timestamp: message.timestamp,
-    });
+    // logger.info({
+    //   message: 'Live Data WebSocket message received',
+    //   topic: message.topic,
+    //   type: message.type,
+    //   connectionId: message.connection_id,
+    //   hasPayload: !!message.payload,
+    //   payloadKeys: message.payload ? Object.keys(message.payload) : [],
+    //   timestamp: message.timestamp,
+    // });
 
     // Log payload details if it's an orders_matched event
-    if (message.topic === 'activity' && message.type === 'orders_matched' && message.payload) {
-      this.logOrdersMatched(message.payload as LiveDataOrdersMatched);
-    }
+    // if (message.topic === 'activity' && message.type === 'orders_matched' && message.payload) {
+    //   this.logOrdersMatched(message.payload as LiveDataOrdersMatched);
+    // }
   }
 
-  /**
-   * Log orders matched details
-   */
+  // /**
+  //  * Log orders matched details
+  //  */
   private logOrdersMatched(payload: LiveDataOrdersMatched): void {
     logger.info({
       message: 'Order matched',
@@ -273,11 +273,11 @@ export class LiveDataWebSocketService {
     }
 
     const messageString = typeof message === 'string' ? message : JSON.stringify(message);
-    
-    logger.info({
-      message: 'Sending message to Live Data WebSocket',
-      messageString: messageString,
-    });
+
+    // logger.info({
+    //   message: 'Sending message to Live Data WebSocket',
+    //   messageString: messageString,
+    // });
 
     this.ws.send(messageString);
   }
@@ -301,10 +301,10 @@ export class LiveDataWebSocketService {
       subscriptions: subscriptions,
     };
 
-    logger.info({
-      message: 'Subscribing to topics',
-      subscriptions: subscriptions.map(s => ({ topic: s.topic, type: s.type })),
-    });
+    // logger.info({
+    //   message: 'Subscribing to topics',
+    //   subscriptions: subscriptions.map(s => ({ topic: s.topic, type: s.type })),
+    // });
 
     this.send(subscribeMessage);
   }
@@ -403,9 +403,9 @@ export class LiveDataWebSocketService {
    */
   clearHistory(): void {
     this.messageHistory = [];
-    logger.info({
-      message: 'Live Data message history cleared',
-    });
+    // logger.info({
+    //   message: 'Live Data message history cleared',
+    // });
   }
 
   /**
@@ -433,7 +433,7 @@ export class LiveDataWebSocketService {
     return codes[code] || `Unknown code: ${code}`;
   }
 }
-
+// 
 // Export singleton instance
 export const liveDataWebSocketService = new LiveDataWebSocketService();
-
+// 

@@ -53,6 +53,10 @@ const swaggerDefinition: SwaggerDefinition = {
       name: 'LiveStats',
       description: 'Live stats widget endpoints - fetch period scores and live game statistics',
     },
+    {
+      name: 'Users',
+      description: 'User registration, proxy wallet deployment, and token approvals for Polymarket trading',
+    },
   ],
   components: {
     schemas: {
@@ -264,7 +268,14 @@ const swaggerDefinition: SwaggerDefinition = {
   },
 };
 
+// Determine which files to scan based on environment
+// In production (Docker), files are compiled to dist/, in development they're in src/
+const isProduction = process.env.NODE_ENV === 'production';
+const apiPaths = isProduction
+  ? ['./dist/routes/*.js', './dist/index.js']
+  : ['./src/routes/*.ts', './src/index.ts'];
+
 export const swaggerOptions = {
   definition: swaggerDefinition,
-  apis: ['./src/routes/*.ts', './src/index.ts'],
+  apis: apiPaths,
 };

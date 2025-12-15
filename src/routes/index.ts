@@ -7,6 +7,8 @@ import tradesRouter from './trades';
 import holdersRouter from './holders';
 import whaleWatcherRouter from './whale-watcher';
 import liveStatsRouter from './live-stats';
+import usersRouter from './users';
+import walletsRouter from './wallets';
 
 const router = Router();
 
@@ -57,5 +59,11 @@ router.use('/live-stats', liveStatsRouter);
 
 // Teams routes
 router.use('/teams', teamsRouter);
+
+// Users routes (registration, wallet deployment, token approvals)
+router.use('/users', usersRouter);
+
+// Wallets routes (wallet creation)
+router.use('/wallets', walletsRouter);
 
 export default router;

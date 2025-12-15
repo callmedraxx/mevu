@@ -9,6 +9,8 @@ import apiRouter from './routes';
 import { logoMappingService } from './services/espn/logo-mapping.service';
 import { liveGamesService } from './services/polymarket/live-games.service';
 import { teamsService } from './services/polymarket/teams.service';
+import { privyService } from './services/privy/privy.service';
+import { initializeUsersTable } from './services/privy/user.service';
 import { teamsRefreshService } from './services/polymarket/teams-refresh.service';
 import { sportsWebSocketService } from './services/polymarket/sports-websocket.service';
 import { gamesWebSocketService } from './services/polymarket/games-websocket.service';
@@ -70,38 +72,46 @@ app.use('/api', apiRouter);
 // Initialize services on startup
 async function initializeServices() {
   try {
+    // Initialize Privy service
+    logger.info({ message: 'Initializing Privy service...' });
+    privyService.initialize();
+    
+    // Initialize users table
+    logger.info({ message: 'Initializing users table...' });
+    await initializeUsersTable();
+    
     // Initialize probability history table
-    logger.info({ message: 'Initializing probability history table...' });
+    // logger.info({ message: 'Initializing probability history table...' });
     await initializeProbabilityHistoryTable();
     
     // Start live games polling service
-    logger.info({ message: 'Starting live games service...' });
+    // logger.info({ message: 'Starting live games service...' });
     liveGamesService.start();
     
     // Start teams refresh service
-    logger.info({ message: 'Starting teams refresh service...' });
+    // logger.info({ message: 'Starting teams refresh service...' });
     teamsRefreshService.start();
     
     // Start sports WebSocket for live updates
-    logger.info({ message: 'Starting sports WebSocket service...' });
+    // logger.info({ message: 'Starting sports WebSocket service...' });
     sportsWebSocketService.connect().catch((error) => {
-      logger.error({
-        message: 'Failed to connect sports WebSocket',
-        error: error instanceof Error ? error.message : String(error),
-      });
+      // logger.error({
+      //   message: 'Failed to connect sports WebSocket',
+      //   error: error instanceof Error ? error.message : String(error),
+      // });
     });
     
     // Set up periodic cleanup of old probability history (every 6 hours)
     setInterval(() => {
       cleanupOldProbabilityHistory(7).catch((error) => {
-        logger.error({
-          message: 'Error cleaning up probability history',
-          error: error instanceof Error ? error.message : String(error),
-        });
+        // logger.error({
+        //   message: 'Error cleaning up probability history',
+        //   error: error instanceof Error ? error.message : String(error),
+        // });
       });
     }, 6 * 60 * 60 * 1000);
     
-    logger.info({ message: 'Services initialized successfully' });
+    // logger.info({ message: 'Services initialized successfully' });
   } catch (error) {
     logger.error({
       message: 'Error initializing services',
@@ -118,29 +128,29 @@ server.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
   console.log(`Swagger documentation available at http://localhost:${PORT}/api-docs`);
   console.log(`WebSocket available at ws://localhost:${PORT}/ws/games`);
-  
+
   // Initialize WebSocket service with HTTP server
   gamesWebSocketService.initialize(server, '/ws/games');
-  
+
   // Initialize other services after server starts
   initializeServices();
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  logger.info({ message: 'SIGTERM received, shutting down gracefully' });
+  // logger.info({ message: 'SIGTERM received, shutting down gracefully' });
   gamesWebSocketService.shutdown();
   server.close(() => {
-    logger.info({ message: 'HTTP server closed' });
+    // logger.info({ message: 'HTTP server closed' });
     process.exit(0);
   });
 });
 
 process.on('SIGINT', () => {
-  logger.info({ message: 'SIGINT received, shutting down gracefully' });
+  // logger.info({ message: 'SIGINT received, shutting down gracefully' });
   gamesWebSocketService.shutdown();
   server.close(() => {
-    logger.info({ message: 'HTTP server closed' });
+    // logger.info({ message: 'HTTP server closed' });
     process.exit(0);
   });
 });

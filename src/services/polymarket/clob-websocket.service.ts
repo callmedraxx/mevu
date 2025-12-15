@@ -18,17 +18,18 @@ export class ClobWebSocketService {
   private orderBookUpdates: ClobOrderBookUpdate[] = [];
   private maxHistorySize: number = 100;
   private maxOrderBookHistory: number = 50;
+  private orderBookUpdateCallbacks: Set<(updates: ClobOrderBookUpdate[]) => void> = new Set();
 
   /**
    * Connect to the CLOB WebSocket endpoint
    */
   async connect(): Promise<void> {
     if (this.isConnecting || this.isConnected) {
-      logger.warn({
-        message: 'WebSocket already connecting or connected',
-        isConnecting: this.isConnecting,
-        isConnected: this.isConnected,
-      });
+      // logger.warn({
+//         message: 'WebSocket already connecting or connected',
+//         isConnecting: this.isConnecting,
+//         isConnected: this.isConnected,
+//       });
       return;
     }
 
@@ -38,10 +39,10 @@ export class ClobWebSocketService {
     this.reconnectAttempts = 0;
 
     try {
-      logger.info({
-        message: 'Connecting to CLOB WebSocket',
-        url: CLOB_WS_URL,
-      });
+      // logger.info({
+//         message: 'Connecting to CLOB WebSocket',
+//         url: CLOB_WS_URL,
+//       });
 
       this.ws = new WebSocket(CLOB_WS_URL, {
         headers: {
@@ -53,10 +54,10 @@ export class ClobWebSocketService {
       this.setupEventHandlers();
     } catch (error) {
       this.isConnecting = false;
-      logger.error({
-        message: 'Failed to create WebSocket connection',
-        error: error instanceof Error ? error.message : String(error),
-      });
+      // logger.error({
+//         message: 'Failed to create WebSocket connection',
+//         error: error instanceof Error ? error.message : String(error),
+//       });
       throw error;
     }
   }
@@ -72,15 +73,15 @@ export class ClobWebSocketService {
       this.isConnected = true;
       this.reconnectAttempts = 0;
       
-      logger.info({
-        message: 'CLOB WebSocket connected',
-        url: CLOB_WS_URL,
-      });
+      // logger.info({
+//         message: 'CLOB WebSocket connected',
+//         url: CLOB_WS_URL,
+//       });
 
       // Log that we're ready to receive messages
-      logger.info({
-        message: 'Waiting for initial messages from server...',
-      });
+      // logger.info({
+//         message: 'Waiting for initial messages from server...',
+//       });
     });
 
     this.ws.on('message', (data: WebSocket.Data) => {
@@ -88,20 +89,20 @@ export class ClobWebSocketService {
         const message = this.parseMessage(data);
         this.handleMessage(message);
       } catch (error) {
-        logger.error({
-          message: 'Error parsing WebSocket message',
-          error: error instanceof Error ? error.message : String(error),
-          rawData: data.toString().substring(0, 500), // Log first 500 chars
-        });
+        // logger.error({
+//           message: 'Error parsing WebSocket message',
+//           error: error instanceof Error ? error.message : String(error),
+//           rawData: data.toString().substring(0, 500), // Log first 500 chars
+//         });
       }
     });
 
     this.ws.on('error', (error: Error) => {
-      logger.error({
-        message: 'CLOB WebSocket error',
-        error: error.message,
-        stack: error.stack,
-      });
+      // logger.error({
+//         message: 'CLOB WebSocket error',
+//         error: error.message,
+//         stack: error.stack,
+//       });
     });
 
     this.ws.on('close', (code: number, reason: Buffer) => {
@@ -110,13 +111,13 @@ export class ClobWebSocketService {
 
       const reasonStr = reason.length > 0 ? reason.toString() : 'No reason provided';
       
-      logger.warn({
-        message: 'CLOB WebSocket closed',
-        code,
-        reason: reasonStr,
-        codeMeaning: this.getCloseCodeMeaning(code),
-        reconnectAttempts: this.reconnectAttempts,
-      });
+      // logger.warn({
+//         message: 'CLOB WebSocket closed',
+//         code,
+//         reason: reasonStr,
+//         codeMeaning: this.getCloseCodeMeaning(code),
+//         reconnectAttempts: this.reconnectAttempts,
+//       });
 
       // Don't auto-reconnect during testing - let the test script handle it
       // Attempt to reconnect if not a normal closure
@@ -126,24 +127,24 @@ export class ClobWebSocketService {
     });
 
     this.ws.on('ping', (data: Buffer) => {
-      logger.debug({
-        message: 'Received ping from server',
-        data: data.toString(),
-      });
+      // logger.debug({
+//         message: 'Received ping from server',
+//         data: data.toString(),
+//       });
       // Respond to ping with pong
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.pong(data);
-        logger.debug({
-          message: 'Sent pong response to server',
-        });
+        // logger.debug({
+//           message: 'Sent pong response to server',
+//         });
       }
     });
 
     this.ws.on('pong', (data: Buffer) => {
-      logger.debug({
-        message: 'Received pong from server',
-        data: data.toString(),
-      });
+      // logger.debug({
+//         message: 'Received pong from server',
+//         data: data.toString(),
+//       });
     });
   }
 
@@ -166,15 +167,15 @@ export class ClobWebSocketService {
     
     // Check if it's a PING message (text)
     if (rawString === 'PING' || rawString.trim() === 'PING') {
-      logger.debug({
-        message: 'Received PING text message from server',
-      });
+      // logger.debug({
+//         message: 'Received PING text message from server',
+//       });
       // Respond with PONG
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send('PONG');
-        logger.debug({
-          message: 'Sent PONG response to server',
-        });
+        // logger.debug({
+//           message: 'Sent PONG response to server',
+//         });
       }
       return {
         type: 'ping',
@@ -216,11 +217,11 @@ export class ClobWebSocketService {
       // This is an array of order book updates
       const updates = message as ClobOrderBookUpdate[];
       
-      logger.info({
-        message: 'CLOB order book update received',
-        updateCount: updates.length,
-        markets: updates.map(u => ({ market: u.market, asset_id: u.asset_id })),
-      });
+      // logger.info({
+//         message: 'CLOB order book update received',
+//         updateCount: updates.length,
+//         markets: updates.map(u => ({ market: u.market, asset_id: u.asset_id })),
+//       });
 
       // Store order book updates
       for (const update of updates) {
@@ -252,12 +253,12 @@ export class ClobWebSocketService {
     }
 
     // Log the message with full details
-    logger.info({
-      message: 'CLOB WebSocket message received',
-      messageType: msg.type || msg.event || msg.channel || 'unknown',
-      fullMessage: msg,
-      messageKeys: Object.keys(msg),
-    });
+    // logger.info({
+//       message: 'CLOB WebSocket message received',
+//       messageType: msg.type || msg.event || msg.channel || 'unknown',
+//       fullMessage: msg,
+//       messageKeys: Object.keys(msg),
+//     });
 
     // Try to identify message structure
     this.analyzeMessage(msg);
@@ -269,32 +270,32 @@ export class ClobWebSocketService {
   private analyzeMessage(message: ClobWebSocketMessage): void {
     // Log specific patterns we might recognize
     if (message.type) {
-      logger.debug({
-        message: 'Message has type field',
-        type: message.type,
-      });
+      // logger.debug({
+//         message: 'Message has type field',
+//         type: message.type,
+//       });
     }
 
     if (message.event) {
-      logger.debug({
-        message: 'Message has event field',
-        event: message.event,
-      });
+      // logger.debug({
+//         message: 'Message has event field',
+//         event: message.event,
+//       });
     }
 
     if (message.channel) {
-      logger.debug({
-        message: 'Message has channel field',
-        channel: message.channel,
-      });
+      // logger.debug({
+//         message: 'Message has channel field',
+//         channel: message.channel,
+//       });
     }
 
     if (message.data) {
-      logger.debug({
-        message: 'Message has data field',
-        dataType: typeof message.data,
-        dataKeys: typeof message.data === 'object' && message.data !== null ? Object.keys(message.data) : null,
-      });
+      // logger.debug({
+//         message: 'Message has data field',
+//         dataType: typeof message.data,
+//         dataKeys: typeof message.data === 'object' && message.data !== null ? Object.keys(message.data) : null,
+//       });
     }
   }
 
@@ -303,19 +304,19 @@ export class ClobWebSocketService {
    */
   send(message: any): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      logger.warn({
-        message: 'Cannot send message: WebSocket not connected',
-        readyState: this.ws?.readyState,
-      });
+      // logger.warn({
+//         message: 'Cannot send message: WebSocket not connected',
+//         readyState: this.ws?.readyState,
+//       });
       return;
     }
 
     const messageString = typeof message === 'string' ? message : JSON.stringify(message);
     
-    logger.info({
-      message: 'Sending message to CLOB WebSocket',
-      messageString: messageString,
-    });
+    // logger.info({
+//       message: 'Sending message to CLOB WebSocket',
+//       messageString: messageString,
+//     });
 
     this.ws.send(messageString);
   }
@@ -325,9 +326,9 @@ export class ClobWebSocketService {
    */
   subscribeToAssets(assetIds: string[]): void {
     if (!assetIds || assetIds.length === 0) {
-      logger.warn({
-        message: 'Cannot subscribe: no asset IDs provided',
-      });
+      // logger.warn({
+//         message: 'Cannot subscribe: no asset IDs provided',
+//       });
       return;
     }
 
@@ -336,11 +337,11 @@ export class ClobWebSocketService {
       type: 'market',
     };
 
-    logger.info({
-      message: 'Subscribing to assets',
-      assetIds,
-      count: assetIds.length,
-    });
+    // logger.info({
+//       message: 'Subscribing to assets',
+//       assetIds,
+//       count: assetIds.length,
+//     });
 
     this.send(subscriptionMessage);
   }
@@ -353,9 +354,9 @@ export class ClobWebSocketService {
       return;
     }
 
-    logger.debug({
-      message: 'Sending ping to server',
-    });
+    // logger.debug({
+//       message: 'Sending ping to server',
+//     });
 
     this.ws.ping();
   }
@@ -366,9 +367,9 @@ export class ClobWebSocketService {
    */
   disconnect(): void {
     if (this.ws) {
-      logger.info({
-        message: 'Disconnecting from CLOB WebSocket',
-      });
+      // logger.info({
+//         message: 'Disconnecting from CLOB WebSocket',
+//       });
       this.ws.close(1000, 'Client disconnect');
       this.ws = null;
     }
@@ -430,18 +431,32 @@ export class ClobWebSocketService {
       ? (parseFloat(bestAsk.price) - parseFloat(bestBid.price)).toFixed(4)
       : null;
 
-    logger.info({
-      message: 'Order book summary',
-      market: update.market,
-      asset_id: update.asset_id,
-      timestamp: update.timestamp,
-      bestBid: bestBid ? { price: bestBid.price, size: bestBid.size } : null,
-      bestAsk: bestAsk ? { price: bestAsk.price, size: bestAsk.size } : null,
-      spread: spread,
-      lastTradePrice: update.last_trade_price,
-      bidCount: update.bids.length,
-      askCount: update.asks.length,
-    });
+    // logger.info({
+//       message: 'Order book summary',
+//       market: update.market,
+//       asset_id: update.asset_id,
+//       timestamp: update.timestamp,
+//       bestBid: bestBid ? { price: bestBid.price, size: bestBid.size } : null,
+//       bestAsk: bestAsk ? { price: bestAsk.price, size: bestAsk.size } : null,
+//       spread: spread,
+//       lastTradePrice: update.last_trade_price,
+//       bidCount: update.bids.length,
+//       askCount: update.asks.length,
+//     });
+  }
+
+  /**
+   * Register callback for order book updates
+   */
+  onOrderBookUpdate(callback: (updates: ClobOrderBookUpdate[]) => void): void {
+    this.orderBookUpdateCallbacks.add(callback);
+  }
+
+  /**
+   * Unregister callback for order book updates
+   */
+  offOrderBookUpdate(callback: (updates: ClobOrderBookUpdate[]) => void): void {
+    this.orderBookUpdateCallbacks.delete(callback);
   }
 
   /**
@@ -449,9 +464,9 @@ export class ClobWebSocketService {
    */
   clearHistory(): void {
     this.messageHistory = [];
-    logger.info({
-      message: 'Message history cleared',
-    });
+    // logger.info({
+    //   message: 'Message history cleared',
+    // });
   }
 
   /**

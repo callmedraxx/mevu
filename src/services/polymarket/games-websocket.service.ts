@@ -3,7 +3,8 @@
  * Real-time WebSocket for frontend game updates - replaces SSE for lower latency
  */
 
-import WebSocket, { WebSocketServer } from 'ws';
+import WebSocket from 'ws';
+import { WebSocketServer } from 'ws';
 import { Server as HttpServer } from 'http';
 import { logger } from '../../config/logger';
 import { LiveGame, getAllLiveGames, liveGamesService } from './live-games.service';
@@ -57,10 +58,10 @@ export class GamesWebSocketService {
     this.startHeartbeat();
     this.isInitialized = true;
 
-    logger.info({ 
-      message: 'Games WebSocket server initialized',
-      path,
-    });
+    // logger.info({ 
+    //   message: 'Games WebSocket server initialized',
+    //   path,
+    // });
   }
 
   /**
@@ -76,11 +77,11 @@ export class GamesWebSocketService {
                        request.headers['x-real-ip'] || 
                        request.socket.remoteAddress;
 
-      logger.info({
-        message: 'WebSocket client connected',
-        clientIp,
-        totalClients: this.clients.size,
-      });
+      // logger.info({
+      //   message: 'WebSocket client connected',
+      //   clientIp,
+      //   totalClients: this.clients.size,
+      // });
 
       // Send confirmation message
       this.sendToClient(ws, {
@@ -170,10 +171,10 @@ export class GamesWebSocketService {
         timestamp: new Date().toISOString(),
       });
 
-      logger.debug({
-        message: 'Sent initial games data to WebSocket client',
-        gameCount: frontendGames.length,
-      });
+      // logger.debug({
+      //   message: 'Sent initial games data to WebSocket client',
+      //   gameCount: frontendGames.length,
+      // });
     } catch (error) {
       logger.error({
         message: 'Error sending initial WebSocket data',
@@ -220,11 +221,11 @@ export class GamesWebSocketService {
         timestamp: new Date().toISOString(),
       });
 
-      logger.debug({
-        message: 'Broadcasted games update to WebSocket clients',
-        clientCount: this.clients.size,
-        gameCount: games.length,
-      });
+      // logger.debug({
+      //   message: 'Broadcasted games update to WebSocket clients',
+      //   clientCount: this.clients.size,
+      //   gameCount: games.length,
+      // });
     } catch (error) {
       logger.error({
         message: 'Error broadcasting games update',
@@ -248,11 +249,11 @@ export class GamesWebSocketService {
         timestamp: new Date().toISOString(),
       });
 
-      logger.debug({
-        message: 'Broadcasted game update to WebSocket clients',
-        clientCount: this.clients.size,
-        gameId: game.id,
-      });
+      // logger.debug({
+      //   message: 'Broadcasted game update to WebSocket clients',
+      //   clientCount: this.clients.size,
+      //   gameId: game.id,
+      // });
     } catch (error) {
       logger.error({
         message: 'Error broadcasting game update',

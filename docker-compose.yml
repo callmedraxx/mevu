@@ -7,11 +7,15 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
+    env_file:
+      - .env
     environment:
       - NODE_ENV=production
       - PORT=3000
       - DATABASE_URL=postgresql://mevu_user:mevu_password@postgres:5432/mevu_db
       - SWAGGER_BASE_URL=https://dev.api.mevu.com
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - postgres
     restart: unless-stopped

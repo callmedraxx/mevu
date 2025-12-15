@@ -67,12 +67,12 @@ export async function fetchTradesFromPolymarket(conditionIds: string[]): Promise
 
       const fullUrl = `${url}?${searchParams.toString()}`;
 
-      logger.info({
-        message: 'Fetching trades from Polymarket data API',
-        conditionIdsCount: conditionIds.length,
-        offset,
-        url: fullUrl,
-      });
+      // logger.info({
+      //   message: 'Fetching trades from Polymarket data API',
+      //   conditionIdsCount: conditionIds.length,
+      //   offset,
+      //   url: fullUrl,
+      // });
 
       const response = await axios.get<PolymarketTrade[]>(fullUrl, {
         timeout: 30000,
@@ -102,12 +102,12 @@ export async function fetchTradesFromPolymarket(conditionIds: string[]): Promise
       }
     }
 
-    logger.info({
-      message: 'Trades fetched successfully',
-      conditionIdsCount: conditionIds.length,
-      totalCount: allTrades.length,
-      pagesFetched: Math.ceil(offset / maxLimit) || 1,
-    });
+    // logger.info({
+    //   message: 'Trades fetched successfully',
+    //   conditionIdsCount: conditionIds.length,
+    //   totalCount: allTrades.length,
+    //   pagesFetched: Math.ceil(offset / maxLimit) || 1,
+    // });
 
     return allTrades;
   } catch (error) {
@@ -186,13 +186,13 @@ export async function storeTrades(trades: PolymarketTrade[], gameId: string): Pr
 
     await client.query('COMMIT');
 
-    logger.info({
-      message: 'Trades stored in database',
-      gameId,
-      totalTrades: trades.length,
-      insertedCount,
-      skippedCount: trades.length - insertedCount,
-    });
+    // logger.info({
+    //   message: 'Trades stored in database',
+    //   gameId,
+    //   totalTrades: trades.length,
+    //   insertedCount,
+    //   skippedCount: trades.length - insertedCount,
+    // });
   } catch (error) {
     await client.query('ROLLBACK');
     logger.error({

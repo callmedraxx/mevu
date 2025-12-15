@@ -99,11 +99,11 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
 
     // If no whale trades exist, trigger population by fetching and storing trades
     if (whaleTrades.length === 0) {
-      logger.info({
-        message: 'No whale trades found, triggering trade population',
-        gameId: game.id,
-        gameSlug: game.slug,
-      });
+      // logger.info({
+      //   message: 'No whale trades found, triggering trade population',
+      //   gameId: game.id,
+      //   gameSlug: game.slug,
+      // });
 
       // Extract all market conditionIds from the game
       const conditionIds = extractAllMarketConditionIds(game);
@@ -126,11 +126,11 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
       if (trades.length > 0) {
         try {
           await storeTrades(trades, game.id);
-          logger.info({
-            message: 'Trades stored, fetching whale trades',
-            gameId: game.id,
-            tradesStored: trades.length,
-          });
+          // logger.info({
+          //   message: 'Trades stored, fetching whale trades',
+          //   gameId: game.id,
+          //   tradesStored: trades.length,
+          // });
         } catch (storeError) {
           logger.warn({
             message: 'Failed to store trades',

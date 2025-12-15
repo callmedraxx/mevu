@@ -9,15 +9,16 @@ import { transformToFrontendGame } from './frontend-game.transformer';
 import { LiveStats, FinalScore } from './live-stats.types';
 
 /**
- * Parse score string (e.g., "99-82") into individual scores
- * Polymarket format: "home-away" (first number is home team score)
+ * Parse score string (e.g., "0-2") into individual scores
+ * Polymarket format: "away-home" (first number is AWAY team score, second is HOME team score)
  */
 function parseScore(scoreStr: string | undefined): FinalScore | null {
   if (!scoreStr) return null;
   
   const parts = scoreStr.split('-').map(s => parseInt(s.trim(), 10));
   if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
-    return { home: parts[0], away: parts[1] };
+    // Format is away-home: first number is away, second is home
+    return { away: parts[0], home: parts[1] };
   }
   return null;
 }

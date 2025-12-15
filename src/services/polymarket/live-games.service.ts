@@ -511,10 +511,10 @@ export async function fetchLiveGames(): Promise<LiveGameEvent[]> {
   const endpoint = getLiveEndpoint();
   
   try {
-    logger.info({
-      message: 'Fetching live games from Polymarket',
-      endpoint,
-    });
+    // logger.info({
+    //   message: 'Fetching live games from Polymarket',
+    //   endpoint,
+    // });
 
     const response = await axios.get<LiveGamesApiResponse>(endpoint, {
       headers: {
@@ -1071,15 +1071,16 @@ function normalizePeriodKey(period: string | undefined): string | null {
 }
 
 /**
- * Parse score string (e.g., "99-82") into individual scores
- * Polymarket format: "home-away" (first number is home team score)
+ * Parse score string (e.g., "0-2") into individual scores
+ * Polymarket format: "away-home" (first number is AWAY team score, second is HOME team score)
  */
 function parseScoreString(scoreStr: string | undefined): { home: number; away: number } | null {
   if (!scoreStr) return null;
   
   const parts = scoreStr.split('-').map(s => parseInt(s.trim(), 10));
   if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
-    return { home: parts[0], away: parts[1] };
+    // Format is away-home: first number is away, second is home
+    return { away: parts[0], home: parts[1] };
   }
   return null;
 }
@@ -1247,6 +1248,26 @@ async function updateGameInDatabase(gameUpdate: Partial<LiveGame> & { id: string
   const client = await pool.connect();
   
   try {
+    // Get current game data if markets need updating
+    let current: any = null;
+    if (gameUpdate.markets !== undefined) {
+      const findResult = await client.query(
+        'SELECT transformed_data FROM live_games WHERE id = $1',
+        [gameUpdate.id]
+      );
+      
+      if (findResult.rows.length === 0) {
+        logger.warn({ message: 'Game not found for update', gameId: gameUpdate.id });
+        return;
+      }
+      
+      current = findResult.rows[0].transformed_data 
+        ? (typeof findResult.rows[0].transformed_data === 'string' 
+            ? JSON.parse(findResult.rows[0].transformed_data) 
+            : findResult.rows[0].transformed_data)
+        : {};
+    }
+    
     const updates: string[] = [];
     const values: any[] = [];
     let paramIndex = 1;
@@ -1257,17 +1278,25 @@ async function updateGameInDatabase(gameUpdate: Partial<LiveGame> & { id: string
     if (gameUpdate.live !== undefined) { updates.push(`live = $${paramIndex++}`); values.push(gameUpdate.live); }
     if (gameUpdate.ended !== undefined) { updates.push(`ended = $${paramIndex++}`); values.push(gameUpdate.ended); }
     
+    // Update transformed_data if markets changed
+    if (gameUpdate.markets !== undefined && current) {
+      const updated = { ...current, ...gameUpdate, updatedAt: new Date() };
+      updates.push(`transformed_data = $${paramIndex++}`);
+      values.push(JSON.stringify(updated));
+    }
+    
     updates.push(`updated_at = CURRENT_TIMESTAMP`);
     values.push(gameUpdate.id);
     
     await client.query(`UPDATE live_games SET ${updates.join(', ')} WHERE id = $${paramIndex}`, values);
     
+    // Update cache
     if (gamesCache.has(gameUpdate.id)) {
       const cached = gamesCache.get(gameUpdate.id)!;
       const updatedGame = { ...cached, ...gameUpdate, updatedAt: new Date() };
       gamesCache.set(gameUpdate.id, updatedGame);
       
-    if (liveGamesService) {
+      if (liveGamesService) {
         liveGamesService.broadcastPartialUpdate(updatedGame);
       }
     }

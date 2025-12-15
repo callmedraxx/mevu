@@ -60,11 +60,11 @@ export async function fetchHoldersFromPolymarket(
 
     const fullUrl = `${url}?${searchParams.toString()}`;
 
-    logger.info({
-      message: 'Fetching holders from Polymarket data API',
-      conditionIdsCount: conditionIds.length,
-      url: fullUrl,
-    });
+    // logger.info({
+    //   message: 'Fetching holders from Polymarket data API',
+    //   conditionIdsCount: conditionIds.length,
+    //   url: fullUrl,
+    // });
 
     const response = await axios.get<PolymarketHolderResponse[]>(fullUrl, {
       timeout: 30000,
@@ -73,11 +73,11 @@ export async function fetchHoldersFromPolymarket(
       },
     });
 
-    logger.info({
-      message: 'Holders fetched successfully',
-      conditionIdsCount: conditionIds.length,
-      responseCount: response.data.length,
-    });
+    // logger.info({
+    //   message: 'Holders fetched successfully',
+    //   conditionIdsCount: conditionIds.length,
+    //   responseCount: response.data.length,
+    // });
 
     return response.data;
   } catch (error) {
@@ -177,11 +177,11 @@ export async function storeHolders(
 
     await client.query('COMMIT');
 
-    logger.info({
-      message: 'Holders stored in database',
-      gameId: game.id,
-      totalHolders: insertedCount,
-    });
+    // logger.info({
+    //   message: 'Holders stored in database',
+    //   gameId: game.id,
+    //   totalHolders: insertedCount,
+    // });
   } catch (error) {
     await client.query('ROLLBACK');
     logger.error({
