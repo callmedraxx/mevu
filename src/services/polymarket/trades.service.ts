@@ -141,22 +141,25 @@ export async function storeTrades(trades: PolymarketTrade[], gameId: string): Pr
   try {
     await client.query('BEGIN');
 
-    const insertQuery = `
-      INSERT INTO trades (
-        proxy_wallet, side, asset, condition_id, size, price, timestamp,
-        title, slug, icon, event_slug, outcome, outcome_index,
-        name, pseudonym, bio, profile_image, profile_image_optimized,
-        transaction_hash, game_id, created_at
-      )
-      VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, CURRENT_TIMESTAMP
-      )
-      ON CONFLICT (transaction_hash) DO NOTHING
-    `;
+    if (trades.length === 0) {
+      await client.query('COMMIT');
+      return;
+    }
 
-    let insertedCount = 0;
+    // Build bulk insert query with multiple VALUES
+    const values: any[] = [];
+    const placeholders: string[] = [];
+    let paramIndex = 1;
+
     for (const trade of trades) {
-      const result = await client.query(insertQuery, [
+      const rowPlaceholders: string[] = [];
+      for (let i = 0; i < 20; i++) {
+        rowPlaceholders.push(`$${paramIndex++}`);
+      }
+      rowPlaceholders.push('CURRENT_TIMESTAMP');
+      placeholders.push(`(${rowPlaceholders.join(', ')})`);
+      
+      values.push(
         trade.proxyWallet,
         trade.side,
         trade.asset,
@@ -177,12 +180,22 @@ export async function storeTrades(trades: PolymarketTrade[], gameId: string): Pr
         trade.profileImageOptimized,
         trade.transactionHash,
         gameId,
-      ]);
-
-      if (result.rowCount && result.rowCount > 0) {
-        insertedCount++;
-      }
+      );
     }
+
+    const insertQuery = `
+      INSERT INTO trades (
+        proxy_wallet, side, asset, condition_id, size, price, timestamp,
+        title, slug, icon, event_slug, outcome, outcome_index,
+        name, pseudonym, bio, profile_image, profile_image_optimized,
+        transaction_hash, game_id, created_at
+      )
+      VALUES ${placeholders.join(', ')}
+      ON CONFLICT (transaction_hash) DO NOTHING
+    `;
+
+    const result = await client.query(insertQuery, values);
+    const insertedCount = result.rowCount || 0;
 
     await client.query('COMMIT');
 
@@ -194,7 +207,14 @@ export async function storeTrades(trades: PolymarketTrade[], gameId: string): Pr
     //   skippedCount: trades.length - insertedCount,
     // });
   } catch (error) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      logger.error({
+        message: 'Error during ROLLBACK in storeTrades',
+        error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+      });
+    }
     logger.error({
       message: 'Error storing trades in database',
       gameId,

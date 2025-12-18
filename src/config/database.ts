@@ -35,12 +35,47 @@ export const pool: Pool = (() => {
   
   if (nodeEnv === 'production') {
     if (!poolInstance) {
+      // Parse connection string to ensure no statement_timeout is in it
+      const connectionString = process.env.DATABASE_URL || '';
+      
       poolInstance = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        max: 20,
+        connectionString,
+        // With PgBouncer, we can have more client connections since PgBouncer pools server connections
+        max: 50, // Increased since PgBouncer handles the actual PostgreSQL connections
         idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 2000,
+        connectionTimeoutMillis: 10000, // 10 seconds
+        // Add retry logic and better error handling
+        allowExitOnIdle: false,
+        // Keep connections alive
+        keepAlive: true,
+        keepAliveInitialDelayMillis: 10000,
+        // Note: statement_timeout removed from Pool config - PgBouncer doesn't support it as a startup parameter
+        // We set it via SQL query after connection instead (see poolInstance.on('connect') below)
+        // Also ensure no options object is passed that might include statement_timeout
       });
+      
+      // Handle pool errors
+      poolInstance.on('error', (err) => {
+        console.error('Unexpected error on idle client', err);
+      });
+      
+      poolInstance.on('connect', async (client) => {
+        // console.log('Database connection established');
+        // Set statement timeout on each new connection to prevent stuck transactions
+        try {
+          await client.query('SET statement_timeout = 30000'); // 30 seconds
+        } catch (err) {
+          console.error('Failed to set statement timeout on connection', err);
+        }
+      });
+      
+      // poolInstance.on('acquire', () => {
+      //   console.log('Database connection acquired from pool');
+      // });
+      
+      // poolInstance.on('remove', () => {
+      //   console.log('Database connection removed from pool');
+      // });
     }
     return poolInstance;
   }

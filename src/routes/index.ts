@@ -9,6 +9,10 @@ import whaleWatcherRouter from './whale-watcher';
 import liveStatsRouter from './live-stats';
 import usersRouter from './users';
 import walletsRouter from './wallets';
+import balancesRouter from './balances';
+import tradingRouter from './trading';
+import positionsRouter from './positions';
+import webhooksRouter from './webhooks';
 
 const router = Router();
 
@@ -65,5 +69,17 @@ router.use('/users', usersRouter);
 
 // Wallets routes (wallet creation)
 router.use('/wallets', walletsRouter);
+
+// Balances routes (USDC.e balance tracking)
+router.use('/balances', balancesRouter);
+
+// Trading routes (buy/sell markets)
+router.use('/trading', tradingRouter);
+
+// Positions routes (user positions and portfolio)
+router.use('/positions', positionsRouter);
+
+// Webhooks routes (Alchemy, etc.)
+router.use('/webhooks', webhooksRouter);
 
 export default router;

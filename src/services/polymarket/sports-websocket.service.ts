@@ -25,182 +25,189 @@ export class SportsWebSocketService {
   private gameUpdates: Map<number, SportsGameUpdate> = new Map(); // gameId -> latest update
   private maxHistorySize: number = 100;
 
+  private maxReconnectAttempts: number = 5;
+  private reconnectDelay: number = 3000;
+
   /**
    * Connect to the Sports WebSocket endpoint
    */
   async connect(): Promise<void> {
-//     if (this.isConnecting || this.isConnected) {
-//       logger.warn({
-//         message: 'Sports WebSocket already connecting or connected',
-//         isConnecting: this.isConnecting,
-//         isConnected: this.isConnected,
-//       });
-//       return;
-//     }
-// 
-//     // Reset state for new connection
-//     this.isConnecting = true;
-//     this.isConnected = false;
-//     this.reconnectAttempts = 0;
-// 
-//     try {
-//       logger.info({
-//         message: 'Connecting to Sports WebSocket',
-//         url: SPORTS_WS_URL,
-//       });
-// 
-//       this.ws = new WebSocket(SPORTS_WS_URL, {
-//         headers: {
-//           'Origin': 'https://polymarket.com',
-//           'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-//         },
-//       });
-// 
-//       this.setupEventHandlers();
-//     } catch (error) {
-//       this.isConnecting = false;
-//       logger.error({
-//         message: 'Failed to create Sports WebSocket connection',
-//         error: error instanceof Error ? error.message : String(error),
-//       });
-//       throw error;
-//     }
+    if (this.isConnecting || this.isConnected) {
+      logger.warn({
+        message: 'Sports WebSocket already connecting or connected',
+        isConnecting: this.isConnecting,
+        isConnected: this.isConnected,
+      });
+      return;
+    }
+
+    // Reset state for new connection
+    this.isConnecting = true;
+    this.isConnected = false;
+
+    try {
+      logger.info({
+        message: 'Connecting to Sports WebSocket',
+        url: SPORTS_WS_URL,
+      });
+
+      this.ws = new WebSocket(SPORTS_WS_URL, {
+        headers: {
+          'Origin': 'https://polymarket.com',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+        },
+      });
+
+      this.setupEventHandlers();
+    } catch (error) {
+      this.isConnecting = false;
+      logger.error({
+        message: 'Failed to create Sports WebSocket connection',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
-// 
-//   /**
-//    * Setup WebSocket event handlers
-//    */
-//   private setupEventHandlers(): void {
-//     if (!this.ws) return;
-// 
-//     this.ws.on('open', () => {
-//       this.isConnecting = false;
-//       this.isConnected = true;
-//       this.reconnectAttempts = 0;
-// 
-//       logger.info({
-//         message: 'Sports WebSocket connected',
-//         url: SPORTS_WS_URL,
-//       });
-// 
-//       logger.info({
-//         message: 'Waiting for initial messages from server...',
-//       });
-//     });
-// 
-//     this.ws.on('message', (data: WebSocket.Data) => {
-//       try {
-//         const message = this.parseMessage(data);
-//         this.handleMessage(message);
-//       } catch (error) {
-//         logger.error({
-//           message: 'Error parsing Sports WebSocket message',
-//           error: error instanceof Error ? error.message : String(error),
-//           rawData: data.toString().substring(0, 500),
-//         });
-//       }
-//     });
-// 
-//     this.ws.on('error', (error: Error) => {
-//       logger.error({
-//         message: 'Sports WebSocket error',
-//         error: error.message,
-//         stack: error.stack,
-//       });
-//     });
-// 
-//     this.ws.on('close', (code: number, reason: Buffer) => {
-//       this.isConnected = false;
-//       this.isConnecting = false;
-// 
-//       const reasonStr = reason.length > 0 ? reason.toString() : 'No reason provided';
-// 
-//       logger.warn({
-//         message: 'Sports WebSocket closed',
-//         code,
-//         reason: reasonStr,
-//         codeMeaning: this.getCloseCodeMeaning(code),
-//         reconnectAttempts: this.reconnectAttempts,
-//       });
-//     });
-// 
-//     this.ws.on('ping', (data: Buffer) => {
-//       logger.debug({
-//         message: 'Received ping from Sports server',
-//         data: data.toString(),
-//       });
-//       // Respond to ping with pong
-//       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-//         this.ws.pong(data);
-//         logger.debug({
-//           message: 'Sent pong response to Sports server',
-//         });
-//       }
-//     });
-// 
-//     this.ws.on('pong', (data: Buffer) => {
-//       logger.debug({
-//         message: 'Received pong from Sports server',
-//         data: data.toString(),
-//       });
-//     });
-//   }
-// 
-//   /**
-//    * Parse incoming WebSocket message
-//    */
-//   private parseMessage(data: WebSocket.Data): SportsWebSocketMessage | SportsGameUpdate {
-//     // Handle different data types
-//     let rawString: string;
-// 
-//     if (Buffer.isBuffer(data)) {
-//       rawString = data.toString('utf8');
-//     } else if (typeof data === 'string') {
-//       rawString = data;
-//     } else if (data instanceof ArrayBuffer) {
-//       rawString = Buffer.from(data).toString('utf8');
-//     } else {
-//       rawString = String(data);
-//     }
-// 
-//     // Check if it's a PING message (text)
-//     if (rawString === 'PING' || rawString.trim() === 'PING') {
-//       logger.debug({
-//         message: 'Received PING text message from Sports server',
-//       });
-//       // Respond with PONG
-//       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-//         this.ws.send('PONG');
-//         logger.debug({
-//           message: 'Sent PONG response to Sports server',
-//         });
-//       }
-//       return {
-//         type: 'ping',
-//         raw: rawString,
-//       };
-//     }
-// 
-//     // Try to parse as JSON
-//     try {
-//       const parsed = JSON.parse(rawString);
-// 
-//       // Check if it's a game update (has gameId, score, etc.)
-//       if (parsed && typeof parsed === 'object' && 'gameId' in parsed && 'score' in parsed) {
-//         return parsed as SportsGameUpdate;
-//       }
-// 
-//       return parsed as SportsWebSocketMessage;
-//     } catch {
-//       // If not JSON, return as raw string with metadata
-//       return {
-//         raw: rawString,
-//         rawLength: rawString.length,
-//         type: 'raw',
-//         isBinary: !/^[\x20-\x7E\s]*$/.test(rawString),
-//       };
-//     }
-//   }
+
+  /**
+   * Setup WebSocket event handlers
+   */
+  private setupEventHandlers(): void {
+    if (!this.ws) return;
+
+    this.ws.on('open', () => {
+      this.isConnecting = false;
+      this.isConnected = true;
+      this.reconnectAttempts = 0;
+
+      logger.info({
+        message: 'Sports WebSocket connected',
+        url: SPORTS_WS_URL,
+      });
+    });
+
+    this.ws.on('message', (data: WebSocket.Data) => {
+      try {
+        const message = this.parseMessage(data);
+        this.handleMessage(message);
+      } catch (error) {
+        logger.error({
+          message: 'Error parsing Sports WebSocket message',
+          error: error instanceof Error ? error.message : String(error),
+          rawData: data.toString().substring(0, 500),
+        });
+      }
+    });
+
+    this.ws.on('error', (error: Error) => {
+      logger.error({
+        message: 'Sports WebSocket error',
+        error: error.message,
+      });
+    });
+
+    this.ws.on('close', (code: number, reason: Buffer) => {
+      this.isConnected = false;
+      this.isConnecting = false;
+
+      const reasonStr = reason.length > 0 ? reason.toString() : 'No reason provided';
+
+      logger.warn({
+        message: 'Sports WebSocket closed',
+        code,
+        reason: reasonStr,
+        codeMeaning: this.getCloseCodeMeaning(code),
+      });
+
+      // Auto-reconnect if not a normal closure
+      if (code !== 1000 && this.reconnectAttempts < this.maxReconnectAttempts) {
+        this.scheduleReconnect();
+      }
+    });
+
+    this.ws.on('ping', (data: Buffer) => {
+      // Respond to ping with pong
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.pong(data);
+      }
+    });
+  }
+
+  /**
+   * Schedule reconnection attempt
+   */
+  private scheduleReconnect(): void {
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1); // Exponential backoff
+
+    logger.info({
+      message: 'Scheduling Sports WebSocket reconnect',
+      attempt: this.reconnectAttempts,
+      delayMs: delay,
+    });
+
+    setTimeout(() => {
+      this.ws = null;
+      this.isConnecting = false;
+      this.isConnected = false;
+      this.connect().catch((error) => {
+        logger.error({
+          message: 'Sports WebSocket reconnect failed',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, delay);
+  }
+
+  /**
+   * Parse incoming WebSocket message
+   */
+  private parseMessage(data: WebSocket.Data): SportsWebSocketMessage | SportsGameUpdate {
+    // Handle different data types
+    let rawString: string;
+
+    if (Buffer.isBuffer(data)) {
+      rawString = data.toString('utf8');
+    } else if (typeof data === 'string') {
+      rawString = data;
+    } else if (data instanceof ArrayBuffer) {
+      rawString = Buffer.from(data).toString('utf8');
+    } else {
+      rawString = String(data);
+    }
+
+    // Check if it's a PING message (text)
+    if (rawString === 'PING' || rawString.trim() === 'PING') {
+      // Respond with PONG
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send('PONG');
+      }
+      return {
+        type: 'ping',
+        raw: rawString,
+      };
+    }
+
+    // Try to parse as JSON
+    try {
+      const parsed = JSON.parse(rawString);
+
+      // Check if it's a game update (has gameId, score, etc.)
+      if (parsed && typeof parsed === 'object' && 'gameId' in parsed && 'score' in parsed) {
+        return parsed as SportsGameUpdate;
+      }
+
+      return parsed as SportsWebSocketMessage;
+    } catch {
+      // If not JSON, return as raw string with metadata
+      return {
+        raw: rawString,
+        rawLength: rawString.length,
+        type: 'raw',
+        isBinary: !/^[\x20-\x7E\s]*$/.test(rawString),
+      };
+    }
+  }
 
   /**
    * Handle incoming messages
@@ -441,7 +448,6 @@ export class SportsWebSocketService {
     return codes[code] || `Unknown code: ${code}`;
   }
 }
-// 
+
 // Export singleton instance
 export const sportsWebSocketService = new SportsWebSocketService();
-// 

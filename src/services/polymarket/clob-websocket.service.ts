@@ -217,11 +217,11 @@ export class ClobWebSocketService {
       // This is an array of order book updates
       const updates = message as ClobOrderBookUpdate[];
       
-      // logger.info({
-//         message: 'CLOB order book update received',
-//         updateCount: updates.length,
-//         markets: updates.map(u => ({ market: u.market, asset_id: u.asset_id })),
-//       });
+      logger.info({
+        message: 'CLOB order book update received',
+        updateCount: updates.length,
+        firstAssetId: updates[0]?.asset_id?.substring(0, 20) + '...',
+      });
 
       // Store order book updates
       for (const update of updates) {
@@ -238,6 +238,30 @@ export class ClobWebSocketService {
       this.messageHistory.push(message as any);
       if (this.messageHistory.length > this.maxHistorySize) {
         this.messageHistory.shift();
+      }
+
+      // Notify all registered callbacks about the order book updates
+      if (this.orderBookUpdateCallbacks.size > 0) {
+        logger.debug({
+          message: 'Calling order book update callbacks',
+          callbackCount: this.orderBookUpdateCallbacks.size,
+          updateCount: updates.length,
+        });
+        for (const callback of this.orderBookUpdateCallbacks) {
+          try {
+            callback(updates);
+          } catch (error) {
+            logger.error({
+              message: 'Error in order book update callback',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      } else {
+        logger.debug({
+          message: 'No callbacks registered for order book updates',
+          updateCount: updates.length,
+        });
       }
 
       return;

@@ -57,6 +57,14 @@ const swaggerDefinition: SwaggerDefinition = {
       name: 'Users',
       description: 'User registration, proxy wallet deployment, and token approvals for Polymarket trading',
     },
+    {
+      name: 'Trading',
+      description: 'Buy and sell markets on Polymarket CLOB with gasless transactions',
+    },
+    {
+      name: 'Positions',
+      description: 'User positions and portfolio tracking endpoints',
+    },
   ],
   components: {
     schemas: {
@@ -128,6 +136,11 @@ const swaggerDefinition: SwaggerDefinition = {
           shortLabel: { type: 'string', example: 'LAL' },
           price: { type: 'number', example: 65.5 },
           probability: { type: 'number', example: 65.5 },
+          clobTokenId: { 
+            type: 'string', 
+            example: '16678291189211314787145083999015737376658799626130630684070927984975568281601',
+            description: 'CLOB token ID for trading this specific outcome',
+          },
         },
       },
       ActivityWatcherMarket: {
@@ -135,15 +148,37 @@ const swaggerDefinition: SwaggerDefinition = {
         properties: {
           id: { type: 'string', example: '12345' },
           title: { type: 'string', example: 'Will Team A win?' },
+          question: { type: 'string', example: 'Will Team A win?', description: 'Full market question for trading context' },
           volume: { type: 'string', example: '$250k' },
           liquidity: { type: 'string', example: '$1.2M' },
           outcomes: {
             type: 'array',
             items: { $ref: '#/components/schemas/ActivityWatcherOutcome' },
             example: [
-              { label: 'Lakers', shortLabel: 'LAL', price: 65.5, probability: 65.5 },
-              { label: 'Warriors', shortLabel: 'GSW', price: 34.5, probability: 34.5 },
+              { label: 'Lakers', shortLabel: 'LAL', price: 65.5, probability: 65.5, clobTokenId: '166782...' },
+              { label: 'Warriors', shortLabel: 'GSW', price: 34.5, probability: 34.5, clobTokenId: '234567...' },
             ],
+          },
+          conditionId: { 
+            type: 'string', 
+            example: '0x1234567890abcdef',
+            description: 'Market condition ID for trading contract',
+          },
+          clobTokenIds: { 
+            type: 'array',
+            items: { type: 'string' },
+            example: ['16678291189211314787145083999015737376658799626130630684070927984975568281601', '23456789012345678901234567890123456789012345678901234567890123456789012345'],
+            description: 'Token IDs for all outcomes',
+          },
+          negRisk: { 
+            type: 'boolean',
+            example: false,
+            description: 'If true, uses negative risk trading',
+          },
+          negRiskMarketId: { 
+            type: 'string',
+            example: '0xabcdef1234567890',
+            description: 'Negative risk market ID (required if negRisk is true)',
           },
         },
       },

@@ -213,7 +213,14 @@ export class TeamsService {
         teamCount: teams.length,
       });
     } catch (error) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        logger.error({
+          message: 'Error during ROLLBACK in upsertTeamsToDatabase',
+          error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+        });
+      }
       logger.error({
         message: 'Error upserting teams to database',
         league,

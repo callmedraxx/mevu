@@ -1,0 +1,598 @@
+/**
+ * Trading Service
+ * Handles buy/sell operations on Polymarket CLOB
+ * Uses RelayerClient for gasless transactions
+ */
+
+import { Side, OrderType as ClobOrderType } from '@polymarket/clob-client';
+import { logger } from '../../../config/logger';
+import { getUserByPrivyId } from '../../privy/user.service';
+import { getClobClientForUser } from './clob-client.service';
+import { CreateTradeRequest, CreateTradeResponse, OrderType, TradeSide, FEE_CONFIG } from './trading.types';
+import { saveTradeRecord, updateTradeRecord, updateTradeRecordById } from './trades-history.service';
+
+// Retry configuration for transient errors
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY_MS = 1000;
+
+// Error codes for frontend handling
+export enum TradeErrorCode {
+  USER_NOT_FOUND = 'USER_NOT_FOUND',
+  NO_PROXY_WALLET = 'NO_PROXY_WALLET',
+  TOKENS_NOT_APPROVED = 'TOKENS_NOT_APPROVED',
+  INSUFFICIENT_BALANCE = 'INSUFFICIENT_BALANCE',
+  INVALID_PRICE = 'INVALID_PRICE',
+  INVALID_SIZE = 'INVALID_SIZE',
+  MARKET_UNAVAILABLE = 'MARKET_UNAVAILABLE',
+  ORDER_REJECTED = 'ORDER_REJECTED',
+  SERVICE_UNAVAILABLE = 'SERVICE_UNAVAILABLE',
+  RATE_LIMITED = 'RATE_LIMITED',
+  UNKNOWN_ERROR = 'UNKNOWN_ERROR',
+}
+
+// User-friendly error messages
+const USER_FRIENDLY_MESSAGES: Record<TradeErrorCode, string> = {
+  [TradeErrorCode.USER_NOT_FOUND]: 'Account not found. Please log in again.',
+  [TradeErrorCode.NO_PROXY_WALLET]: 'Your trading wallet is not set up. Please complete account setup first.',
+  [TradeErrorCode.TOKENS_NOT_APPROVED]: 'Token approvals required. Please approve tokens before trading.',
+  [TradeErrorCode.INSUFFICIENT_BALANCE]: 'Insufficient USDC balance for this trade.',
+  [TradeErrorCode.INVALID_PRICE]: 'Invalid price. Price must be between $0.01 and $0.99.',
+  [TradeErrorCode.INVALID_SIZE]: 'Order amount too small. Minimum order size is $1.',
+  [TradeErrorCode.MARKET_UNAVAILABLE]: 'This market is currently unavailable. Please try again later.',
+  [TradeErrorCode.ORDER_REJECTED]: 'Order was rejected. The market may have moved or insufficient liquidity.',
+  [TradeErrorCode.SERVICE_UNAVAILABLE]: 'Trading service is temporarily busy. Please try again in a few seconds.',
+  [TradeErrorCode.RATE_LIMITED]: 'Too many requests. Please wait a moment before trying again.',
+  [TradeErrorCode.UNKNOWN_ERROR]: 'Something went wrong. Please try again.',
+};
+
+/**
+ * Check if an error is retryable (503, 502, 429, network errors)
+ */
+function isRetryableError(error: any): boolean {
+  if (error?.response?.status) {
+    const status = error.response.status;
+    return status === 503 || status === 502 || status === 429 || status === 504;
+  }
+  // Network errors
+  if (error?.code === 'ECONNRESET' || error?.code === 'ETIMEDOUT' || error?.code === 'ENOTFOUND') {
+    return true;
+  }
+  // Check error message for common transient error patterns
+  const message = error?.message?.toLowerCase() || '';
+  return message.includes('service unavailable') || 
+         message.includes('temporarily unavailable') ||
+         message.includes('timeout') ||
+         message.includes('econnreset');
+}
+
+/**
+ * Map error to user-friendly error code and message
+ */
+function mapErrorToUserFriendly(error: any): { code: TradeErrorCode; message: string } {
+  const errorMessage = error?.message?.toLowerCase() || '';
+  const responseStatus = error?.response?.status;
+  const responseData = error?.response?.data;
+
+  // Check for specific error patterns
+  if (errorMessage.includes('user not found')) {
+    return { code: TradeErrorCode.USER_NOT_FOUND, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.USER_NOT_FOUND] };
+  }
+  
+  if (errorMessage.includes('proxy wallet') || errorMessage.includes('deploy proxy')) {
+    return { code: TradeErrorCode.NO_PROXY_WALLET, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.NO_PROXY_WALLET] };
+  }
+  
+  if (errorMessage.includes('approval') || errorMessage.includes('approve token')) {
+    return { code: TradeErrorCode.TOKENS_NOT_APPROVED, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.TOKENS_NOT_APPROVED] };
+  }
+  
+  if (errorMessage.includes('insufficient') || errorMessage.includes('balance') || errorMessage.includes('not enough balance')) {
+    // Use the actual error message if it includes specific balance info
+    if (errorMessage.includes('you have $') || errorMessage.includes('need $')) {
+      return { code: TradeErrorCode.INSUFFICIENT_BALANCE, message: error?.message || USER_FRIENDLY_MESSAGES[TradeErrorCode.INSUFFICIENT_BALANCE] };
+    }
+    return { code: TradeErrorCode.INSUFFICIENT_BALANCE, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.INSUFFICIENT_BALANCE] };
+  }
+  
+  if (errorMessage.includes('invalid price') || errorMessage.includes('price must be')) {
+    return { code: TradeErrorCode.INVALID_PRICE, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.INVALID_PRICE] };
+  }
+
+  // Check for minimum order size errors
+  if (errorMessage.includes('min size') || errorMessage.includes('minimum') || errorMessage.includes('order amount too small')) {
+    // Use the actual error message which includes the amount details
+    return { code: TradeErrorCode.INVALID_SIZE, message: error?.message || 'Order amount too small. Minimum order size is $1.' };
+  }
+
+  if (responseStatus === 429) {
+    return { code: TradeErrorCode.RATE_LIMITED, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.RATE_LIMITED] };
+  }
+  
+  if (responseStatus === 503 || responseStatus === 502 || responseStatus === 504) {
+    return { code: TradeErrorCode.SERVICE_UNAVAILABLE, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.SERVICE_UNAVAILABLE] };
+  }
+
+  // Check Polymarket-specific errors
+  if (responseData?.error) {
+    const polyError = responseData.error.toLowerCase();
+    if (polyError.includes('rejected') || polyError.includes('not enough liquidity')) {
+      return { code: TradeErrorCode.ORDER_REJECTED, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.ORDER_REJECTED] };
+    }
+    if (polyError.includes('market') || polyError.includes('token')) {
+      return { code: TradeErrorCode.MARKET_UNAVAILABLE, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.MARKET_UNAVAILABLE] };
+    }
+  }
+
+  return { code: TradeErrorCode.UNKNOWN_ERROR, message: USER_FRIENDLY_MESSAGES[TradeErrorCode.UNKNOWN_ERROR] };
+}
+
+/**
+ * Sleep for a given number of milliseconds
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute a trade (buy or sell) on Polymarket
+ * Uses RelayerClient for gasless execution
+ */
+export async function executeTrade(
+  request: CreateTradeRequest
+): Promise<CreateTradeResponse> {
+  const { privyUserId, marketInfo, side, orderType, size, price } = request;
+
+  logger.info({
+    message: 'Executing trade',
+    privyUserId,
+    marketId: marketInfo.marketId,
+    clobTokenId: marketInfo.clobTokenId,
+    side,
+    orderType,
+    size,
+    price,
+  });
+
+  try {
+    // Validate user
+    const user = await getUserByPrivyId(privyUserId);
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    if (!user.proxyWalletAddress) {
+      throw new Error('User does not have a proxy wallet. Please deploy proxy wallet first.');
+    }
+
+    // Validate token approvals
+    if (!user.usdcApprovalEnabled || !user.ctfApprovalEnabled) {
+      throw new Error('Token approvals not set up. Please approve tokens first.');
+    }
+
+    // Pre-check: Validate balance is sufficient for BUY orders using Alchemy
+    if (side === TradeSide.BUY) {
+      // Frontend sends 'size' as number of shares for all order types
+      // Backend calculates USDC amount = shares * price
+      if (!price || parseFloat(price) <= 0 || parseFloat(price) > 1) {
+        throw new Error('Price is required and must be between 0 and 1.');
+      }
+      const estimatedCost = parseFloat(size) * parseFloat(price); // shares * price = USDC amount
+      try {
+        const { fetchBalanceFromAlchemy } = await import('../../alchemy/balance.service');
+        const balanceResult = await fetchBalanceFromAlchemy(user.proxyWalletAddress);
+        const balanceUsdc = parseFloat(balanceResult.balanceHuman);
+        
+        // Calculate fee and total required
+        const feeAmount = estimatedCost * FEE_CONFIG.RATE;
+        const totalRequired = estimatedCost + feeAmount;
+        
+        logger.info({
+          message: 'Pre-trade balance check (Alchemy)',
+          privyUserId,
+          proxyWalletAddress: user.proxyWalletAddress,
+          balanceUsdc,
+          estimatedCost,
+          feeAmount,
+          totalRequired,
+          hasSufficientBalance: balanceUsdc >= totalRequired,
+        });
+        
+        if (balanceUsdc < totalRequired) {
+          throw new Error(
+            `Insufficient balance. You have $${balanceUsdc.toFixed(2)} but need ` +
+            `$${estimatedCost.toFixed(2)} for trade + $${feeAmount.toFixed(2)} fee = $${totalRequired.toFixed(2)} total.`
+          );
+        }
+      } catch (balanceError: any) {
+        // If balance check fails but it's our custom error, re-throw it
+        if (balanceError.message?.includes('Insufficient balance')) {
+          throw balanceError;
+        }
+        // Otherwise log warning and continue (let CLOB reject if insufficient)
+        logger.warn({
+          message: 'Could not pre-check balance, proceeding with trade',
+          privyUserId,
+          error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+        });
+      }
+    }
+
+    // Save trade record FIRST with PENDING status (before CLOB call)
+    // This ensures we track the trade attempt even if CLOB fails
+    // Frontend sends 'size' as shares, backend calculates USDC = shares * price
+    if (!price || parseFloat(price) <= 0 || parseFloat(price) > 1) {
+      throw new Error('Price is required and must be between 0 and 1.');
+    }
+    const costUsdc = (parseFloat(size) * parseFloat(price)).toFixed(18);
+    
+    const tradeRecord = await saveTradeRecord({
+      privyUserId,
+      proxyWalletAddress: user.proxyWalletAddress,
+      marketId: marketInfo.marketId,
+      marketQuestion: marketInfo.marketQuestion,
+      clobTokenId: marketInfo.clobTokenId,
+      outcome: marketInfo.outcome,
+      side,
+      orderType,
+      size,
+      price: price,
+      costUsdc,
+      feeUsdc: '0', // Will be updated when order fills
+      orderId: undefined, // Will be updated after CLOB call
+      status: 'PENDING',
+      metadata: marketInfo.metadata,
+    });
+
+    logger.info({
+      message: 'Trade record created with PENDING status',
+      privyUserId,
+      tradeId: tradeRecord.id,
+    });
+
+    try {
+      // Get CLOB client
+      const clobClient = await getClobClientForUser(privyUserId, request.userJwt);
+
+      // For FOK and FAK orders, use market order method
+      // For LIMIT orders, use limit order method
+      let orderResponse: any;
+      let lastError: Error | null = null;
+
+      // Retry loop for transient errors
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          if (orderType === OrderType.FOK || orderType === OrderType.FAK) {
+            // Use market order for FOK/FAK (fill-or-kill / fill-and-kill)
+            // Polymarket's createAndPostMarketOrder expects:
+            //   - BUY: amount = USDC to spend
+            //   - SELL: amount = number of shares to sell
+            
+            const clobOrderType = orderType === OrderType.FOK 
+              ? ClobOrderType.FOK 
+              : ClobOrderType.FAK;
+
+            let orderAmount: number;
+            
+            if (side === TradeSide.BUY) {
+              // For BUY: Convert shares to USDC amount = shares * price
+              if (!price || parseFloat(price) <= 0 || parseFloat(price) > 1) {
+                throw new Error('Price is required for BUY orders to calculate USDC amount.');
+              }
+              orderAmount = parseFloat(size) * parseFloat(price);
+              
+              // Polymarket requires minimum $1 for market BUY orders
+              if (orderAmount < 1) {
+                throw new Error(`Order amount too small ($${orderAmount.toFixed(2)}). Minimum order size is $1.`);
+              }
+              
+              logger.info({
+                message: 'Calculated BUY order amount',
+                privyUserId,
+                shares: size,
+                price,
+                usdcAmount: orderAmount,
+              });
+            } else {
+              // For SELL: Use shares directly (not USDC)
+              orderAmount = parseFloat(size);
+              
+              logger.info({
+                message: 'Using shares for SELL order',
+                privyUserId,
+                shares: size,
+                price,
+                orderAmount,
+              });
+            }
+
+            orderResponse = await clobClient.createAndPostMarketOrder(
+              {
+                tokenID: marketInfo.clobTokenId,
+                amount: orderAmount, // BUY: USDC amount | SELL: shares
+                side: side === TradeSide.BUY ? Side.BUY : Side.SELL,
+              },
+              {}, // Options (tickSize, negativeRisk, etc.)
+              clobOrderType
+            );
+            
+            logger.info({
+              message: 'Market order created',
+              privyUserId,
+              orderType,
+              clobOrderType,
+              orderId: orderResponse?.orderID,
+              attempt,
+            });
+          } else {
+            // Use limit order for LIMIT/MARKET orders
+            // Limit orders require a price
+            if (!price || parseFloat(price) <= 0 || parseFloat(price) > 1) {
+              throw new Error('Invalid price for limit order. Price must be between 0 and 1.');
+            }
+
+            orderResponse = await clobClient.createAndPostOrder({
+              tokenID: marketInfo.clobTokenId,
+              price: parseFloat(price),
+              size: parseFloat(size),
+              side: side === TradeSide.BUY ? Side.BUY : Side.SELL,
+            });
+            
+            logger.info({
+              message: 'Limit order created',
+              privyUserId,
+              price,
+              orderId: orderResponse?.orderID,
+              attempt,
+            });
+          }
+
+          // If we got here without error, break the retry loop
+          if (orderResponse?.orderID || orderResponse?.status) {
+            break;
+          }
+
+          // No order ID returned - might be a silent failure
+          if (!orderResponse?.orderID && attempt < MAX_RETRIES) {
+            logger.warn({
+              message: 'Order response missing orderID, retrying',
+              privyUserId,
+              attempt,
+              response: orderResponse,
+            });
+            await sleep(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1));
+            continue;
+          }
+        } catch (error: any) {
+          lastError = error;
+          
+          if (isRetryableError(error) && attempt < MAX_RETRIES) {
+            const delayMs = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+            logger.warn({
+              message: 'Retryable error during order submission, retrying',
+              privyUserId,
+              attempt,
+              maxRetries: MAX_RETRIES,
+              delayMs,
+              errorStatus: error?.response?.status,
+              errorMessage: error?.message,
+            });
+            await sleep(delayMs);
+            continue;
+          }
+          
+          // Non-retryable error or max retries reached
+          throw error;
+        }
+      }
+
+      // If we still don't have an orderResponse after retries
+      if (!orderResponse) {
+        throw lastError || new Error('Failed to create order after retries');
+      }
+
+      logger.info({
+        message: 'Order created via CLOB client',
+        privyUserId,
+        orderId: orderResponse.orderID,
+        status: orderResponse.status,
+      });
+
+      // Check if response is an HTTP error (status is a number like 400, 500)
+      // CLOB client sometimes returns error responses instead of throwing
+      if (typeof orderResponse.status === 'number' && orderResponse.status >= 400) {
+        const errorMsg = orderResponse.data?.error || orderResponse.statusText || `HTTP ${orderResponse.status}`;
+        throw new Error(errorMsg);
+      }
+
+      // Determine the final status based on CLOB response
+      // CLOB statuses: MATCHED, FILLED, EXECUTED, LIVE, OPEN, CANCELLED, REJECTED
+      // Note: status might be a string (order status) or number (HTTP status code on error)
+      const rawStatus = orderResponse.status;
+      const clobStatus = typeof rawStatus === 'string' ? rawStatus.toUpperCase() : '';
+      let finalStatus: string;
+      
+      if (clobStatus === 'MATCHED' || clobStatus === 'FILLED' || clobStatus === 'EXECUTED') {
+        finalStatus = 'FILLED';
+      } else if (clobStatus === 'LIVE' || clobStatus === 'OPEN') {
+        // Limit order placed but not yet filled - keep as PENDING
+        finalStatus = 'PENDING';
+      } else if (clobStatus === 'CANCELLED' || clobStatus === 'REJECTED') {
+        finalStatus = 'CANCELLED';
+      } else if (!orderResponse.orderID) {
+        // No orderID and no valid status - likely an error
+        throw new Error('Order failed: no orderID returned from CLOB');
+      } else {
+        // For FOK/FAK orders, if we got an orderID it likely succeeded
+        // Default to FILLED for market orders that got a response
+        finalStatus = (orderType === OrderType.FOK || orderType === OrderType.FAK) ? 'FILLED' : 'PENDING';
+      }
+
+      // Calculate actual fee based on trade cost
+      const actualCost = parseFloat(costUsdc);
+      const feeAmount = actualCost * FEE_CONFIG.RATE;
+
+      // Update trade record with order ID, final status, and fee info
+      const updatedTrade = await updateTradeRecordById(tradeRecord.id, {
+        orderId: orderResponse.orderID,
+        status: finalStatus,
+        transactionHash: orderResponse.txHash,
+        blockNumber: orderResponse.blockNumber,
+        feeRate: FEE_CONFIG.RATE,
+        feeAmount: feeAmount.toFixed(18),
+        feeStatus: finalStatus === 'FILLED' ? 'PENDING' : undefined, // Only charge fee if trade filled
+      });
+
+      logger.info({
+        message: 'Trade record updated with CLOB response',
+        privyUserId,
+        tradeId: tradeRecord.id,
+        orderId: orderResponse.orderID,
+        clobStatus,
+        finalStatus,
+        feeAmount,
+      });
+
+      // Transfer fee if trade was filled successfully
+      let feeTransferResult: { success: boolean; txHash?: string; error?: string } | null = null;
+      if (finalStatus === 'FILLED') {
+        try {
+          const { transferFee } = await import('./fee.service');
+          feeTransferResult = await transferFee(privyUserId, feeAmount, tradeRecord.id);
+          
+          if (feeTransferResult.success) {
+            logger.info({
+              message: 'Fee transferred successfully',
+              privyUserId,
+              tradeId: tradeRecord.id,
+              feeAmount,
+              txHash: feeTransferResult.txHash,
+            });
+          } else {
+            logger.warn({
+              message: 'Fee transfer failed, will retry via background job',
+              privyUserId,
+              tradeId: tradeRecord.id,
+              feeAmount,
+              error: feeTransferResult.error,
+            });
+          }
+        } catch (feeError) {
+          logger.error({
+            message: 'Error during fee transfer',
+            privyUserId,
+            tradeId: tradeRecord.id,
+            feeAmount,
+            error: feeError instanceof Error ? feeError.message : String(feeError),
+          });
+          // Don't fail the trade if fee transfer fails - background job will retry
+        }
+      }
+
+      // Fetch updated trade record with fee status
+      const finalTrade = updatedTrade || tradeRecord;
+
+      // Refresh positions, portfolio, and balance after successful trade
+      if (finalStatus === 'FILLED') {
+        // Refresh positions in background
+        try {
+          const { refreshPositions } = await import('../../positions/positions.service');
+          refreshPositions(privyUserId).catch((refreshError) => {
+            logger.warn({
+              message: 'Failed to refresh positions after trade',
+              privyUserId,
+              tradeId: tradeRecord.id,
+              error: refreshError instanceof Error ? refreshError.message : String(refreshError),
+            });
+          });
+        } catch (importError) {
+          logger.warn({
+            message: 'Failed to import positions service for refresh',
+            privyUserId,
+            error: importError instanceof Error ? importError.message : String(importError),
+          });
+        }
+
+        // Refresh USDC balance from Alchemy after trade
+        try {
+          const { refreshAndUpdateBalance } = await import('../../alchemy/balance.service');
+          refreshAndUpdateBalance(user.proxyWalletAddress, privyUserId).catch((balanceError) => {
+            logger.warn({
+              message: 'Failed to refresh balance after trade',
+              privyUserId,
+              tradeId: tradeRecord.id,
+              error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+            });
+          });
+        } catch (importError) {
+          logger.warn({
+            message: 'Failed to import balance service for refresh',
+            privyUserId,
+            error: importError instanceof Error ? importError.message : String(importError),
+          });
+        }
+      }
+
+      return {
+        success: true,
+        orderId: orderResponse.orderID,
+        transactionHash: orderResponse.txHash,
+        status: finalStatus,
+        trade: finalTrade,
+      };
+    } catch (clobError: any) {
+      // CLOB call failed - update trade record to FAILED
+      const { code, message: userMessage } = mapErrorToUserFriendly(clobError);
+      const errorMsg = clobError instanceof Error ? clobError.message : String(clobError);
+      
+      logger.error({
+        message: 'CLOB order failed, updating trade record to FAILED',
+        privyUserId,
+        tradeId: tradeRecord.id,
+        errorCode: code,
+        errorMessage: errorMsg,
+      });
+
+      // Update trade record to FAILED status with error message
+      await updateTradeRecordById(tradeRecord.id, {
+        status: 'FAILED',
+        errorMessage: errorMsg,
+      });
+
+      const isRetryable = isRetryableError(clobError);
+
+      return {
+        success: false,
+        status: 'FAILED',
+        errorCode: code,
+        userMessage: userMessage,
+        message: errorMsg,
+        retryable: isRetryable,
+        trade: { ...tradeRecord, status: 'FAILED' },
+      };
+    }
+  } catch (error: any) {
+    // Pre-CLOB validation error (user not found, no wallet, etc.)
+    const { code, message: userMessage } = mapErrorToUserFriendly(error);
+    const isRetryable = isRetryableError(error);
+    
+    logger.error({
+      message: 'Failed to execute trade (pre-CLOB validation)',
+      privyUserId,
+      marketId: marketInfo.marketId,
+      errorCode: code,
+      userMessage,
+      isRetryable,
+      technicalError: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: code,
+      userMessage: userMessage,
+      message: error instanceof Error ? error.message : String(error),
+      retryable: isRetryable,
+    };
+  }
+}

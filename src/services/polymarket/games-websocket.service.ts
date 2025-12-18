@@ -30,6 +30,8 @@ export class GamesWebSocketService {
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private isInitialized: boolean = false;
 
+  private wsPath: string = '/ws/games';
+  
   /**
    * Initialize the WebSocket server
    * @param server - HTTP server instance to attach WebSocket to
@@ -41,16 +43,29 @@ export class GamesWebSocketService {
       return;
     }
 
-    // Create WebSocket server attached to the HTTP server
+    this.wsPath = path;
+
+    // Create WebSocket server with noServer to handle upgrades manually
     this.wss = new WebSocketServer({ 
-      server,
-      path,
-      // Verify client (can add auth here)
-      verifyClient: (info, callback) => {
-        // For now, accept all connections
-        // In production, add authentication/rate limiting here
-        callback(true);
+      noServer: true,
+      perMessageDeflate: false, // Completely disable compression
+      maxPayload: 100 * 1024 * 1024, // 100MB max payload
+      clientTracking: true,
+    });
+
+    // Handle upgrade requests manually to strip compression extensions
+    server.on('upgrade', (request, socket, head) => {
+      const pathname = new URL(request.url || '', `http://${request.headers.host}`).pathname;
+      
+      if (pathname === this.wsPath) {
+        // Remove Sec-WebSocket-Extensions header to prevent compression negotiation
+        delete request.headers['sec-websocket-extensions'];
+        
+        this.wss!.handleUpgrade(request, socket, head, (ws) => {
+          this.wss!.emit('connection', ws, request);
+        });
       }
+      // Let other handlers deal with other paths
     });
 
     this.setupEventHandlers();
@@ -58,10 +73,10 @@ export class GamesWebSocketService {
     this.startHeartbeat();
     this.isInitialized = true;
 
-    // logger.info({ 
-    //   message: 'Games WebSocket server initialized',
-    //   path,
-    // });
+    logger.info({ 
+      message: 'Games WebSocket server initialized',
+      path,
+    });
   }
 
   /**
@@ -110,7 +125,9 @@ export class GamesWebSocketService {
       // Handle client disconnect
       ws.on('close', (code, reason) => {
         this.clients.delete(ws);
-        logger.info({
+        // Only log at info level for normal closures, debug for abnormal
+        const logFn = code === 1000 || code === 1001 ? logger.info : logger.debug;
+        logFn.call(logger, {
           message: 'WebSocket client disconnected',
           code,
           reason: reason.toString(),
@@ -268,7 +285,7 @@ export class GamesWebSocketService {
   private sendToClient(ws: WebSocket, message: WSMessage): void {
     if (ws.readyState === WebSocket.OPEN) {
       try {
-        ws.send(JSON.stringify(message));
+        ws.send(JSON.stringify(message), { compress: false });
       } catch (error) {
         logger.error({
           message: 'Error sending to WebSocket client',
@@ -288,7 +305,7 @@ export class GamesWebSocketService {
     for (const client of this.clients) {
       if (client.readyState === WebSocket.OPEN) {
         try {
-          client.send(data);
+          client.send(data, { compress: false });
         } catch (error) {
           logger.error({
             message: 'Error broadcasting to WebSocket client',

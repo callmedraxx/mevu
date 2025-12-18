@@ -27,8 +27,22 @@ import {
   updateUserProxyWallet, 
   getUserByPrivyId,
   isUsernameAvailable,
+  updateUserSessionSigner,
 } from './user.service';
 import { CreateUserRequest, UserProfile } from './privy.types';
+
+/**
+ * Cache for RelayerClient instances per user
+ * Key: privyUserId, Value: { relayerClient, wallet, builderConfig, signer, walletId, embeddedWalletAddress }
+ */
+const relayerClientCache = new Map<string, {
+  relayerClient: any;
+  wallet: any;
+  builderConfig: any;
+  signer: any;
+  walletId?: string;
+  embeddedWalletAddress: string;
+}>();
 
 // Note: These types match the Polymarket RelayerClient
 // You'll need to install: npm install @polymarket/builder-relayer-client @polymarket/builder-signing-sdk
@@ -134,16 +148,18 @@ async function createApprovalTransactions(): Promise<Transaction[]> {
  * 2. Get or create embedded wallet (ensures one wallet per user)
  * 3. Validates the username is available
  * 4. Creates user record in database
- * 5. Deploys a Gnosis Safe via Polymarket relayer
- * 6. Updates user record with proxy wallet address
+ * 5. Adds session signer to enable backend signing (if userJwt provided)
+ * 6. Deploys a Gnosis Safe via Polymarket relayer
+ * 7. Updates user record with proxy wallet address
  * 
  * @param privyUserId - The Privy user ID
  * @param username - Desired username
- * @param embeddedWalletAddress - Optional: The user's Privy embedded wallet address (if not provided, will be created/fetched)
+ * @param userJwt - Optional: User JWT token for adding session signer (if not provided, will use authorization private key)
  */
 export async function registerUserAndDeployWallet(
   privyUserId: string,
-  username: string
+  username: string,
+  userJwt?: string
 ): Promise<{ user: UserProfile; proxyWalletAddress: string | null; embeddedWalletAddress: string }> {
   logger.info({
     message: 'Starting user registration and wallet deployment',
@@ -180,12 +196,156 @@ export async function registerUserAndDeployWallet(
       embeddedWalletAddress: existingUser.embeddedWalletAddress,
     });
 
+    // Try to add session signer first if not already added
+    if (!existingUser.sessionSignerEnabled) {
+      try {
+        const { privyService } = await import('./privy.service');
+        const { privyConfig } = await import('./privy.config');
+        
+        const signerId = privyConfig.defaultSignerId;
+        if (signerId) {
+          logger.info({
+            message: 'Adding session signer for existing user before deploying proxy wallet',
+            privyUserId,
+            walletAddress: existingUser.embeddedWalletAddress,
+          });
+          
+          await privyService.addSessionSigner(
+            privyUserId,
+            existingUser.embeddedWalletAddress,
+            signerId
+          );
+          
+          await updateUserSessionSigner(privyUserId, true);
+        }
+      } catch (addSignerError) {
+        logger.warn({
+          message: 'Failed to add session signer for existing user - deployment may fail',
+          privyUserId,
+          error: addSignerError instanceof Error ? addSignerError.message : String(addSignerError),
+        });
+      }
+    }
+    
     try {
       const proxyWalletAddress = await deployProxyWallet(privyUserId, existingUser.embeddedWalletAddress);
-      const updatedUser = await updateUserProxyWallet(privyUserId, proxyWalletAddress);
+      
+      // IMPORTANT: Wrap this in its own try-catch so database update failures don't get treated as deployment failures
+      let updatedUser: UserProfile | null = null;
+      let updateError: Error | null = null;
+      
+      try {
+        updatedUser = await updateUserProxyWallet(privyUserId, proxyWalletAddress);
+      } catch (updateErr) {
+        updateError = updateErr instanceof Error ? updateErr : new Error(String(updateErr));
+        logger.error({
+          message: 'Database update failed after proxy wallet deployment for existing user',
+          privyUserId,
+          proxyWalletAddress,
+          error: updateError.message,
+          note: 'Wallet is deployed on-chain. Will retry database update.',
+        });
+      }
       
       if (!updatedUser) {
-        throw new Error('Failed to update user with proxy wallet address');
+        // Retry the update - wallet is deployed, we just need to save it to database
+        logger.warn({
+          message: 'First attempt to update existing user with proxy wallet failed, retrying',
+          privyUserId,
+          proxyWalletAddress,
+          hadError: !!updateError,
+          errorMessage: updateError?.message,
+        });
+        
+        // Wait a moment and retry
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        try {
+          updatedUser = await updateUserProxyWallet(privyUserId, proxyWalletAddress);
+        } catch (retryErr) {
+          updateError = retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+          logger.error({
+            message: 'Database update retry also failed for existing user',
+            privyUserId,
+            proxyWalletAddress,
+            error: updateError.message,
+          });
+        }
+        
+        if (!updatedUser) {
+          // This is critical - wallet is deployed but we can't save it
+          logger.error({
+            message: 'CRITICAL: Proxy wallet deployed but failed to save to database after retry for existing user',
+            privyUserId,
+            proxyWalletAddress,
+            error: updateError?.message,
+            note: 'Wallet is deployed on-chain but not saved in database. Will attempt final recovery.',
+          });
+          
+          // Final attempt with longer delay
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          try {
+            updatedUser = await updateUserProxyWallet(privyUserId, proxyWalletAddress);
+            if (updatedUser) {
+              logger.info({
+                message: 'Successfully updated existing user with proxy wallet on final attempt',
+                privyUserId,
+                proxyWalletAddress,
+              });
+            }
+          } catch (finalErr) {
+            const finalError = finalErr instanceof Error ? finalErr : new Error(String(finalErr));
+            logger.error({
+              message: 'All database update attempts failed for existing user',
+              privyUserId,
+              proxyWalletAddress,
+              error: finalError.message,
+            });
+            throw new Error(`Failed to update user with proxy wallet address after all retries. Wallet deployed at: ${proxyWalletAddress}. Error: ${finalError.message}`);
+          }
+        } else {
+          logger.info({
+            message: 'Successfully updated existing user with proxy wallet on retry',
+            privyUserId,
+            proxyWalletAddress,
+          });
+        }
+      }
+
+      // Ensure we have an updated user before proceeding
+      if (!updatedUser) {
+        throw new Error(`Failed to update user with proxy wallet address after all retries. Wallet deployed at: ${proxyWalletAddress}`);
+      }
+
+      // Start tracking USDC.e balance for the proxy wallet
+      // IMPORTANT: Don't await this - it might hang. Start it in the background.
+      // The database update is more important than balance tracking.
+      try {
+        const { polygonUsdcBalanceService } = await import('../polygon/polygon-usdc-balance.service');
+        // Start watching in background - don't block on it
+        polygonUsdcBalanceService.watchAddress(proxyWalletAddress, privyUserId).then(() => {
+          logger.info({
+            message: 'Started tracking USDC.e balance for proxy wallet',
+            privyUserId,
+            proxyWalletAddress,
+          });
+        }).catch((balanceError) => {
+          logger.warn({
+            message: 'Failed to start balance tracking (non-critical)',
+            privyUserId,
+            proxyWalletAddress,
+            error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+          });
+        });
+        // Don't await - let it run in background
+      } catch (balanceError) {
+        // Don't fail if balance tracking fails
+        logger.warn({
+          message: 'Failed to start balance tracking (non-critical)',
+          privyUserId,
+          proxyWalletAddress,
+          error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+        });
       }
 
       return {
@@ -194,8 +354,64 @@ export async function registerUserAndDeployWallet(
         embeddedWalletAddress: updatedUser.embeddedWalletAddress,
       };
     } catch (error) {
-      // If deployment fails due to session signer, return user without proxy wallet
+      // Check if this is a database update error (wallet was deployed but not saved)
       const errorMessage = error instanceof Error ? error.message : String(error);
+      const isDatabaseUpdateError = errorMessage.toLowerCase().includes('failed to update user with proxy wallet') ||
+                                    errorMessage.toLowerCase().includes('wallet deployed at:');
+      
+      if (isDatabaseUpdateError) {
+        // CRITICAL: Wallet was deployed but database update failed
+        logger.error({
+          message: 'CRITICAL: Proxy wallet deployed but database update failed for existing user',
+          privyUserId,
+          username: existingUser.username,
+          embeddedWalletAddress: existingUser.embeddedWalletAddress,
+          error: errorMessage,
+          note: 'Wallet is deployed on-chain. Database update failed. User may need to manually update proxy wallet address.',
+        });
+        
+        // Extract proxy wallet address from error message if available
+        const proxyWalletMatch = errorMessage.match(/wallet deployed at: (0x[a-fA-F0-9]{40})/i);
+        const deployedProxyAddress = proxyWalletMatch ? proxyWalletMatch[1] : null;
+        
+        // Try one more time to update the database
+        if (deployedProxyAddress) {
+          logger.info({
+            message: 'Attempting final database update with deployed proxy wallet address for existing user',
+            privyUserId,
+            proxyWalletAddress: deployedProxyAddress,
+          });
+          
+          try {
+            const finalUpdatedUser = await updateUserProxyWallet(privyUserId, deployedProxyAddress);
+            if (finalUpdatedUser) {
+              logger.info({
+                message: 'Successfully updated existing user with proxy wallet on final attempt',
+                privyUserId,
+                proxyWalletAddress: deployedProxyAddress,
+              });
+              
+              return {
+                user: finalUpdatedUser,
+                proxyWalletAddress: deployedProxyAddress,
+                embeddedWalletAddress: finalUpdatedUser.embeddedWalletAddress,
+              };
+            }
+          } catch (finalUpdateError) {
+            logger.error({
+              message: 'Final database update attempt also failed for existing user',
+              privyUserId,
+              proxyWalletAddress: deployedProxyAddress,
+              error: finalUpdateError instanceof Error ? finalUpdateError.message : String(finalUpdateError),
+            });
+          }
+        }
+        
+        // If we still can't update, throw the error so it's clear something went wrong
+        throw new Error(`Proxy wallet was deployed but failed to save to database. Wallet address: ${deployedProxyAddress || 'unknown'}. Please contact support or manually update via API.`);
+      }
+      
+      // If deployment fails due to session signer, return user without proxy wallet
       const isSessionSignerError = errorMessage.toLowerCase().includes('session signer') || 
                                     errorMessage.toLowerCase().includes('401') ||
                                     errorMessage.toLowerCase().includes('not authorized');
@@ -233,11 +449,15 @@ export async function registerUserAndDeployWallet(
   // Get or create embedded wallet via Privy API
   // This will check for existing wallet first, or create a new one if needed
   const { privyService } = await import('./privy.service');
-  const finalEmbeddedWalletAddress = await privyService.createEmbeddedWallet(privyUserId);
+  const walletResult = await privyService.createEmbeddedWallet(privyUserId);
+  const finalEmbeddedWalletAddress = walletResult.address;
+  const walletId = walletResult.walletId; // Wallet ID from creation (if wallet was just created)
+  
   logger.info({
     message: 'Got or created embedded wallet',
     privyUserId,
     walletAddress: finalEmbeddedWalletAddress,
+    walletId: walletId || 'not available',
   });
 
   // Step 3: Validate username
@@ -261,18 +481,204 @@ export async function registerUserAndDeployWallet(
     embeddedWalletAddress: user.embeddedWalletAddress,
   });
 
-  // Step 5: Try to deploy proxy wallet via Polymarket relayer
-  // NOTE: This requires session signer authorization. If it fails, registration still succeeds
-  // User can deploy proxy wallet later via POST /api/users/:privyUserId/deploy-proxy-wallet
+  // Step 5: Add session signer to enable backend signing (before deploying proxy wallet)
+  // NOTE: If wallet was just created, it may already have the session signer added during creation
+  // We'll try to add it anyway - addSessionSigner will detect if it already exists and skip
+  try {
+    const { privyService } = await import('./privy.service');
+    const { privyConfig } = await import('./privy.config');
+    
+    const signerId = privyConfig.defaultSignerId;
+    if (!signerId) {
+      logger.warn({
+        message: 'No default signer ID configured - session signer will not be added',
+        privyUserId,
+        note: 'Set PRIVY_SIGNER_ID environment variable to enable automatic session signer addition',
+      });
+    } else {
+      logger.info({
+        message: 'Adding session signer to enable backend signing',
+        privyUserId,
+        walletAddress: finalEmbeddedWalletAddress,
+        walletId: walletId || 'will be looked up',
+        signerId,
+        hasUserJwt: !!userJwt,
+      });
+      
+      try {
+        // Use walletId directly if we have it (from wallet creation), otherwise addSessionSigner will look it up
+        // Pass walletId as an optional parameter - we'll need to modify addSessionSigner to accept it
+        await privyService.addSessionSigner(
+          privyUserId,
+          finalEmbeddedWalletAddress,
+          signerId,
+          undefined, // policyIds
+          userJwt, // Use user JWT if provided, otherwise will use authorization private key
+          walletId // Pass walletId if available to avoid lookup
+        );
+        
+        // Update user record to indicate session signer is enabled
+        await updateUserSessionSigner(privyUserId, true);
+        
+        logger.info({
+          message: 'Session signer added successfully during registration',
+          privyUserId,
+        });
+      } catch (addSignerError) {
+        const errorMessage = addSignerError instanceof Error ? addSignerError.message : String(addSignerError);
+        
+        // If error is "already exists", that's fine - wallet was created with signer already
+        if (errorMessage.toLowerCase().includes('already exists') || errorMessage.toLowerCase().includes('session signer already exists')) {
+          logger.info({
+            message: 'Session signer already exists (wallet was created with signer) - this is expected',
+            privyUserId,
+          });
+          // Mark session signer as enabled since it already exists
+          await updateUserSessionSigner(privyUserId, true);
+        } else {
+          logger.warn({
+            message: 'Failed to add session signer during registration - proxy wallet deployment may fail',
+            privyUserId,
+            error: errorMessage,
+            note: 'User can add session signer later via POST /api/users/add-session-signer',
+          });
+          // Continue - we'll try to deploy anyway, but it will likely fail
+        }
+      }
+    }
+  } catch (sessionSignerError) {
+    logger.warn({
+      message: 'Error during session signer setup - continuing with registration',
+      privyUserId,
+      error: sessionSignerError instanceof Error ? sessionSignerError.message : String(sessionSignerError),
+    });
+    // Continue - registration succeeds even if session signer setup fails
+  }
+
+  // Step 6: Try to deploy proxy wallet via Polymarket relayer
+  // NOTE: This now works because session signer was added above
+  // If it fails, registration still succeeds and user can deploy later
   let proxyWalletAddress: string | null = null;
   try {
-    proxyWalletAddress = await deployProxyWallet(privyUserId, finalEmbeddedWalletAddress);
+    proxyWalletAddress = await deployProxyWallet(privyUserId, finalEmbeddedWalletAddress, walletId);
     
     // Step 6: Update user record with proxy wallet
-    const updatedUser = await updateUserProxyWallet(privyUserId, proxyWalletAddress);
+    // IMPORTANT: Wrap this in its own try-catch so database update failures don't get treated as deployment failures
+    let updatedUser: UserProfile | null = null;
+    let updateError: Error | null = null;
     
+    try {
+      updatedUser = await updateUserProxyWallet(privyUserId, proxyWalletAddress);
+    } catch (updateErr) {
+      updateError = updateErr instanceof Error ? updateErr : new Error(String(updateErr));
+      logger.error({
+        message: 'Database update failed after proxy wallet deployment',
+        privyUserId,
+        proxyWalletAddress,
+        error: updateError.message,
+        note: 'Wallet is deployed on-chain. Will retry database update.',
+      });
+    }
+
     if (!updatedUser) {
-      throw new Error('Failed to update user with proxy wallet address');
+      // Retry the update - wallet is deployed, we just need to save it to database
+      logger.warn({
+        message: 'First attempt to update user with proxy wallet failed, retrying',
+        privyUserId,
+        proxyWalletAddress,
+        hadError: !!updateError,
+        errorMessage: updateError?.message,
+      });
+      
+      // Wait a moment and retry
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      try {
+        updatedUser = await updateUserProxyWallet(privyUserId, proxyWalletAddress);
+      } catch (retryErr) {
+        updateError = retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+        logger.error({
+          message: 'Database update retry also failed',
+          privyUserId,
+          proxyWalletAddress,
+          error: updateError.message,
+        });
+      }
+      
+      if (!updatedUser) {
+        // This is critical - wallet is deployed but we can't save it
+        logger.error({
+          message: 'CRITICAL: Proxy wallet deployed but failed to save to database after retry',
+          privyUserId,
+          proxyWalletAddress,
+          error: updateError?.message,
+          note: 'Wallet is deployed on-chain but not saved in database. Will attempt final recovery.',
+        });
+        
+        // Final attempt with longer delay
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        try {
+          updatedUser = await updateUserProxyWallet(privyUserId, proxyWalletAddress);
+          if (updatedUser) {
+            logger.info({
+              message: 'Successfully updated user with proxy wallet on final attempt',
+              privyUserId,
+              proxyWalletAddress,
+            });
+          }
+        } catch (finalErr) {
+          const finalError = finalErr instanceof Error ? finalErr : new Error(String(finalErr));
+          logger.error({
+            message: 'All database update attempts failed',
+            privyUserId,
+            proxyWalletAddress,
+            error: finalError.message,
+          });
+          throw new Error(`Failed to update user with proxy wallet address after all retries. Wallet deployed at: ${proxyWalletAddress}. Error: ${finalError.message}`);
+        }
+      } else {
+        logger.info({
+          message: 'Successfully updated user with proxy wallet on retry',
+          privyUserId,
+          proxyWalletAddress,
+        });
+      }
+    }
+
+    // Ensure we have an updated user before proceeding
+    if (!updatedUser) {
+      throw new Error(`Failed to update user with proxy wallet address after all retries. Wallet deployed at: ${proxyWalletAddress}`);
+    }
+
+    // Step 7: Start tracking USDC.e balance for the proxy wallet
+    // IMPORTANT: Don't await this - it might hang. Start it in the background.
+    // The database update is more important than balance tracking.
+    try {
+      const { polygonUsdcBalanceService } = await import('../polygon/polygon-usdc-balance.service');
+      // Start watching in background - don't block on it
+      polygonUsdcBalanceService.watchAddress(proxyWalletAddress, privyUserId).then(() => {
+        logger.info({
+          message: 'Started tracking USDC.e balance for proxy wallet',
+          privyUserId,
+          proxyWalletAddress,
+        });
+      }).catch((balanceError) => {
+        logger.warn({
+          message: 'Failed to start balance tracking (non-critical)',
+          privyUserId,
+          proxyWalletAddress,
+          error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+        });
+      });
+      // Don't await - let it run in background
+    } catch (balanceError) {
+      // Don't fail registration if balance tracking fails
+      logger.warn({
+        message: 'Failed to start balance tracking (non-critical)',
+        privyUserId,
+        proxyWalletAddress,
+        error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+      });
     }
 
     logger.info({
@@ -289,9 +695,67 @@ export async function registerUserAndDeployWallet(
       embeddedWalletAddress: finalEmbeddedWalletAddress,
     };
   } catch (error) {
+    // Check if this is a database update error (wallet was deployed but not saved)
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const isDatabaseUpdateError = errorMessage.toLowerCase().includes('failed to update user with proxy wallet') ||
+                                  errorMessage.toLowerCase().includes('wallet deployed at:');
+    
+    if (isDatabaseUpdateError) {
+      // CRITICAL: Wallet was deployed but database update failed
+      // We should NOT return user without proxy wallet - this is a critical error
+      logger.error({
+        message: 'CRITICAL: Proxy wallet deployed but database update failed',
+        privyUserId,
+        username: user.username,
+        embeddedWalletAddress: finalEmbeddedWalletAddress,
+        error: errorMessage,
+        note: 'Wallet is deployed on-chain. Database update failed. User may need to manually update proxy wallet address.',
+      });
+      
+      // Extract proxy wallet address from error message if available
+      const proxyWalletMatch = errorMessage.match(/wallet deployed at: (0x[a-fA-F0-9]{40})/i);
+      const deployedProxyAddress = proxyWalletMatch ? proxyWalletMatch[1] : null;
+      
+      // Try one more time to update the database
+      if (deployedProxyAddress) {
+        logger.info({
+          message: 'Attempting final database update with deployed proxy wallet address',
+          privyUserId,
+          proxyWalletAddress: deployedProxyAddress,
+        });
+        
+        try {
+          const finalUpdatedUser = await updateUserProxyWallet(privyUserId, deployedProxyAddress);
+          if (finalUpdatedUser) {
+            logger.info({
+              message: 'Successfully updated user with proxy wallet on final attempt',
+              privyUserId,
+              proxyWalletAddress: deployedProxyAddress,
+            });
+            
+            return {
+              user: finalUpdatedUser,
+              proxyWalletAddress: deployedProxyAddress,
+              embeddedWalletAddress: finalEmbeddedWalletAddress,
+            };
+          }
+        } catch (finalUpdateError) {
+          logger.error({
+            message: 'Final database update attempt also failed',
+            privyUserId,
+            proxyWalletAddress: deployedProxyAddress,
+            error: finalUpdateError instanceof Error ? finalUpdateError.message : String(finalUpdateError),
+          });
+        }
+      }
+      
+      // If we still can't update, throw the error so it's clear something went wrong
+      // The wallet is deployed, but we can't save it to the database
+      throw new Error(`Proxy wallet was deployed but failed to save to database. Wallet address: ${deployedProxyAddress || 'unknown'}. Please contact support or manually update via API.`);
+    }
+    
     // If proxy wallet deployment fails (e.g., session signer not authorized),
     // registration still succeeds - user can deploy later
-    const errorMessage = error instanceof Error ? error.message : String(error);
     const isSessionSignerError = errorMessage.toLowerCase().includes('session signer') || 
                                   errorMessage.toLowerCase().includes('401') ||
                                   errorMessage.toLowerCase().includes('not authorized');
@@ -522,12 +986,13 @@ async function addOwnerToSafe(
  * @param embeddedWalletAddress - The user's embedded wallet address
  * @returns A viem WalletClient configured with Privy signing
  */
-async function createViemWalletForRelayer(
+export async function createViemWalletForRelayer(
   privyUserId: string,
-  embeddedWalletAddress: string
-): Promise<{ wallet: any; builderConfig: any }> {
+  embeddedWalletAddress: string,
+  walletId?: string // Optional: walletId to avoid lookup during signing
+): Promise<{ wallet: any; builderConfig: any; signer: any }> {
   // Create Privy signer adapter for signing
-  const signer = createPrivySigner(privyUserId, embeddedWalletAddress);
+  const signer = createPrivySigner(privyUserId, embeddedWalletAddress, walletId);
   const signerAddress = await signer.getAddress();
   const normalizedAddress = signerAddress.toLowerCase() as `0x${string}`;
   
@@ -536,7 +1001,8 @@ async function createViemWalletForRelayer(
   const { polygon } = await import('viem/chains');
   const { BuilderConfig } = await import('@polymarket/builder-signing-sdk');
   
-  // Create BuilderConfig with remote signing server
+  // Create BuilderConfig with remote signing server for Polymarket order signing
+  // Note: Safe transaction signing uses the wallet's signing methods, not builderConfig
   const builderConfig = new BuilderConfig({
     remoteBuilderConfig: { url: privyConfig.builderSigningServerUrl },
   });
@@ -546,11 +1012,87 @@ async function createViemWalletForRelayer(
   const account = {
     address: normalizedAddress,
     type: 'local' as const,
-    async signMessage({ message }: { message: string }) {
-      const signature = await signer.signMessage(message);
-      return signature as `0x${string}`;
+    async signMessage({ message }: { message: string | { raw: Uint8Array | string } }) {
+      // ViemSigner (from @polymarket/builder-abstract-signer) wraps messages in { raw: Uint8Array }
+      // We need to extract the actual message and convert it properly for our signer
+      let actualMessage: string | Uint8Array;
+      
+      if (typeof message === 'object' && message !== null && 'raw' in message) {
+        // Message is in { raw: Uint8Array | string } format from ViemSigner
+        const rawValue = message.raw;
+        if (typeof rawValue === 'string') {
+          actualMessage = rawValue;
+        } else if (rawValue instanceof Uint8Array) {
+          actualMessage = rawValue;
+        } else if (typeof rawValue === 'object' && rawValue !== null) {
+          // Convert object with numeric keys to Uint8Array
+          const length = Object.keys(rawValue).length;
+          const bytes = new Uint8Array(length);
+          for (let i = 0; i < length; i++) {
+            bytes[i] = (rawValue as any)[i] || 0;
+          }
+          actualMessage = bytes;
+        } else {
+          throw new Error(`Unexpected raw message format: ${typeof rawValue}`);
+        }
+      } else if (typeof message === 'string') {
+        actualMessage = message;
+      } else {
+        throw new Error(`Unexpected message format: ${typeof message}`);
+      }
+      
+      const signature = await signer.signMessage(actualMessage);
+      
+      // Defensive normalization - ensure signature is always a hex string
+      // RelayerClient/ethers might receive the raw object format from Privy
+      if (typeof signature === 'string' && signature.startsWith('0x')) {
+        return signature as `0x${string}`;
+      }
+      
+      // If signature is an object with raw property, normalize it
+      if (signature && typeof signature === 'object' && 'raw' in signature) {
+        const { ethers } = await import('ethers');
+        const rawValue = (signature as any).raw;
+        let bytes: Uint8Array;
+        
+        if (rawValue instanceof Uint8Array) {
+          bytes = rawValue;
+        } else if (typeof rawValue === 'object' && rawValue !== null) {
+          // Convert object with numeric keys to Uint8Array
+          const length = Object.keys(rawValue).length;
+          bytes = new Uint8Array(length);
+          for (let i = 0; i < length; i++) {
+            bytes[i] = rawValue[i] || 0;
+          }
+        } else {
+          throw new Error(`Unexpected raw signature format: ${typeof rawValue}`);
+        }
+        
+        const hexSignature = ethers.utils.hexlify(bytes);
+        logger.warn({
+          message: 'Normalized signature at account level (defensive)',
+          userId: privyUserId,
+          signatureLength: bytes.length,
+        });
+        return hexSignature as `0x${string}`;
+      }
+      
+      // Fallback: try to convert to string
+      const hexSig = typeof signature === 'string' ? signature : String(signature);
+      if (!hexSig.startsWith('0x')) {
+        throw new Error(`Invalid signature format: expected hex string starting with 0x, got ${typeof signature}`);
+      }
+      return hexSig as `0x${string}`;
     },
     async signTypedData({ domain, types, primaryType, message: messageData }: any) {
+      logger.info({
+        message: 'Account signTypedData called',
+        userId: privyUserId,
+        hasDomain: !!domain,
+        hasTypes: !!types,
+        primaryType,
+      });
+      
       // Convert viem types to ethers format for Privy
       const ethersTypes: Record<string, ethers.TypedDataField[]> = {};
       for (const [key, value] of Object.entries(types)) {
@@ -571,7 +1113,75 @@ async function createViemWalletForRelayer(
       };
       
       const signature = await signer._signTypedData(ethersDomain, ethersTypes, messageData);
-      return signature as `0x${string}`;
+      
+      logger.info({
+        message: 'Received signature from signer._signTypedData',
+        userId: privyUserId,
+        signatureType: typeof signature,
+        isString: typeof signature === 'string',
+        isObject: typeof signature === 'object',
+        hasRaw: signature && typeof signature === 'object' && 'raw' in signature,
+        signaturePreview: typeof signature === 'string' ? signature.substring(0, 20) + '...' : 'object',
+      });
+      
+      // Defensive normalization - ensure signature is always a hex string
+      // RelayerClient/ethers might receive the raw object format from Privy
+      if (typeof signature === 'string' && signature.startsWith('0x')) {
+        logger.info({
+          message: 'Signature already in hex string format',
+          userId: privyUserId,
+          signatureLength: signature.length,
+        });
+        return signature as `0x${string}`;
+      }
+      
+      // If signature is an object with raw property, normalize it
+      if (signature && typeof signature === 'object' && 'raw' in signature) {
+        logger.warn({
+          message: 'Normalizing signature from raw object format',
+          userId: privyUserId,
+          rawType: typeof (signature as any).raw,
+        });
+        
+        const { ethers } = await import('ethers');
+        const rawValue = (signature as any).raw;
+        let bytes: Uint8Array;
+        
+        if (rawValue instanceof Uint8Array) {
+          bytes = rawValue;
+        } else if (typeof rawValue === 'object' && rawValue !== null) {
+          // Convert object with numeric keys to Uint8Array
+          const length = Object.keys(rawValue).length;
+          bytes = new Uint8Array(length);
+          for (let i = 0; i < length; i++) {
+            bytes[i] = rawValue[i] || 0;
+          }
+        } else {
+          throw new Error(`Unexpected raw signature format: ${typeof rawValue}`);
+        }
+        
+        const hexSignature = ethers.utils.hexlify(bytes);
+        logger.warn({
+          message: 'Normalized typed data signature at account level (defensive)',
+          userId: privyUserId,
+          signatureLength: bytes.length,
+          hexSignature: hexSignature.substring(0, 20) + '...',
+        });
+        return hexSignature as `0x${string}`;
+      }
+      
+      // Fallback: try to convert to string
+      const hexSig = typeof signature === 'string' ? signature : String(signature);
+      if (!hexSig.startsWith('0x')) {
+        logger.error({
+          message: 'Invalid signature format - not a hex string',
+          userId: privyUserId,
+          signatureType: typeof signature,
+          signatureValue: signature,
+        });
+        throw new Error(`Invalid signature format: expected hex string starting with 0x, got ${typeof signature}`);
+      }
+      return hexSig as `0x${string}`;
     },
   } as any;
   
@@ -582,7 +1192,7 @@ async function createViemWalletForRelayer(
     transport: http(privyConfig.rpcUrl),
   });
   
-  return { wallet, builderConfig };
+  return { wallet, builderConfig, signer };
 }
 
 /**
@@ -596,7 +1206,8 @@ async function createViemWalletForRelayer(
  */
 export async function deployProxyWallet(
   privyUserId: string,
-  embeddedWalletAddress: string
+  embeddedWalletAddress: string,
+  walletId?: string // Optional: walletId to avoid lookup during signing
 ): Promise<string> {
   logger.info({
     message: 'Deploying proxy wallet via Polymarket relayer',
@@ -664,34 +1275,53 @@ export async function deployProxyWallet(
       embeddedWalletAddress,
     });
     
-    const { wallet, builderConfig } = await createViemWalletForRelayer(privyUserId, embeddedWalletAddress);
+    // Check cache first
+    const cached = relayerClientCache.get(privyUserId);
+    let relayerClient: any;
+    let wallet: any;
+    let builderConfig: any;
     
-    // Verify wallet address matches embedded wallet address
-    const walletAddress = wallet.account.address.toLowerCase();
-    const normalizedEmbeddedAddress = embeddedWalletAddress.toLowerCase();
-    
-    if (walletAddress !== normalizedEmbeddedAddress) {
-      logger.error({
-        message: 'Wallet address mismatch - cannot deploy proxy wallet',
-        embeddedWalletAddress: normalizedEmbeddedAddress,
+    if (cached && cached.embeddedWalletAddress.toLowerCase() === embeddedWalletAddress.toLowerCase()) {
+      logger.info({
+        message: 'Reusing cached RelayerClient instance',
+        privyUserId,
+        embeddedWalletAddress,
+      });
+      relayerClient = cached.relayerClient;
+      wallet = cached.wallet;
+      builderConfig = cached.builderConfig;
+    } else {
+      // Create new RelayerClient instance
+      const walletResult = await createViemWalletForRelayer(privyUserId, embeddedWalletAddress, walletId);
+      wallet = walletResult.wallet;
+      builderConfig = walletResult.builderConfig;
+      const signer = walletResult.signer;
+      
+      // Verify wallet address matches embedded wallet address
+      const walletAddress = wallet.account.address.toLowerCase();
+      const normalizedEmbeddedAddress = embeddedWalletAddress.toLowerCase();
+      
+      if (walletAddress !== normalizedEmbeddedAddress) {
+        logger.error({
+          message: 'Wallet address mismatch - cannot deploy proxy wallet',
+          embeddedWalletAddress: normalizedEmbeddedAddress,
+          walletAddress: walletAddress,
+        });
+        throw new Error('Wallet address does not match embedded wallet address. Cannot set owner correctly.');
+      }
+      
+      logger.info({
+        message: 'Viem wallet client created successfully - embedded wallet will be set as Safe owner',
+        privyUserId,
         walletAddress: walletAddress,
       });
-      throw new Error('Wallet address does not match embedded wallet address. Cannot set owner correctly.');
-    }
-    
-    logger.info({
-      message: 'Viem wallet client created successfully - embedded wallet will be set as Safe owner',
-      privyUserId,
-      walletAddress: walletAddress,
-    });
-    
-    // Import RelayerTxType
-    const { RelayerTxType } = await import('@polymarket/builder-relayer-client');
-    
-    let relayerClient: any;
-    try {
-      logger.info({
-        message: 'Creating RelayerClient with viem wallet client',
+      
+      // Import RelayerTxType
+      const { RelayerTxType } = await import('@polymarket/builder-relayer-client');
+      
+      try {
+        logger.info({
+          message: 'Creating RelayerClient with viem wallet client',
         privyUserId,
         relayerUrl: privyConfig.relayerUrl,
         chainId: privyConfig.chainId,
@@ -715,6 +1345,22 @@ export async function deployProxyWallet(
         owner: walletAddress,
         privyUserId,
       });
+      
+      // Cache the RelayerClient instance for reuse
+      relayerClientCache.set(privyUserId, {
+        relayerClient,
+        wallet,
+        builderConfig,
+        signer,
+        walletId: walletId || undefined,
+        embeddedWalletAddress,
+      });
+      
+      logger.info({
+        message: 'RelayerClient cached for future use',
+        privyUserId,
+        embeddedWalletAddress,
+      });
     } catch (clientError) {
       // Enhanced error logging to identify what's undefined
       const errorMessage = clientError instanceof Error ? clientError.message : String(clientError);
@@ -737,7 +1383,8 @@ export async function deployProxyWallet(
         throw new Error(`Failed to create RelayerClient: ${errorMessage}. This usually means the wallet or builderConfig is missing required properties. Check that the wallet is properly initialized and builderConfig is correctly configured.`);
       }
       
-      throw new Error(`Failed to create RelayerClient: ${errorMessage}`);
+        throw new Error(`Failed to create RelayerClient: ${errorMessage}`);
+      }
     }
 
     // Get authorization key address (will be co-owner)
@@ -759,6 +1406,8 @@ export async function deployProxyWallet(
       authorizationKeyAddress = '';
     }
 
+    // Get wallet address (from cached or newly created wallet)
+    const walletAddress = wallet.account.address.toLowerCase();
     const owners = [walletAddress];
     if (authorizationKeyAddress) {
       owners.push(authorizationKeyAddress.toLowerCase());
@@ -826,6 +1475,37 @@ export async function deployProxyWallet(
       transactionHash: result.transactionHash,
       privyUserId,
     });
+
+    // Start tracking USDC.e balance for the proxy wallet
+    // IMPORTANT: Don't await this - it might hang. Start it in the background.
+    // The database update is more important than balance tracking.
+    try {
+      const { polygonUsdcBalanceService } = await import('../polygon/polygon-usdc-balance.service');
+      // Start watching in background - don't block on it
+      polygonUsdcBalanceService.watchAddress(safeAddress, privyUserId).then(() => {
+        logger.info({
+          message: 'Started tracking USDC.e balance for proxy wallet',
+          privyUserId,
+          proxyWalletAddress: safeAddress,
+        });
+      }).catch((balanceError) => {
+        logger.warn({
+          message: 'Failed to start balance tracking (non-critical)',
+          privyUserId,
+          proxyWalletAddress: safeAddress,
+          error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+        });
+      });
+      // Don't await - let it run in background
+    } catch (balanceError) {
+      // Don't fail deployment if balance tracking fails
+      logger.warn({
+        message: 'Failed to start balance tracking (non-critical)',
+        privyUserId,
+        proxyWalletAddress: safeAddress,
+        error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+      });
+    }
 
     // Add authorization key as co-owner if configured
     if (authorizationKeyAddress && owners.length > 1) {
@@ -965,21 +1645,56 @@ export async function setupTokenApprovals(
   });
   
   try {
-    const { RelayClient, RelayerTxType } = await import('@polymarket/builder-relayer-client');
+    // Check cache first - reuse RelayerClient from deployment if available
+    const cached = relayerClientCache.get(privyUserId);
+    let relayerClient: any;
     
-    // Create viem wallet client with Privy signing
-    const { wallet, builderConfig } = await createViemWalletForRelayer(
-      privyUserId,
-      user.embeddedWalletAddress
-    );
+    if (cached && cached.embeddedWalletAddress.toLowerCase() === user.embeddedWalletAddress.toLowerCase()) {
+      logger.info({
+        message: 'Reusing cached RelayerClient instance for token approvals',
+        privyUserId,
+        embeddedWalletAddress: user.embeddedWalletAddress,
+      });
+      relayerClient = cached.relayerClient;
+    } else {
+      // Create new RelayerClient if not cached (shouldn't happen normally, but handle gracefully)
+      logger.info({
+        message: 'Creating new RelayerClient for token approvals (cache miss)',
+        privyUserId,
+        embeddedWalletAddress: user.embeddedWalletAddress,
+      });
+      
+      const { RelayClient, RelayerTxType } = await import('@polymarket/builder-relayer-client');
+      
+      // Try to get walletId for user's wallet
+      const { privyService } = await import('./privy.service');
+      const walletId = await privyService.getWalletIdByAddress(privyUserId, user.embeddedWalletAddress);
+      
+      // Create viem wallet client with Privy signing
+      const { wallet, builderConfig, signer } = await createViemWalletForRelayer(
+        privyUserId,
+        user.embeddedWalletAddress,
+        walletId || undefined
+      );
 
-    const relayerClient = new RelayClient(
-      privyConfig.relayerUrl,
-      privyConfig.chainId,
-      wallet, // Pass viem WalletClient (RelayerClient expects this structure)
-      builderConfig,
-      RelayerTxType.SAFE // Specify Safe wallet type
-    );
+      relayerClient = new RelayClient(
+        privyConfig.relayerUrl,
+        privyConfig.chainId,
+        wallet, // Pass viem WalletClient (RelayerClient expects this structure)
+        builderConfig,
+        RelayerTxType.SAFE // Specify Safe wallet type
+      );
+      
+      // Cache it for future use
+      relayerClientCache.set(privyUserId, {
+        relayerClient,
+        wallet,
+        builderConfig,
+        signer,
+        walletId: walletId || undefined,
+        embeddedWalletAddress: user.embeddedWalletAddress,
+      });
+    }
 
     // Create approval transactions (using viem for encoding)
     const approvalTxs = await createApprovalTransactions();
@@ -1001,6 +1716,25 @@ export async function setupTokenApprovals(
       privyUserId,
       transactionHash: result.transactionHash,
     });
+
+    // Update user profile to mark approvals as enabled
+    try {
+      const { updateUserTokenApprovals } = await import('./user.service');
+      await updateUserTokenApprovals(privyUserId, true, true);
+      logger.info({
+        message: 'Updated user token approval statuses',
+        privyUserId,
+        usdcApprovalEnabled: true,
+        ctfApprovalEnabled: true,
+      });
+    } catch (updateError) {
+      // Log error but don't fail the approval - approvals are on-chain
+      logger.error({
+        message: 'Failed to update user token approval statuses (non-critical)',
+        privyUserId,
+        error: updateError instanceof Error ? updateError.message : String(updateError),
+      });
+    }
 
     return {
       success: true,

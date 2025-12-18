@@ -290,6 +290,9 @@ function transformMarket(market: PolymarketMarket): TransformedMarket {
       resolutionSource: market.resolutionSource,
       umaResolutionStatus: market.umaResolutionStatus,
       automaticallyResolved: market.automaticallyResolved,
+      // Trading fields
+      negRisk: market.negRisk,
+      negRiskMarketId: market.negRiskMarketID,
     };
   } catch (error) {
     logger.error({

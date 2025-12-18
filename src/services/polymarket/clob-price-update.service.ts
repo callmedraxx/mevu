@@ -31,9 +31,25 @@ export class ClobPriceUpdateService {
     logger.info({ message: 'Initializing CLOB price update service' });
 
     // Connect to CLOB WebSocket if not connected
-    if (!clobWebSocketService.getStatus().isConnected) {
+    const initialStatus = clobWebSocketService.getStatus();
+    logger.info({
+      message: 'CLOB WebSocket initial status',
+      isConnected: initialStatus.isConnected,
+      isConnecting: initialStatus.isConnecting,
+    });
+
+    if (!initialStatus.isConnected && !initialStatus.isConnecting) {
       await clobWebSocketService.connect();
+      // Wait a bit for connection to establish
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
+
+    const statusAfterConnect = clobWebSocketService.getStatus();
+    logger.info({
+      message: 'CLOB WebSocket status after connect',
+      isConnected: statusAfterConnect.isConnected,
+      isConnecting: statusAfterConnect.isConnecting,
+    });
 
     // Set up order book update handler
     this.setupOrderBookHandler();
@@ -60,10 +76,9 @@ export class ClobPriceUpdateService {
   private setupOrderBookHandler(): void {
     // Register callback for real-time order book updates
     clobWebSocketService.onOrderBookUpdate((updates: ClobOrderBookUpdate[]) => {
-      logger.debug({
+      logger.info({
         message: 'Order book update callback triggered',
         updateCount: updates.length,
-        assetIds: updates.map(u => u.asset_id).slice(0, 5),
       });
       
       // Process updates asynchronously

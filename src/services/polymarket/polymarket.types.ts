@@ -230,6 +230,9 @@ export interface TransformedMarket {
   resolutionSource?: string;
   umaResolutionStatus?: string;
   automaticallyResolved?: boolean;
+  // Trading fields
+  negRisk?: boolean; // If true, uses negative risk trading
+  negRiskMarketId?: string; // Negative risk market ID (required if negRisk is true)
 }
 
 export interface TransformedEvent {

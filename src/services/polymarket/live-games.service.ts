@@ -617,16 +617,24 @@ export async function fetchLiveGames(): Promise<LiveGameEvent[]> {
 }
 
 function isGameEnded(game: LiveGameEvent): boolean {
+  // Check explicit ended/closed flags
   if (game.ended === true) return true;
+  if (game.closed === true) return true;
   
+  // Check if all markets are closed
+  if (game.markets && game.markets.length > 0) {
+    const allMarketsClosed = game.markets.every((m: any) => m.closed === true);
+    if (allMarketsClosed) return true;
+  }
+
+  // Check if end_date + 3 hour grace period has passed
   if (game.endDate) {
     const endDate = new Date(game.endDate);
     const now = new Date();
-    const endDateOnly = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
-    const nowDateOnly = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    if (endDateOnly < nowDateOnly) return true;
+    const graceTime = 3 * 60 * 60 * 1000; // 3 hours
+    if ((endDate.getTime() + graceTime) < now.getTime()) return true;
   }
-  
+
   return false;
 }
 
@@ -640,19 +648,21 @@ export function filterOutEndedGames(games: LiveGameEvent[]): LiveGameEvent[] {
 
 async function cleanupEndedGames(): Promise<number> {
   const isProduction = process.env.NODE_ENV === 'production';
+  const GRACE_PERIOD_HOURS = 3; // 3 hour grace period after end_date
   
   if (!isProduction) {
     let removedCount = 0;
     const now = new Date();
-    const nowDateOnly = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     
     for (const [id, game] of inMemoryGames.entries()) {
-      let isEnded = game.ended === true;
+      // Check explicit ended/closed flags first
+      let isEnded = game.ended === true || game.closed === true;
       
+      // Check if end_date + grace period has passed
       if (!isEnded && game.endDate) {
         const endDate = new Date(game.endDate);
-        const endDateOnly = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
-        isEnded = endDateOnly < nowDateOnly;
+        const graceTime = GRACE_PERIOD_HOURS * 60 * 60 * 1000;
+        isEnded = (endDate.getTime() + graceTime) < now.getTime();
       }
       
       if (isEnded) {
@@ -668,12 +678,23 @@ async function cleanupEndedGames(): Promise<number> {
   const client = await pool.connect();
   
   try {
-    const result = await client.query(
-      `DELETE FROM live_games WHERE ended = true OR (end_date IS NOT NULL AND DATE(end_date) < CURRENT_DATE)`
-    );
+    // Delete games that are:
+    // 1. Marked as ended
+    // 2. Marked as closed (market closed)
+    // 3. End date + 3 hours has passed (grace period for games that didn't update properly)
+    const result = await client.query(`
+      DELETE FROM live_games 
+      WHERE ended = true 
+         OR closed = true 
+         OR (end_date IS NOT NULL AND end_date + INTERVAL '3 hours' < NOW())
+    `);
     
     const removedCount = result.rowCount || 0;
     if (removedCount > 0) {
+      logger.info({
+        message: 'Cleaned up ended games from database',
+        removedCount,
+      });
       gamesCache.clear();
     }
     
@@ -787,40 +808,60 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
   try {
     await client.query('BEGIN');
     
+    if (games.length === 0) {
+      await client.query('COMMIT');
+      return;
+    }
+
+    // Build bulk insert query
+    const values: any[] = [];
+    const placeholders: string[] = [];
+    let paramIndex = 1;
+
     for (const game of games) {
       const ticker = game.ticker || game.slug || game.id || 'UNKNOWN';
+      const rowPlaceholders: string[] = [];
       
-      await client.query(
-        `INSERT INTO live_games (
-          id, ticker, slug, title, description, resolution_source,
-          start_date, end_date, image, icon, active, closed, archived,
-          restricted, liquidity, volume, volume_24hr, competitive,
-          sport, league, series_id, game_id, score, period, elapsed, live, ended,
-          transformed_data, raw_data, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
-        ON CONFLICT (id) DO UPDATE SET
-          ticker = EXCLUDED.ticker, slug = EXCLUDED.slug, title = EXCLUDED.title,
-          description = EXCLUDED.description, resolution_source = EXCLUDED.resolution_source,
-          start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
-          image = EXCLUDED.image, icon = EXCLUDED.icon, active = EXCLUDED.active,
-          closed = EXCLUDED.closed, archived = EXCLUDED.archived, restricted = EXCLUDED.restricted,
-          liquidity = EXCLUDED.liquidity, volume = EXCLUDED.volume, volume_24hr = EXCLUDED.volume_24hr,
-          competitive = EXCLUDED.competitive, sport = EXCLUDED.sport, league = EXCLUDED.league,
-          series_id = EXCLUDED.series_id, game_id = EXCLUDED.game_id, score = EXCLUDED.score,
-          period = EXCLUDED.period, elapsed = EXCLUDED.elapsed, live = EXCLUDED.live,
-          ended = EXCLUDED.ended, transformed_data = EXCLUDED.transformed_data,
-          raw_data = EXCLUDED.raw_data, updated_at = CURRENT_TIMESTAMP`,
-        [
-          game.id, ticker, game.slug, game.title, game.description, game.resolutionSource,
-          game.startDate, game.endDate, game.image, game.icon, game.active, game.closed,
-          game.archived, game.restricted, game.liquidity, game.volume, game.volume24hr,
-          game.competitive, game.sport, game.league, game.seriesId, game.gameId,
-          game.score, game.period, game.elapsed, game.live, game.ended,
-          JSON.stringify(game), JSON.stringify(game.rawData), game.createdAt, game.updatedAt,
-        ]
+      // 29 parameters + 2 CURRENT_TIMESTAMP = 31 total (matching 31 columns)
+      for (let i = 0; i < 29; i++) {
+        rowPlaceholders.push(`$${paramIndex++}`);
+      }
+      rowPlaceholders.push('CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP');
+      placeholders.push(`(${rowPlaceholders.join(', ')})`);
+      
+      values.push(
+        game.id, ticker, game.slug, game.title, game.description, game.resolutionSource,
+        game.startDate, game.endDate, game.image, game.icon, game.active, game.closed,
+        game.archived, game.restricted, game.liquidity, game.volume, game.volume24hr,
+        game.competitive, game.sport, game.league, game.seriesId, game.gameId,
+        game.score, game.period, game.elapsed, game.live, game.ended,
+        JSON.stringify(game), JSON.stringify(game.rawData)
       );
     }
-    
+
+    const insertQuery = `
+      INSERT INTO live_games (
+        id, ticker, slug, title, description, resolution_source,
+        start_date, end_date, image, icon, active, closed, archived,
+        restricted, liquidity, volume, volume_24hr, competitive,
+        sport, league, series_id, game_id, score, period, elapsed, live, ended,
+        transformed_data, raw_data, created_at, updated_at
+      ) VALUES ${placeholders.join(', ')}
+      ON CONFLICT (id) DO UPDATE SET
+        ticker = EXCLUDED.ticker, slug = EXCLUDED.slug, title = EXCLUDED.title,
+        description = EXCLUDED.description, resolution_source = EXCLUDED.resolution_source,
+        start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
+        image = EXCLUDED.image, icon = EXCLUDED.icon, active = EXCLUDED.active,
+        closed = EXCLUDED.closed, archived = EXCLUDED.archived, restricted = EXCLUDED.restricted,
+        liquidity = EXCLUDED.liquidity, volume = EXCLUDED.volume, volume_24hr = EXCLUDED.volume_24hr,
+        competitive = EXCLUDED.competitive, sport = EXCLUDED.sport, league = EXCLUDED.league,
+        series_id = EXCLUDED.series_id, game_id = EXCLUDED.game_id, score = EXCLUDED.score,
+        period = EXCLUDED.period, elapsed = EXCLUDED.elapsed, live = EXCLUDED.live,
+        ended = EXCLUDED.ended, transformed_data = EXCLUDED.transformed_data,
+        raw_data = EXCLUDED.raw_data, updated_at = CURRENT_TIMESTAMP
+    `;
+
+    await client.query(insertQuery, values);
     await client.query('COMMIT');
     
     for (const game of games) {
@@ -829,7 +870,14 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
     
     logger.info({ message: 'Games stored in database', count: games.length });
   } catch (error) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      logger.error({
+        message: 'Error during ROLLBACK in storeGamesInDatabase',
+        error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+      });
+    }
     logger.error({
       message: 'Error storing games in database',
       error: error instanceof Error ? error.message : String(error),
@@ -1290,15 +1338,24 @@ async function updateGameInDatabase(gameUpdate: Partial<LiveGame> & { id: string
     
     await client.query(`UPDATE live_games SET ${updates.join(', ')} WHERE id = $${paramIndex}`, values);
     
-    // Update cache
-    if (gamesCache.has(gameUpdate.id)) {
-      const cached = gamesCache.get(gameUpdate.id)!;
-      const updatedGame = { ...cached, ...gameUpdate, updatedAt: new Date() };
+    // Update cache and broadcast - ALWAYS broadcast even if not in cache
+    const cached = gamesCache.get(gameUpdate.id);
+    const updatedGame = cached 
+      ? { ...cached, ...gameUpdate, updatedAt: new Date() }
+      : gameUpdate as LiveGame;
+    
+    if (cached) {
       gamesCache.set(gameUpdate.id, updatedGame);
-      
-      if (liveGamesService) {
-        liveGamesService.broadcastPartialUpdate(updatedGame);
-      }
+    }
+    
+    // Always broadcast updates
+    if (liveGamesService) {
+      logger.info({
+        message: 'Broadcasting game update',
+        gameId: gameUpdate.id,
+        inCache: !!cached,
+      });
+      liveGamesService.broadcastPartialUpdate(updatedGame);
     }
   } finally {
     client.release();
@@ -1457,6 +1514,13 @@ export class LiveGamesService {
   }
 
   broadcastPartialUpdate(game: LiveGame): void {
+    logger.info({
+      message: 'Broadcasting partial update to callbacks',
+      gameId: game.id,
+      slug: game.slug,
+      callbackCount: this.ssePartialBroadcastCallbacks.size,
+    });
+
     for (const callback of this.ssePartialBroadcastCallbacks) {
       try {
         callback(game);

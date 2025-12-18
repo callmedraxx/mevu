@@ -17,8 +17,11 @@ RUN npm run build
 # Remove dev dependencies
 RUN npm prune --production
 
+# Copy migrations directory (needed at runtime for migration script)
+COPY migrations ./migrations
+
 # Expose port
 EXPOSE 3000
 
-# Start the application
+# Start the application (migrations run automatically in index.ts on startup)
 CMD ["npm", "start"]

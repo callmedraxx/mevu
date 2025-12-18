@@ -8,14 +8,22 @@ export interface ActivityWatcherOutcome {
   shortLabel?: string;
   price: number;
   probability: number;
+  // Trading fields
+  clobTokenId?: string; // Required for executing trades
 }
 
 export interface ActivityWatcherMarket {
   id: string;
   title: string;
+  question: string; // Full market question for trading context
   volume: string;
   liquidity: string;
   outcomes: ActivityWatcherOutcome[];
+  // Trading fields
+  conditionId?: string; // Market condition ID for trading contract
+  clobTokenIds?: string[]; // Token IDs for all outcomes
+  negRisk?: boolean; // If true, uses negative risk trading
+  negRiskMarketId?: string; // Negative risk market ID (required if negRisk is true)
 }
 
 export interface ActivityWatcherGame {
@@ -67,6 +75,8 @@ function transformOutcome(outcome: TransformedOutcome): ActivityWatcherOutcome {
     shortLabel: outcome.shortLabel,
     price: Number(price.toFixed(2)),
     probability,
+    // Trading fields
+    clobTokenId: outcome.clobTokenId,
   };
 }
 
@@ -85,9 +95,15 @@ function simplifyMarket(market: TransformedMarket): ActivityWatcherMarket | null
     return {
       id: market.id,
       title: market.question || market.slug || market.id,
+      question: market.question || market.slug || market.id,
       volume: formatCurrency(market.volume || market.volume24Hr || 0),
       liquidity: formatCurrency(market.liquidity ?? 0),
       outcomes,
+      // Trading fields
+      conditionId: market.conditionId,
+      clobTokenIds: market.clobTokenIds,
+      negRisk: market.negRisk,
+      negRiskMarketId: market.negRiskMarketId,
     };
   } catch (error) {
     logger.warn({

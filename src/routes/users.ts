@@ -4,7 +4,9 @@
  */
 
 import { Router, Request, Response } from 'express';
+import axios, { AxiosError } from 'axios';
 import { logger } from '../config/logger';
+import { getCache, setCache } from '../utils/cache';
 import {
   registerUserAndDeployWallet,
   setupTokenApprovals,
@@ -21,6 +23,80 @@ import {
 import { privyService } from '../services/privy/privy.service';
 
 const router = Router();
+
+/**
+ * Cache TTL for supported assets: 24 hours (86400 seconds)
+ */
+const SUPPORTED_ASSETS_CACHE_TTL = 86400;
+const SUPPORTED_ASSETS_CACHE_KEY = 'polymarket:supported-assets';
+
+/**
+ * Fetch supported assets from Polymarket bridge API
+ * Results are cached for 24 hours
+ */
+async function getSupportedAssets(): Promise<any[]> {
+  // Check cache first
+  const cached = await getCache(SUPPORTED_ASSETS_CACHE_KEY);
+  if (cached) {
+    try {
+      const parsed = JSON.parse(cached);
+      logger.info({
+        message: 'Using cached supported assets',
+        assetCount: parsed?.supportedAssets?.length || 0,
+      });
+      return parsed.supportedAssets || [];
+    } catch (parseError) {
+      logger.warn({
+        message: 'Failed to parse cached supported assets, fetching fresh',
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+      });
+    }
+  }
+
+  // Fetch from API
+  const bridgeApiUrl = process.env.POLYMARKET_BRIDGE_API_URL || 'https://bridge.polymarket.com';
+  
+  try {
+    const response = await axios.get(`${bridgeApiUrl}/supported-assets`, {
+      headers: {
+        'Accept': 'application/json',
+      },
+      timeout: 10000,
+    });
+
+    const supportedAssets = response.data?.supportedAssets || [];
+    
+    // Cache for 24 hours
+    await setCache(SUPPORTED_ASSETS_CACHE_KEY, JSON.stringify(response.data), SUPPORTED_ASSETS_CACHE_TTL);
+    
+    logger.info({
+      message: 'Fetched supported assets from Polymarket bridge',
+      assetCount: supportedAssets.length,
+    });
+
+    return supportedAssets;
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching supported assets from Polymarket bridge',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    
+    // If we have cached data, use it even if expired
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        logger.warn({
+          message: 'Using stale cached supported assets due to API error',
+        });
+        return parsed.supportedAssets || [];
+      } catch {
+        // Ignore parse errors
+      }
+    }
+    
+    throw error;
+  }
+}
 
 /**
  * Helper function to extract error message from various error types
@@ -217,7 +293,7 @@ router.get('/check-privy-config', async (req: Request, res: Response) => {
 
 router.post('/register', async (req: Request, res: Response) => {
   try {
-    const { privyUserId, username } = req.body;
+    const { privyUserId, username, userJwt } = req.body;
 
     if (!privyUserId || !username) {
       return res.status(400).json({
@@ -234,22 +310,27 @@ router.post('/register', async (req: Request, res: Response) => {
       });
     }
 
-    // Register user and optionally deploy proxy wallet
-    // Embedded wallet will be created/fetched automatically via Privy API
-    // Proxy wallet deployment requires session signer authorization - if not available,
-    // registration still succeeds and user can deploy proxy wallet later
+    // Register user and deploy proxy wallet
+    // Flow:
+    // 1. Creates user record
+    // 2. Gets/creates embedded wallet
+    // 3. Adds session signer (using userJwt if provided, otherwise uses authorization private key)
+    // 4. Deploys proxy wallet (now works because session signer is added)
+    // 
+    // If userJwt is provided, it will be used to authorize adding the session signer.
+    // If not provided, the backend will use PRIVY_AUTHORIZATION_PRIVATE_KEY if configured.
     const result = await registerUserAndDeployWallet(
       privyUserId,
-      username
-      // embeddedWalletAddress is not needed - will be created automatically
+      username,
+      userJwt // Optional: User JWT for session signer authorization
     );
 
     // Determine next step based on whether proxy wallet was deployed
     let nextStep: string;
     if (result.proxyWalletAddress) {
-      nextStep = 'User must authorize session signer, then call POST /api/users/session-signer/confirm';
+      nextStep = 'Registration complete! Proxy wallet deployed successfully.';
     } else {
-      nextStep = 'User must authorize session signer, then call POST /api/users/:privyUserId/deploy-proxy-wallet to deploy proxy wallet';
+      nextStep = 'Registration complete, but proxy wallet deployment failed. Call POST /api/users/:privyUserId/deploy-proxy-wallet to retry.';
     }
 
     res.status(201).json({
@@ -258,7 +339,7 @@ router.post('/register', async (req: Request, res: Response) => {
       embeddedWalletAddress: result.embeddedWalletAddress,
       proxyWalletAddress: result.proxyWalletAddress,
       nextStep,
-      requiresSessionSigner: !result.proxyWalletAddress,
+      sessionSignerEnabled: result.user.sessionSignerEnabled,
     });
   } catch (error) {
     // Enhanced error logging
@@ -1502,6 +1583,270 @@ router.delete('/delete-all', async (req: Request, res: Response) => {
       success: false,
       error: 'Failed to delete all users',
       details: extractErrorMessage(error),
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/users/{privyUserId}/deposit-addresses:
+ *   post:
+ *     summary: Get deposit addresses for Polymarket bridge
+ *     description: Generates unique deposit addresses for bridging assets (ETH, Base, Solana, Polygon USDC.e) to Polymarket. Assets are automatically bridged and swapped to USDC.e on Polygon. Response includes enriched chain information with minimum checkout amounts.
+ *     tags: [Users]
+ *     parameters:
+ *       - in: path
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: The Privy user ID
+ *         example: "did:privy:clx1234567890"
+ *     responses:
+ *       200:
+ *         description: Deposit addresses retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 addresses:
+ *                   type: array
+ *                   description: Enriched deposit addresses with chain information
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       chain:
+ *                         type: string
+ *                         example: "Polygon"
+ *                       address:
+ *                         type: string
+ *                         example: "0x7d597d8ce27e13ab65e4613db6dcfcbbdde8816a"
+ *                       minCheckoutUsd:
+ *                         type: number
+ *                         example: 2
+ *                       token:
+ *                         type: string
+ *                         example: "USDC.e"
+ *                 note:
+ *                   type: string
+ *                   description: Additional information about supported assets
+ *                   example: "Only certain chains and tokens are supported. See /supported-assets for details."
+ *       400:
+ *         description: User does not have a proxy wallet
+ *       404:
+ *         description: User not found
+ *       500:
+ *         description: Error fetching deposit addresses
+ */
+router.post('/:privyUserId/deposit-addresses', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId } = req.params;
+
+    // Get user and verify they have a proxy wallet
+    const user = await getUserByPrivyId(privyUserId);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    if (!user.proxyWalletAddress) {
+      return res.status(400).json({
+        success: false,
+        error: 'User does not have a proxy wallet. Please deploy a proxy wallet first.',
+      });
+    }
+
+    logger.info({
+      message: 'Fetching deposit addresses from Polymarket bridge',
+      privyUserId,
+      proxyWalletAddress: user.proxyWalletAddress,
+    });
+
+    // Call Polymarket bridge API to create deposit addresses
+    // Ensure no trailing slash on base URL
+    let bridgeApiUrl = process.env.POLYMARKET_BRIDGE_API_URL || 'https://bridge.polymarket.com';
+    bridgeApiUrl = bridgeApiUrl.replace(/\/$/, ''); // Remove trailing slash if present
+    const depositUrl = `${bridgeApiUrl}/deposit`;
+    const requestBody = {
+      address: user.proxyWalletAddress,
+    };
+    
+    logger.info({
+      message: 'Calling Polymarket bridge API for deposit addresses',
+      method: 'POST',
+      url: depositUrl,
+      baseUrl: bridgeApiUrl,
+      requestBody,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+    });
+    
+    try {
+      const response = await axios.post(
+        depositUrl,
+        requestBody,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          timeout: 10000, // 10 second timeout
+        }
+      );
+
+      logger.info({
+        message: 'Successfully fetched deposit addresses from Polymarket bridge',
+        privyUserId,
+        proxyWalletAddress: user.proxyWalletAddress,
+        hasEvm: !!response.data?.address?.evm,
+        hasSvm: !!response.data?.address?.svm,
+        hasBtc: !!response.data?.address?.btc,
+      });
+
+      // Get supported assets to enrich the response
+      let supportedAssets: any[] = [];
+      try {
+        supportedAssets = await getSupportedAssets();
+      } catch (assetsError) {
+        logger.warn({
+          message: 'Failed to fetch supported assets, returning basic deposit addresses',
+          error: assetsError instanceof Error ? assetsError.message : String(assetsError),
+        });
+      }
+
+      // Enrich deposit addresses with chain-specific information
+      const enrichedAddresses: any[] = [];
+      const depositAddresses = response.data.address || {};
+
+      // Polygon: Use proxy wallet address, find USDC.e token (address: 0x2791bca1f2de4661ed88a30c99a7a9449aa84174)
+      const polygonAssets = supportedAssets.filter(
+        (asset) => asset.chainId === '137' && asset.chainName === 'Polygon'
+      );
+      const polygonUsdce = polygonAssets.find(
+        (asset) => asset.token?.address?.toLowerCase() === '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'
+      );
+      
+      if (polygonUsdce) {
+        enrichedAddresses.push({
+          chain: 'Polygon',
+          address: user.proxyWalletAddress, // Use proxy wallet for Polygon
+          minCheckoutUsd: polygonUsdce.minCheckoutUsd,
+          token: 'USDC.e',
+        });
+      }
+
+      // Ethereum: Use evm address, find USDC token (address: 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48)
+      if (depositAddresses.evm) {
+        const ethereumAssets = supportedAssets.filter(
+          (asset) => asset.chainId === '1' && asset.chainName === 'Ethereum'
+        );
+        const ethereumUsdc = ethereumAssets.find(
+          (asset) => asset.token?.address?.toLowerCase() === '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+        );
+        
+        if (ethereumUsdc) {
+          enrichedAddresses.push({
+            chain: 'Ethereum',
+            address: depositAddresses.evm,
+            minCheckoutUsd: ethereumUsdc.minCheckoutUsd,
+            token: 'USDC',
+          });
+        }
+      }
+
+      // Solana: Use svm address, find SOL token (address: 11111111111111111111111111111111)
+      if (depositAddresses.svm) {
+        const solanaAssets = supportedAssets.filter(
+          (asset) => asset.chainId === '1151111081099710' && asset.chainName === 'Solana'
+        );
+        const solanaSol = solanaAssets.find(
+          (asset) => asset.token?.address === '11111111111111111111111111111111'
+        );
+        
+        if (solanaSol) {
+          enrichedAddresses.push({
+            chain: 'Solana',
+            address: depositAddresses.svm,
+            minCheckoutUsd: solanaSol.minCheckoutUsd,
+            token: 'SOL',
+          });
+        }
+      }
+
+      // Base: Use evm address (same as Ethereum), find USDC token (address: 0x833589fcd6edb6e08f4c7c32d4f71b54bda02913)
+      const baseAssets = supportedAssets.filter(
+        (asset) => asset.chainId === '8453' && asset.chainName === 'Base'
+      );
+      if (baseAssets.length > 0 && depositAddresses.evm) {
+        const baseUsdc = baseAssets.find(
+          (asset) => asset.token?.address?.toLowerCase() === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+        );
+        
+        if (baseUsdc) {
+          enrichedAddresses.push({
+            chain: 'Base',
+            address: depositAddresses.evm, // Base uses the same evm address
+            minCheckoutUsd: baseUsdc.minCheckoutUsd,
+            token: 'USDC',
+          });
+        }
+      }
+
+      logger.info({
+        message: 'Enriched deposit addresses with chain information',
+        privyUserId,
+        enrichedCount: enrichedAddresses.length,
+        chains: enrichedAddresses.map((a) => a.chain),
+      });
+
+      res.json({
+        success: true,
+        addresses: enrichedAddresses,
+        note: response.data.note || 'Only certain chains and tokens are supported. See /supported-assets for details.',
+      });
+    } catch (bridgeError) {
+      const axiosError = bridgeError as AxiosError;
+      
+      logger.error({
+        message: 'Error calling Polymarket bridge API',
+        privyUserId,
+        proxyWalletAddress: user.proxyWalletAddress,
+        status: axiosError.response?.status,
+        statusText: axiosError.response?.statusText,
+        error: axiosError.message,
+        responseData: axiosError.response?.data,
+      });
+
+      if (axiosError.response) {
+        // Forward the error response from Polymarket bridge API
+        return res.status(axiosError.response.status).json({
+          success: false,
+          error: axiosError.response.data || axiosError.message,
+        });
+      }
+
+      // Network or timeout error
+      throw new Error(`Failed to connect to Polymarket bridge API: ${axiosError.message}`);
+    }
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching deposit addresses',
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    res.status(500).json({
+      success: false,
+      error: extractErrorMessage(error),
     });
   }
 });

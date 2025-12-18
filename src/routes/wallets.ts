@@ -124,7 +124,8 @@ router.post('/create', async (req: Request, res: Response) => {
     });
 
     // Create the embedded wallet via Privy API
-    const walletAddress = await privyService.createEmbeddedWallet(privyUserId);
+    const walletResult = await privyService.createEmbeddedWallet(privyUserId);
+    const walletAddress = walletResult.address;
 
     logger.info({
       message: 'Embedded wallet created successfully',

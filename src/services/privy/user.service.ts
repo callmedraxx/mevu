@@ -31,6 +31,8 @@ export async function initializeUsersTable(): Promise<void> {
         embedded_wallet_address VARCHAR(42) NOT NULL,
         proxy_wallet_address VARCHAR(42),
         session_signer_enabled BOOLEAN DEFAULT FALSE,
+        usdc_approval_enabled BOOLEAN DEFAULT FALSE,
+        ctf_approval_enabled BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
@@ -70,6 +72,8 @@ export async function createUser(request: CreateUserRequest): Promise<UserProfil
       embeddedWalletAddress: normalizedAddress,
       proxyWalletAddress: null,
       sessionSignerEnabled: false,
+      usdcApprovalEnabled: false,
+      ctfApprovalEnabled: false,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -95,7 +99,8 @@ export async function createUser(request: CreateUserRequest): Promise<UserProfil
       `INSERT INTO users (privy_user_id, username, embedded_wallet_address)
        VALUES ($1, $2, $3)
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
-                 proxy_wallet_address, session_signer_enabled, created_at, updated_at`,
+                 proxy_wallet_address, session_signer_enabled, usdc_approval_enabled, 
+                 ctf_approval_enabled, created_at, updated_at`,
       [request.privyUserId, request.username, normalizedAddress]
     );
 
@@ -107,6 +112,8 @@ export async function createUser(request: CreateUserRequest): Promise<UserProfil
       embeddedWalletAddress: row.embedded_wallet_address,
       proxyWalletAddress: row.proxy_wallet_address,
       sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled,
+      ctfApprovalEnabled: row.ctf_approval_enabled,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -144,7 +151,8 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
   try {
     const result = await client.query(
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
-              proxy_wallet_address, session_signer_enabled, created_at, updated_at
+              proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
+              ctf_approval_enabled, created_at, updated_at
        FROM users WHERE privy_user_id = $1`,
       [privyUserId]
     );
@@ -159,6 +167,8 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
       embeddedWalletAddress: row.embedded_wallet_address,
       proxyWalletAddress: row.proxy_wallet_address,
       sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
+      ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -182,7 +192,8 @@ export async function getUserByUsername(username: string): Promise<UserProfile |
   try {
     const result = await client.query(
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
-              proxy_wallet_address, session_signer_enabled, created_at, updated_at
+              proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
+              ctf_approval_enabled, created_at, updated_at
        FROM users WHERE LOWER(username) = LOWER($1)`,
       [username]
     );
@@ -197,6 +208,8 @@ export async function getUserByUsername(username: string): Promise<UserProfile |
       embeddedWalletAddress: row.embedded_wallet_address,
       proxyWalletAddress: row.proxy_wallet_address,
       sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
+      ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -221,7 +234,8 @@ export async function getUserByWalletAddress(walletAddress: string): Promise<Use
   try {
     const result = await client.query(
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
-              proxy_wallet_address, session_signer_enabled, created_at, updated_at
+              proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
+              ctf_approval_enabled, created_at, updated_at
        FROM users WHERE LOWER(embedded_wallet_address) = $1`,
       [normalizedAddress]
     );
@@ -236,6 +250,8 @@ export async function getUserByWalletAddress(walletAddress: string): Promise<Use
       embeddedWalletAddress: row.embedded_wallet_address,
       proxyWalletAddress: row.proxy_wallet_address,
       sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
+      ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -259,6 +275,8 @@ export async function updateUserProxyWallet(
     if (!user) return null;
     
     user.proxyWalletAddress = normalizedProxyAddress;
+    user.usdcApprovalEnabled = user.usdcApprovalEnabled ?? false;
+    user.ctfApprovalEnabled = user.ctfApprovalEnabled ?? false;
     user.updatedAt = new Date();
     
     memoryStore.set(`user:privy:${privyUserId}`, user);
@@ -270,28 +288,77 @@ export async function updateUserProxyWallet(
   const client = await pool.connect();
   
   try {
+    logger.info({
+      message: 'Updating user proxy wallet address in database',
+      privyUserId,
+      proxyWalletAddress: normalizedProxyAddress,
+    });
+
     const result = await client.query(
       `UPDATE users 
        SET proxy_wallet_address = $1, updated_at = CURRENT_TIMESTAMP
        WHERE privy_user_id = $2
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
-                 proxy_wallet_address, session_signer_enabled, created_at, updated_at`,
+                 proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
+                 ctf_approval_enabled, created_at, updated_at`,
       [normalizedProxyAddress, privyUserId]
     );
 
-    if (result.rows.length === 0) return null;
+    if (result.rows.length === 0) {
+      logger.warn({
+        message: 'No user found to update with proxy wallet address',
+        privyUserId,
+        proxyWalletAddress: normalizedProxyAddress,
+      });
+      return null;
+    }
 
     const row = result.rows[0];
-    return {
+    const updatedUser = {
       id: row.id,
       privyUserId: row.privy_user_id,
       username: row.username,
       embeddedWalletAddress: row.embedded_wallet_address,
       proxyWalletAddress: row.proxy_wallet_address,
       sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
+      ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
+
+    logger.info({
+      message: 'Successfully updated user proxy wallet address in database',
+      privyUserId,
+      proxyWalletAddress: normalizedProxyAddress,
+      userId: updatedUser.id,
+    });
+
+    // Add the new proxy wallet to Alchemy webhook for balance tracking
+    try {
+      const { alchemyWebhookService } = await import('../alchemy/alchemy-webhook.service');
+      await alchemyWebhookService.addUserAddress(normalizedProxyAddress, privyUserId);
+    } catch (webhookError) {
+      // Don't fail the wallet update if webhook registration fails
+      logger.warn({
+        message: 'Failed to add address to Alchemy webhook',
+        privyUserId,
+        proxyWalletAddress: normalizedProxyAddress,
+        error: webhookError instanceof Error ? webhookError.message : String(webhookError),
+      });
+    }
+
+    return updatedUser;
+  } catch (error) {
+    logger.error({
+      message: 'Error updating user proxy wallet address in database',
+      privyUserId,
+      proxyWalletAddress: normalizedProxyAddress,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    // Re-throw the error so the caller can handle it
+    throw error;
   } finally {
     client.release();
   }
@@ -329,7 +396,8 @@ export async function updateUserEmbeddedWalletAddress(
        SET embedded_wallet_address = $1, updated_at = CURRENT_TIMESTAMP
        WHERE privy_user_id = $2
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
-                 proxy_wallet_address, session_signer_enabled, created_at, updated_at`,
+                 proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
+                 ctf_approval_enabled, created_at, updated_at`,
       [normalizedAddress, privyUserId]
     );
 
@@ -343,6 +411,63 @@ export async function updateUserEmbeddedWalletAddress(
       embeddedWalletAddress: row.embedded_wallet_address,
       proxyWalletAddress: row.proxy_wallet_address,
       sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
+      ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      createdAt: new Date(row.created_at),
+      updatedAt: new Date(row.updated_at),
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Update user's token approval statuses
+ */
+export async function updateUserTokenApprovals(
+  privyUserId: string,
+  usdcApprovalEnabled: boolean,
+  ctfApprovalEnabled: boolean
+): Promise<UserProfile | null> {
+  const dbConfig = getDatabaseConfig();
+  
+  if (dbConfig.type !== 'postgres') {
+    const user = memoryStore.get(`user:privy:${privyUserId}`);
+    if (!user) return null;
+    
+    user.usdcApprovalEnabled = usdcApprovalEnabled;
+    user.ctfApprovalEnabled = ctfApprovalEnabled;
+    user.updatedAt = new Date();
+    
+    memoryStore.set(`user:privy:${privyUserId}`, user);
+    return user;
+  }
+
+  const client = await pool.connect();
+  
+  try {
+    const result = await client.query(
+      `UPDATE users 
+       SET usdc_approval_enabled = $1, ctf_approval_enabled = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE privy_user_id = $3
+       RETURNING id, privy_user_id, username, embedded_wallet_address, 
+                 proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
+                 ctf_approval_enabled, created_at, updated_at`,
+      [usdcApprovalEnabled, ctfApprovalEnabled, privyUserId]
+    );
+
+    if (result.rows.length === 0) return null;
+
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      privyUserId: row.privy_user_id,
+      username: row.username,
+      embeddedWalletAddress: row.embedded_wallet_address,
+      proxyWalletAddress: row.proxy_wallet_address,
+      sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
+      ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -365,6 +490,8 @@ export async function updateUserSessionSigner(
     if (!user) return null;
     
     user.sessionSignerEnabled = enabled;
+    user.usdcApprovalEnabled = user.usdcApprovalEnabled ?? false;
+    user.ctfApprovalEnabled = user.ctfApprovalEnabled ?? false;
     user.updatedAt = new Date();
     
     memoryStore.set(`user:privy:${privyUserId}`, user);
@@ -379,7 +506,8 @@ export async function updateUserSessionSigner(
        SET session_signer_enabled = $1, updated_at = CURRENT_TIMESTAMP
        WHERE privy_user_id = $2
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
-                 proxy_wallet_address, session_signer_enabled, created_at, updated_at`,
+                 proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
+                 ctf_approval_enabled, created_at, updated_at`,
       [enabled, privyUserId]
     );
 
@@ -393,6 +521,8 @@ export async function updateUserSessionSigner(
       embeddedWalletAddress: row.embedded_wallet_address,
       proxyWalletAddress: row.proxy_wallet_address,
       sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
+      ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };

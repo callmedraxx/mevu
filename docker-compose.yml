@@ -12,26 +12,61 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - DATABASE_URL=postgresql://mevu_user:mevu_password@postgres:5432/mevu_db
+      - DATABASE_URL=postgresql://user:password@pgbouncer:6432/mevu
       - SWAGGER_BASE_URL=https://dev.api.mevu.com
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
     restart: unless-stopped
+    networks:
+      - mevu-network
 
   postgres:
     image: postgres:16-alpine
     environment:
-      - POSTGRES_USER=mevu_user
-      - POSTGRES_PASSWORD=mevu_password
-      - POSTGRES_DB=mevu_db
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=mevu
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d mevu"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
+    networks:
+      - mevu-network
+
+  pgbouncer:
+    image: rmccaffrey/pgbouncer:latest
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - PG_USER=user
+      - AUTH_FILE_CONTENT="user" "password"
+      - DB_NAME=mevu
+    volumes:
+      - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "6432:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - mevu-network
 
 volumes:
   postgres_data:
 
+networks:
+  mevu-network:
+    driver: bridge

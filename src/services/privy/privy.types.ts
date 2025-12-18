@@ -31,6 +31,7 @@ export interface SessionSignerConfig {
 export interface SignTypedDataRequest {
   userId: string;
   typedData: EIP712TypedData;
+  walletId?: string; // Optional: walletId to avoid lookup if already known
 }
 
 export interface SignMessageRequest {
@@ -65,6 +66,8 @@ export interface UserProfile {
   embeddedWalletAddress: string;
   proxyWalletAddress: string | null;
   sessionSignerEnabled: boolean;
+  usdcApprovalEnabled: boolean;
+  ctfApprovalEnabled: boolean;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -23,18 +23,21 @@ import { EIP712TypedData } from './privy.types';
 export class PrivySignerAdapter extends ethers.Signer {
   private userId: string;
   private walletAddress: string;
+  private walletId?: string; // Optional: walletId to avoid lookup during signing
   readonly provider: ethers.providers.Provider;
 
   constructor(
     userId: string,
     walletAddress: string,
-    provider?: ethers.providers.Provider
+    provider?: ethers.providers.Provider,
+    walletId?: string // Optional: walletId to avoid lookup during signing
   ) {
     super();
     this.userId = userId;
     // Normalize address: convert to lowercase first to avoid checksum errors, then get proper checksum
     const normalized = walletAddress.toLowerCase();
     this.walletAddress = ethers.utils.getAddress(normalized);
+    this.walletId = walletId;
     
     // Create provider if not provided
     this.provider = provider || new ethers.providers.JsonRpcProvider(privyConfig.rpcUrl);
@@ -52,16 +55,30 @@ export class PrivySignerAdapter extends ethers.Signer {
 
   /**
    * Sign a message using Privy session signer
+   * 
+   * For string messages: signs the message as-is (personal_sign behavior)
+   * For binary data (Uint8Array): hex-encodes the bytes for signing
+   *   - This is used for Safe transaction hash signing
+   *   - Binary data cannot be converted to UTF-8 string directly
    */
   async signMessage(message: string | ethers.utils.Bytes): Promise<string> {
-    const messageString = typeof message === 'string' 
-      ? message 
-      : ethers.utils.toUtf8String(message);
+    let messageString: string;
+    
+    if (typeof message === 'string') {
+      messageString = message;
+    } else {
+      // For binary data (Uint8Array), hex-encode it
+      // This handles Safe transaction hashes and other binary data
+      // that cannot be represented as valid UTF-8
+      messageString = ethers.utils.hexlify(message);
+    }
 
     logger.info({
       message: 'Signing message via Privy session signer',
       userId: this.userId,
       walletAddress: this.walletAddress,
+      messageType: typeof message === 'string' ? 'string' : 'bytes',
+      messageLength: typeof message === 'string' ? message.length : (message as any).length,
     });
 
     try {
@@ -143,9 +160,71 @@ export class PrivySignerAdapter extends ethers.Signer {
       const signature = await privyService.signTypedData({
         userId: this.userId,
         typedData,
+        walletId: this.walletId, // Pass walletId if available to avoid lookup
       });
 
-      return signature;
+      logger.info({
+        message: 'Received signature from privyService.signTypedData',
+        userId: this.userId,
+        signatureType: typeof signature,
+        isString: typeof signature === 'string',
+        isObject: typeof signature === 'object',
+        hasRaw: signature && typeof signature === 'object' && 'raw' in signature,
+        signaturePreview: typeof signature === 'string' ? signature.substring(0, 20) + '...' : 'object',
+      });
+
+      // Defensive normalization - ensure we always return a hex string
+      if (typeof signature === 'string' && signature.startsWith('0x')) {
+        return signature;
+      }
+
+      // If signature is an object with raw property, normalize it
+      if (signature && typeof signature === 'object' && 'raw' in signature) {
+        logger.warn({
+          message: 'Normalizing signature in PrivySignerAdapter._signTypedData',
+          userId: this.userId,
+          rawType: typeof (signature as any).raw,
+        });
+
+        const { ethers } = await import('ethers');
+        const rawValue = (signature as any).raw;
+        let bytes: Uint8Array;
+        
+        if (rawValue instanceof Uint8Array) {
+          bytes = rawValue;
+        } else if (typeof rawValue === 'object' && rawValue !== null) {
+          // Convert object with numeric keys to Uint8Array
+          const length = Object.keys(rawValue).length;
+          bytes = new Uint8Array(length);
+          for (let i = 0; i < length; i++) {
+            bytes[i] = rawValue[i] || 0;
+          }
+        } else {
+          throw new Error(`Unexpected raw signature format: ${typeof rawValue}`);
+        }
+        
+        const hexSignature = ethers.utils.hexlify(bytes);
+        logger.warn({
+          message: 'Normalized signature in PrivySignerAdapter._signTypedData',
+          userId: this.userId,
+          signatureLength: bytes.length,
+          hexSignature: hexSignature.substring(0, 20) + '...',
+        });
+        return hexSignature;
+      }
+
+      // Fallback
+      const hexSig = typeof signature === 'string' ? signature : String(signature);
+      if (!hexSig.startsWith('0x')) {
+        logger.error({
+          message: 'Invalid signature format in PrivySignerAdapter._signTypedData',
+          userId: this.userId,
+          signatureType: typeof signature,
+          signatureValue: signature,
+        });
+        throw new Error(`Invalid signature format: expected hex string starting with 0x, got ${typeof signature}`);
+      }
+      return hexSig;
     } catch (error) {
       logger.error({
         message: 'Failed to sign typed data via Privy',
@@ -212,7 +291,8 @@ export class PrivySignerAdapter extends ethers.Signer {
 export function createPrivySigner(
   userId: string,
   walletAddress: string,
+  walletId?: string,
   provider?: ethers.providers.Provider
 ): PrivySignerAdapter {
-  return new PrivySignerAdapter(userId, walletAddress, provider);
+  return new PrivySignerAdapter(userId, walletAddress, provider, walletId);
 }

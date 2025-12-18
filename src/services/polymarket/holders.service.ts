@@ -116,20 +116,6 @@ export async function storeHolders(
     // Delete existing holders for this game to refresh data
     await client.query('DELETE FROM holders WHERE game_id = $1', [game.id]);
 
-    const insertQuery = `
-      INSERT INTO holders (
-        token, proxy_wallet, asset, amount, outcome_index,
-        condition_id, market_id, game_id, name, pseudonym, bio,
-        profile_image, profile_image_optimized, verified, display_username_public,
-        created_at
-      )
-      VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CURRENT_TIMESTAMP
-      )
-    `;
-
-    let insertedCount = 0;
-
     // Create a map of clobTokenId to conditionId and marketId for lookup
     // The API returns token = clobTokenId, NOT conditionId
     const clobTokenIdToConditionId = new Map<string, string>();
@@ -146,6 +132,8 @@ export async function storeHolders(
       }
     }
 
+    // Collect all holders to insert
+    const holdersToInsert: any[] = [];
     for (const response of holders) {
       // response.token is the clobTokenId (asset ID), NOT the conditionId
       const clobTokenId = response.token;
@@ -153,27 +141,75 @@ export async function storeHolders(
       const marketId = clobTokenIdToMarketId.get(clobTokenId) || null;
 
       for (const holder of response.holders) {
-        await client.query(insertQuery, [
-          response.token, // This is the clobTokenId
-          holder.proxyWallet,
-          holder.asset,
-          holder.amount,
-          holder.outcomeIndex,
-          conditionId, // Now correctly looked up from game markets
+        holdersToInsert.push({
+          token: response.token, // This is the clobTokenId
+          proxyWallet: holder.proxyWallet,
+          asset: holder.asset,
+          amount: holder.amount,
+          outcomeIndex: holder.outcomeIndex,
+          conditionId,
           marketId,
-          game.id,
-          holder.name,
-          holder.pseudonym,
-          holder.bio,
-          holder.profileImage,
-          holder.profileImageOptimized,
-          holder.verified,
-          holder.displayUsernamePublic,
-        ]);
-
-        insertedCount++;
+          gameId: game.id,
+          name: holder.name,
+          pseudonym: holder.pseudonym,
+          bio: holder.bio,
+          profileImage: holder.profileImage,
+          profileImageOptimized: holder.profileImageOptimized,
+          verified: holder.verified,
+          displayUsernamePublic: holder.displayUsernamePublic,
+        });
       }
     }
+
+    if (holdersToInsert.length === 0) {
+      await client.query('COMMIT');
+      return;
+    }
+
+    // Build bulk insert query
+    const values: any[] = [];
+    const placeholders: string[] = [];
+    let paramIndex = 1;
+
+    for (const holder of holdersToInsert) {
+      const rowPlaceholders: string[] = [];
+      for (let i = 0; i < 15; i++) {
+        rowPlaceholders.push(`$${paramIndex++}`);
+      }
+      rowPlaceholders.push('CURRENT_TIMESTAMP');
+      placeholders.push(`(${rowPlaceholders.join(', ')})`);
+      
+      values.push(
+        holder.token,
+        holder.proxyWallet,
+        holder.asset,
+        holder.amount,
+        holder.outcomeIndex,
+        holder.conditionId,
+        holder.marketId,
+        holder.gameId,
+        holder.name,
+        holder.pseudonym,
+        holder.bio,
+        holder.profileImage,
+        holder.profileImageOptimized,
+        holder.verified,
+        holder.displayUsernamePublic,
+      );
+    }
+
+    const insertQuery = `
+      INSERT INTO holders (
+        token, proxy_wallet, asset, amount, outcome_index,
+        condition_id, market_id, game_id, name, pseudonym, bio,
+        profile_image, profile_image_optimized, verified, display_username_public,
+        created_at
+      )
+      VALUES ${placeholders.join(', ')}
+    `;
+
+    const result = await client.query(insertQuery, values);
+    const insertedCount = result.rowCount || 0;
 
     await client.query('COMMIT');
 
@@ -183,7 +219,14 @@ export async function storeHolders(
     //   totalHolders: insertedCount,
     // });
   } catch (error) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      logger.error({
+        message: 'Error during ROLLBACK in storeHolders',
+        error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+      });
+    }
     logger.error({
       message: 'Error storing holders in database',
       gameId: game.id,

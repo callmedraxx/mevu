@@ -26,7 +26,7 @@ class PrivyService {
   private initialized: boolean = false;
   private walletClient: AxiosInstance; // Keep for backward compatibility
   // In-memory lock to prevent concurrent wallet creation for the same user
-  private walletCreationLocks = new Map<string, Promise<string>>();
+  private walletCreationLocks = new Map<string, Promise<{ address: string; walletId?: string }>>();
 
   constructor() {
     // Keep axios clients for backward compatibility and fallback
@@ -107,7 +107,7 @@ class PrivyService {
    * Get wallet ID from wallet address
    * Fetches user's wallets and finds the one matching the address
    */
-  private async getWalletIdByAddress(userId: string, address: string): Promise<string | null> {
+  async getWalletIdByAddress(userId: string, address: string): Promise<string | null> {
     logger.info({
       message: 'Getting wallet ID by address',
       userId,
@@ -472,7 +472,78 @@ class PrivyService {
               message: request.message,
               authorization_context: authorizationContext,
             });
-            return response.signature;
+            
+            // Normalize signature format for downstream consumers (RelayerClient expects 0x-prefixed hex string)
+            const rawSignature = (response as any)?.signature;
+            
+            logger.info({
+              message: 'Received signature from Privy signMessage',
+              userId: request.userId,
+              walletId,
+              signatureType: typeof rawSignature,
+              isString: typeof rawSignature === 'string',
+              isObject: typeof rawSignature === 'object',
+              hasRaw: rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature,
+            });
+            
+            if (typeof rawSignature === 'string') {
+              // Already a hex string
+              return rawSignature;
+            }
+            
+            if (rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature) {
+              try {
+                // raw might be a Uint8Array or an object with numeric keys (JSON-serialized Uint8Array)
+                const rawValue = (rawSignature as any).raw;
+                let bytes: Uint8Array;
+                
+                if (rawValue instanceof Uint8Array) {
+                  bytes = rawValue;
+                } else if (typeof rawValue === 'object' && rawValue !== null) {
+                  // Convert object with numeric keys to Uint8Array
+                  const length = Object.keys(rawValue).length;
+                  bytes = new Uint8Array(length);
+                  for (let i = 0; i < length; i++) {
+                    bytes[i] = rawValue[i] || 0;
+                  }
+                } else {
+                  throw new Error(`Unexpected raw signature format: ${typeof rawValue}`);
+                }
+                
+                // Convert to 0x-prefixed hex string
+                const hexSignature = ethers.utils.hexlify(bytes);
+                
+                logger.info({
+                  message: 'Normalized Privy signature from raw format',
+                  userId: request.userId,
+                  walletId,
+                  signatureLength: bytes.length,
+                });
+                
+                return hexSignature;
+              } catch (convertError) {
+                logger.error({
+                  message: 'Failed to convert Privy signature to hex string',
+                  userId: request.userId,
+                  walletId,
+                  signatureType: typeof rawSignature,
+                  signatureKeys: Object.keys(rawSignature),
+                  rawValueType: typeof (rawSignature as any)?.raw,
+                  rawValueKeys: (rawSignature as any)?.raw ? Object.keys((rawSignature as any).raw) : [],
+                  convertError: convertError instanceof Error ? convertError.message : String(convertError),
+                });
+                // Fall through to generic handling below
+              }
+            }
+            
+            // Fallback: stringify whatever we got, but this is unexpected
+            logger.warn({
+              message: 'Privy signMessage returned unexpected signature format',
+              userId: request.userId,
+              walletId,
+              rawSignature,
+            });
+            return String(rawSignature);
           }
         }
       }
@@ -512,11 +583,19 @@ class PrivyService {
     try {
       // Try to use SDK if available
       if (this.privyClient) {
-        // Get wallet ID from user's embedded wallet
-        const embeddedWalletAddress = await this.getEmbeddedWalletAddress(request.userId);
-        if (embeddedWalletAddress) {
-          const walletId = await this.getWalletIdByAddress(request.userId, embeddedWalletAddress);
-          if (walletId) {
+        // Get wallet ID - use provided walletId if available, otherwise look it up
+        let walletId = request.walletId;
+        
+        if (!walletId) {
+          // Get wallet ID from user's embedded wallet
+          const embeddedWalletAddress = await this.getEmbeddedWalletAddress(request.userId);
+          if (embeddedWalletAddress) {
+            const lookedUpId = await this.getWalletIdByAddress(request.userId, embeddedWalletAddress);
+            walletId = lookedUpId ?? undefined;
+          }
+        }
+        
+        if (walletId) {
             // Use SDK to sign with authorization context
             // Try authorization private key first (most reliable)
             let authorizationContext = this.getAuthorizationContext();
@@ -593,14 +672,18 @@ class PrivyService {
                   }
                 );
                 
-                logger.info({
-                  message: 'Successfully signed typed data via Privy SDK signTypedData',
-                  userId: request.userId,
-                  walletId,
-                });
-                
                 // Normalize signature format for downstream consumers (RelayerClient expects 0x-prefixed hex string)
                 const rawSignature = (response as any)?.signature;
+                
+                logger.info({
+                  message: 'Received signature from Privy signTypedData',
+                  userId: request.userId,
+                  walletId,
+                  signatureType: typeof rawSignature,
+                  isString: typeof rawSignature === 'string',
+                  isObject: typeof rawSignature === 'object',
+                  hasRaw: rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature,
+                });
                 
                 if (typeof rawSignature === 'string') {
                   // Already a hex string
@@ -609,8 +692,33 @@ class PrivyService {
                 
                 if (rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature) {
                   try {
-                    // raw is typically a Uint8Array; convert to 0x-prefixed hex string
-                    const hexSignature = ethers.utils.hexlify((rawSignature as any).raw);
+                    // raw might be a Uint8Array or an object with numeric keys (JSON-serialized Uint8Array)
+                    const rawValue = (rawSignature as any).raw;
+                    let bytes: Uint8Array;
+                    
+                    if (rawValue instanceof Uint8Array) {
+                      bytes = rawValue;
+                    } else if (typeof rawValue === 'object' && rawValue !== null) {
+                      // Convert object with numeric keys to Uint8Array
+                      const length = Object.keys(rawValue).length;
+                      bytes = new Uint8Array(length);
+                      for (let i = 0; i < length; i++) {
+                        bytes[i] = rawValue[i] || 0;
+                      }
+                    } else {
+                      throw new Error(`Unexpected raw signature format: ${typeof rawValue}`);
+                    }
+                    
+                    // Convert to 0x-prefixed hex string
+                    const hexSignature = ethers.utils.hexlify(bytes);
+                    
+                    logger.info({
+                      message: 'Normalized Privy typed data signature from raw format',
+                      userId: request.userId,
+                      walletId,
+                      signatureLength: bytes.length,
+                    });
+                    
                     return hexSignature;
                   } catch (convertError) {
                     logger.error({
@@ -619,6 +727,8 @@ class PrivyService {
                       walletId,
                       signatureType: typeof rawSignature,
                       signatureKeys: Object.keys(rawSignature),
+                      rawValueType: typeof (rawSignature as any)?.raw,
+                      rawValueKeys: (rawSignature as any)?.raw ? Object.keys((rawSignature as any).raw) : [],
                       convertError: convertError instanceof Error ? convertError.message : String(convertError),
                     });
                     // Fall through to generic handling below
@@ -649,7 +759,6 @@ class PrivyService {
             }
           }
         }
-      }
 
       // Fallback to direct RPC endpoint if SDK not available
       // Note: This requires session signers to be enabled
@@ -725,7 +834,8 @@ class PrivyService {
     walletAddress: string,
     signerId: string,
     policyIds?: string[],
-    userJwt?: string
+    userJwt?: string,
+    walletId?: string // Optional: walletId to avoid lookup if already known
   ): Promise<void> {
     if (!this.initialized) {
       throw new Error('Privy service not initialized');
@@ -736,23 +846,35 @@ class PrivyService {
     }
 
     try {
-      // Get wallet ID from address
-      logger.info({
-        message: 'addSessionSigner: Getting wallet ID',
-        userId,
-        walletAddress,
-      });
+      // Get wallet ID from address (or use provided walletId)
+      let finalWalletId: string | undefined;
       
-      const walletId = await this.getWalletIdByAddress(userId, walletAddress);
+      if (walletId) {
+        logger.info({
+          message: 'addSessionSigner: Using provided wallet ID',
+          userId,
+          walletAddress,
+          walletId,
+        });
+        finalWalletId = walletId;
+      } else {
+        logger.info({
+          message: 'addSessionSigner: Getting wallet ID from address',
+          userId,
+          walletAddress,
+        });
+        const lookedUpId = await this.getWalletIdByAddress(userId, walletAddress);
+        finalWalletId = lookedUpId ?? undefined;
+      }
       
       logger.info({
         message: 'addSessionSigner: Wallet ID lookup result',
         userId,
         walletAddress,
-        walletId: walletId || 'NOT FOUND',
+        walletId: finalWalletId || 'NOT FOUND',
       });
       
-      if (!walletId) {
+      if (!finalWalletId) {
         // Try to get more info about what wallets exist
         try {
           const user = await this.getUser(userId);
@@ -818,9 +940,9 @@ class PrivyService {
         const walletsService = this.privyClient.wallets();
         
         // Try SDK method
-        wallet = await (walletsService as any).getWallet?.(walletId, {
+        wallet = await (walletsService as any).getWallet?.(finalWalletId, {
           authorization_context: authorizationContext,
-        }) || await (walletsService as any).getWallet?.(walletId, authorizationContext);
+        }) || await (walletsService as any).getWallet?.(finalWalletId, authorizationContext);
         
         if (!wallet) {
           throw new Error('SDK returned undefined');
@@ -828,7 +950,7 @@ class PrivyService {
       } catch (sdkError) {
         logger.warn({
           message: 'SDK getWallet failed, trying REST API',
-          walletId,
+          walletId: finalWalletId,
           error: sdkError instanceof Error ? sdkError.message : String(sdkError),
         });
         
@@ -836,7 +958,7 @@ class PrivyService {
         // For now, if SDK fails, assume no existing signers
         logger.warn({
           message: 'SDK getWallet failed, assuming no existing signers',
-          walletId,
+          walletId: finalWalletId,
           error: sdkError instanceof Error ? sdkError.message : String(sdkError),
         });
         wallet = { additional_signers: [] };
@@ -845,7 +967,7 @@ class PrivyService {
       logger.info({
         message: 'Wallet retrieved',
         userId,
-        walletId,
+        walletId: finalWalletId,
         hasWallet: !!wallet,
         hasAdditionalSigners: !!(wallet as any)?.additional_signers,
         existingSignerCount: Array.isArray((wallet as any)?.additional_signers) ? (wallet as any).additional_signers.length : 0,
@@ -888,7 +1010,7 @@ class PrivyService {
       logger.info({
         message: 'Updating wallet with session signer',
         userId,
-        walletId,
+        walletId: finalWalletId,
         signerId,
         hasAuthContext: !!authorizationContext,
         authContextType: authorizationContext?.authorization_private_keys ? 'private_key' : authorizationContext?.user_jwts ? 'user_jwt' : 'none',
@@ -900,7 +1022,7 @@ class PrivyService {
       try {
         // Method 1: Try update with authorization_context as third param
         const updateResult = await (walletsService as any).update?.(
-          walletId,
+          finalWalletId,
           {
             additional_signers: updatedSigners,
           },
@@ -911,7 +1033,7 @@ class PrivyService {
           logger.info({
             message: 'Wallet updated successfully via SDK update method',
             userId,
-            walletId,
+            walletId: finalWalletId,
           });
           return;
         }
@@ -925,7 +1047,7 @@ class PrivyService {
         // Method 2: Try updateWallet with authorization_context
         try {
           await (walletsService as any).updateWallet?.(
-            walletId,
+            finalWalletId,
             {
               additional_signers: updatedSigners,
               authorization_context: authorizationContext,
@@ -934,7 +1056,7 @@ class PrivyService {
           logger.info({
             message: 'Wallet updated successfully via SDK updateWallet method',
             userId,
-            walletId,
+            walletId: finalWalletId,
           });
           return;
         } catch (sdkError2: any) {
@@ -955,7 +1077,7 @@ class PrivyService {
         message: 'Session signer added successfully',
         userId,
         walletAddress,
-        walletId,
+        walletId: finalWalletId,
         signerId,
         policyIds,
       });
@@ -1004,7 +1126,7 @@ class PrivyService {
    * @param userId - The Privy user ID
    * @returns The wallet address
    */
-  async createEmbeddedWallet(userId: string): Promise<string> {
+  async createEmbeddedWallet(userId: string): Promise<{ address: string; walletId?: string }> {
     if (!this.initialized) {
       throw new Error('Privy service not initialized');
     }
@@ -1020,7 +1142,7 @@ class PrivyService {
     }
 
     // Create a new promise for this wallet creation
-    const creationPromise = (async (): Promise<string> => {
+    const creationPromise = (async (): Promise<{ address: string; walletId?: string }> => {
       try {
         // First, check if user already has an embedded wallet
         logger.info({
@@ -1035,7 +1157,9 @@ class PrivyService {
             userId,
             walletAddress: existingWallet,
           });
-          return existingWallet;
+          // Try to get walletId for existing wallet
+          const existingWalletId = await this.getWalletIdByAddress(userId, existingWallet);
+          return { address: existingWallet, walletId: existingWalletId || undefined };
         }
 
         // Use SDK if available
@@ -1082,7 +1206,7 @@ class PrivyService {
               additionalSigners: wallet.additional_signers,
             });
 
-            return wallet.address;
+            return { address: wallet.address, walletId: wallet.id };
           } catch (error: any) {
             // Handle SDK errors - fall through to REST API fallback
             logger.warn({
@@ -1143,7 +1267,7 @@ class PrivyService {
           walletId: response.data?.id,
         });
 
-        return walletAddress;
+        return { address: walletAddress, walletId: response.data?.id };
       } catch (error) {
         logger.error({
           message: 'Error creating wallet via Privy',
