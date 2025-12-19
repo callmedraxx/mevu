@@ -181,7 +181,7 @@ export interface PolymarketApiResponse {
 export interface TransformedOutcome {
   label: string;
   shortLabel: string;
-  price: string; // Price in cents, e.g., "18.5"
+  price: string; // Price in cents, e.g., "18.5" (probability from trade price)
   probability: number; // 0-100
   volume: number; // Individual outcome volume
   icon?: string; // Outcome image
@@ -189,6 +189,7 @@ export interface TransformedOutcome {
   conditionId?: string;
   groupItemThreshold?: string; // Threshold for group items
   isWinner?: boolean; // True if this outcome won (for resolved markets)
+  buyPrice?: number; // Best ask price for buying (from CLOB best_ask * 100)
 }
 
 export interface TransformedMarket {

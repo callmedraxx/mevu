@@ -12,7 +12,7 @@ import { transformToFrontendGames, transformToFrontendGame, FrontendGame } from 
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'initial' | 'games_update' | 'game_update' | 'heartbeat' | 'error' | 'subscribed';
+  type: 'initial' | 'games_update' | 'game_update' | 'price_update' | 'heartbeat' | 'error' | 'subscribed';
   games?: FrontendGame[];
   game?: FrontendGame;
   timestamp?: string;
@@ -274,6 +274,35 @@ export class GamesWebSocketService {
     } catch (error) {
       logger.error({
         message: 'Error broadcasting game update',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Broadcast price update to all connected clients (fast path for real-time prices)
+   */
+  async broadcastPriceUpdate(game: LiveGame): Promise<void> {
+    if (this.clients.size === 0) return;
+
+    try {
+      const frontendGame = await transformToFrontendGame(game);
+
+      this.broadcast({
+        type: 'price_update' as any,
+        game: frontendGame,
+        timestamp: new Date().toISOString(),
+      });
+
+      logger.info({
+        message: 'Broadcasted price update to WebSocket clients',
+        clientCount: this.clients.size,
+        gameId: game.id,
+        slug: game.slug,
+      });
+    } catch (error) {
+      logger.error({
+        message: 'Error broadcasting price update',
         error: error instanceof Error ? error.message : String(error),
       });
     }

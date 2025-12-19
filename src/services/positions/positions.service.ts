@@ -16,6 +16,11 @@ import {
 
 const POLYMARKET_DATA_API_URL = 'https://data-api.polymarket.com';
 
+// Cache to track when positions were last fetched from Polymarket (per user)
+// This prevents excessive API calls when frontend polls frequently
+const lastFetchTime = new Map<string, number>();
+const CACHE_TTL_MS = 100; // 100 milliseconds - only fetch from Polymarket if data is older than this
+
 /**
  * Fetch positions from Polymarket Data API
  */
@@ -311,10 +316,13 @@ async function updateUserPortfolio(privyUserId: string, portfolio: number): Prom
 
 /**
  * Fetch and store positions for a user
+ * Uses caching to prevent excessive Polymarket API calls
+ * @param forceRefresh - If true, ignores cache and fetches from Polymarket
  */
 export async function fetchAndStorePositions(
   privyUserId: string,
-  params: PositionsQueryParams = {}
+  params: PositionsQueryParams = {},
+  forceRefresh: boolean = false
 ): Promise<UserPosition[]> {
   // Get user to verify they exist and get proxy wallet
   const user = await getUserByPrivyId(privyUserId);
@@ -330,11 +338,30 @@ export async function fetchAndStorePositions(
     return [];
   }
 
+  // Check cache - only fetch from Polymarket if data is stale or forceRefresh is true
+  const lastFetch = lastFetchTime.get(privyUserId) || 0;
+  const now = Date.now();
+  const isStale = (now - lastFetch) > CACHE_TTL_MS;
+
+  if (!isStale && !forceRefresh) {
+    // Data is fresh, return from database
+    logger.debug({
+      message: 'Using cached positions (not stale yet)',
+      privyUserId,
+      cacheAge: now - lastFetch,
+      cacheTTL: CACHE_TTL_MS,
+    });
+    return await getPositionsFromDatabase(privyUserId);
+  }
+
   // Fetch positions from Polymarket
   const polymarketPositions = await fetchPositionsFromPolymarket(
     user.proxyWalletAddress,
     params
   );
+
+  // Update cache timestamp
+  lastFetchTime.set(privyUserId, now);
 
   // Store positions in database
   await upsertPositions(privyUserId, user.proxyWalletAddress, polymarketPositions);

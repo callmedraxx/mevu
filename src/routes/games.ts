@@ -121,20 +121,21 @@ router.get('/', async (req: Request, res: Response) => {
  * @swagger
  * /api/games/frontend:
  *   get:
- *     summary: Get all live games in frontend format
- *     description: Returns all active live games transformed into the frontend Game interface
+ *     summary: Get all games in frontend format
+ *     description: Returns all active games transformed into the frontend Game interface. Can filter by sport and live status.
  *     tags: [Games]
  *     parameters:
  *       - in: query
  *         name: sport
  *         schema:
  *           type: string
- *         description: Filter by sport (e.g., nba, nfl)
+ *         description: Filter by sport (e.g., nba, nfl, nhl)
  *       - in: query
  *         name: live
  *         schema:
- *           type: boolean
- *         description: Filter only live games
+ *           type: string
+ *           enum: [true, false]
+ *         description: Filter by live status. 'true' = only live games, 'false' = only non-live games, omitted = all games
  *     responses:
  *       200:
  *         description: List of frontend-formatted games
@@ -161,9 +162,13 @@ router.get('/frontend', async (req: Request, res: Response) => {
       games = games.filter(g => g.sport?.toLowerCase() === String(sport).toLowerCase());
     }
     
+    // Handle live filter: 'true' = only live, 'false' = only non-live, undefined = all games
     if (live === 'true') {
       games = games.filter(g => g.live === true);
+    } else if (live === 'false') {
+      games = games.filter(g => g.live === false || g.live === null || g.live === undefined);
     }
+    // If live is not provided or any other value, return all games (no filter)
     
     const frontendGames = await transformToFrontendGames(games);
     

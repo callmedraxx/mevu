@@ -2,6 +2,11 @@
  * Balance API Routes
  * Handles USDC.e balance tracking using Alchemy API
  * Real-time updates are handled via Alchemy webhooks
+ * 
+ * @swagger
+ * tags:
+ *   - name: Balances
+ *     description: USDC.e balance tracking and transfer history
  */
 
 import { Router, Request, Response } from 'express';
@@ -19,6 +24,33 @@ function extractErrorMessage(error: unknown): string {
   return String(error) || 'Unknown error';
 }
 
+/**
+ * @swagger
+ * /api/balances/stream/{privyUserId}:
+ *   get:
+ *     summary: Stream real-time balance updates via SSE
+ *     description: Opens an SSE connection for real-time balance updates when deposits/withdrawals occur
+ *     tags: [Balances]
+ *     parameters:
+ *       - in: path
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User's Privy ID
+ *         example: "did:privy:clx1234567890"
+ *     responses:
+ *       200:
+ *         description: SSE stream opened
+ *         content:
+ *           text/event-stream:
+ *             schema:
+ *               type: string
+ *       404:
+ *         description: User not found
+ *       400:
+ *         description: User has no proxy wallet
+ */
 router.get('/stream/:privyUserId', async (req: Request, res: Response) => {
   const { privyUserId } = req.params;
 
@@ -62,6 +94,54 @@ router.get('/stream/:privyUserId', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/balances/{privyUserId}:
+ *   get:
+ *     summary: Get current USDC.e balance
+ *     description: Returns the user's current USDC.e balance from the database. Balance is updated by webhooks and after trades.
+ *     tags: [Balances]
+ *     parameters:
+ *       - in: path
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User's Privy ID
+ *         example: "did:privy:clx1234567890"
+ *     responses:
+ *       200:
+ *         description: Balance retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 balance:
+ *                   type: string
+ *                   description: Raw balance (wei)
+ *                   example: "1000000"
+ *                 humanBalance:
+ *                   type: string
+ *                   description: Human-readable balance (USDC)
+ *                   example: "1.00"
+ *                 source:
+ *                   type: string
+ *                   example: "database"
+ *                 lastUpdated:
+ *                   type: string
+ *                   format: date-time
+ *                 proxyWalletAddress:
+ *                   type: string
+ *                   example: "0x1234..."
+ *       404:
+ *         description: User not found
+ *       400:
+ *         description: User has no proxy wallet
+ */
 router.get('/:privyUserId', async (req: Request, res: Response) => {
   try {
     const { privyUserId } = req.params;
@@ -97,6 +177,50 @@ router.get('/:privyUserId', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/balances/{privyUserId}/refresh:
+ *   post:
+ *     summary: Force refresh balance from Alchemy
+ *     description: Fetches the latest balance from Alchemy API and updates the database. Use this to manually sync balance.
+ *     tags: [Balances]
+ *     parameters:
+ *       - in: path
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User's Privy ID
+ *         example: "did:privy:clx1234567890"
+ *     responses:
+ *       200:
+ *         description: Balance refreshed successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 balance:
+ *                   type: string
+ *                   description: Raw balance (wei)
+ *                   example: "1000000"
+ *                 humanBalance:
+ *                   type: string
+ *                   description: Human-readable balance (USDC)
+ *                   example: "1.00"
+ *                 proxyWalletAddress:
+ *                   type: string
+ *                   example: "0x1234..."
+ *       404:
+ *         description: User not found
+ *       400:
+ *         description: User has no proxy wallet
+ *       500:
+ *         description: Error refreshing balance
+ */
 router.post('/:privyUserId/refresh', async (req: Request, res: Response) => {
   try {
     const { privyUserId } = req.params;
@@ -122,6 +246,66 @@ router.post('/:privyUserId/refresh', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/balances/{privyUserId}/transfers:
+ *   get:
+ *     summary: Get transfer history
+ *     description: Returns all USDC.e transfers (deposits and withdrawals) for the user
+ *     tags: [Balances]
+ *     parameters:
+ *       - in: path
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User's Privy ID
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 100
+ *         description: Max transfers to return
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *         description: Number to skip
+ *     responses:
+ *       200:
+ *         description: Transfer history retrieved
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 transfers:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       transfer_type:
+ *                         type: string
+ *                         enum: [in, out]
+ *                       from_address:
+ *                         type: string
+ *                       to_address:
+ *                         type: string
+ *                       amount_human:
+ *                         type: string
+ *                       transaction_hash:
+ *                         type: string
+ *                       created_at:
+ *                         type: string
+ *                         format: date-time
+ *                 count:
+ *                   type: integer
+ *       404:
+ *         description: User not found
+ */
 router.get('/:privyUserId/transfers', async (req: Request, res: Response) => {
   try {
     const { privyUserId } = req.params;
@@ -144,6 +328,49 @@ router.get('/:privyUserId/transfers', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/balances/{privyUserId}/deposits:
+ *   get:
+ *     summary: Get deposit history only
+ *     description: Returns only incoming USDC.e transfers (deposits)
+ *     tags: [Balances]
+ *     parameters:
+ *       - in: path
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User's Privy ID
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 100
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *     responses:
+ *       200:
+ *         description: Deposit history retrieved
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 deposits:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                 count:
+ *                   type: integer
+ *       404:
+ *         description: User not found
+ */
 router.get('/:privyUserId/deposits', async (req: Request, res: Response) => {
   try {
     const { privyUserId } = req.params;

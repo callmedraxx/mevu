@@ -212,7 +212,34 @@ export class ClobWebSocketService {
    * Handle incoming messages
    */
   private handleMessage(message: ClobWebSocketMessage | ClobOrderBookUpdate[]): void {
-    // Check if this is an array of order book updates
+    // Check if this is a price_change event (the format we want)
+    const msg = message as any;
+    if (msg && typeof msg === 'object' && msg.event_type === 'price_change' && msg.price_changes) {
+      logger.info({
+        message: 'CLOB price_change event received',
+        market: msg.market?.substring(0, 20) + '...',
+        priceChangeCount: msg.price_changes.length,
+        timestamp: msg.timestamp,
+      });
+
+      // Notify callbacks with the price changes
+      if (this.orderBookUpdateCallbacks.size > 0) {
+        for (const callback of this.orderBookUpdateCallbacks) {
+          try {
+            // Pass the entire price_change message
+            callback([msg]);
+          } catch (error) {
+            logger.error({
+              message: 'Error in price change callback',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+      return;
+    }
+
+    // Check if this is an array of order book updates (legacy format)
     if (Array.isArray(message) && message.length > 0 && 'market' in message[0] && 'bids' in message[0]) {
       // This is an array of order book updates
       const updates = message as ClobOrderBookUpdate[];
@@ -268,24 +295,16 @@ export class ClobWebSocketService {
     }
 
     // Handle single message object
-    const msg = message as ClobWebSocketMessage;
+    const singleMsg = message as ClobWebSocketMessage;
     
     // Store message in history
-    this.messageHistory.push(msg);
+    this.messageHistory.push(singleMsg);
     if (this.messageHistory.length > this.maxHistorySize) {
       this.messageHistory.shift();
     }
 
-    // Log the message with full details
-    // logger.info({
-//       message: 'CLOB WebSocket message received',
-//       messageType: msg.type || msg.event || msg.channel || 'unknown',
-//       fullMessage: msg,
-//       messageKeys: Object.keys(msg),
-//     });
-
     // Try to identify message structure
-    this.analyzeMessage(msg);
+    this.analyzeMessage(singleMsg);
   }
 
   /**

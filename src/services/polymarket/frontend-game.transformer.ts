@@ -221,6 +221,7 @@ function extractAbbrevsFromSlug(slug: string | undefined): { away?: string; home
 interface TeamOutcome {
   label: string;
   price: number;  // Probability (e.g., 50.50 = 50.50% chance to win)
+  buyPrice?: number;  // Best ask price for buying (from CLOB best_ask)
 }
 
 /**
@@ -238,17 +239,98 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
   const homeAbbr = game.homeTeam?.abbreviation?.toLowerCase() || '';
   const awayAbbr = game.awayTeam?.abbreviation?.toLowerCase() || '';
   
+  // SOCCER/FOOTBALL: First try to find individual "Will X win?" markets
+  // These are Yes/No markets where each team has their own market
+  // This handles 3-way outcomes (home win, draw, away win) correctly
+  let homeWinMarket: { price: number } | null = null;
+  let awayWinMarket: { price: number } | null = null;
+  
+  for (const market of game.markets) {
+    const question = (market.question || '').toLowerCase();
+    
+    // Check if this is a "Will X win?" market
+    if (question.includes('will') && question.includes('win')) {
+      // Prefer raw outcomePrices as they're more reliable
+      let yesPrice = 0;
+      
+      if (market.outcomes && market.outcomePrices) {
+        const rawOutcomes = market.outcomes as string[];
+        const rawPrices = market.outcomePrices as string[];
+        const yesIndex = rawOutcomes.findIndex(o => o.toLowerCase() === 'yes');
+        if (yesIndex !== -1 && rawPrices[yesIndex]) {
+          yesPrice = parseFloat(rawPrices[yesIndex]) * 100; // Convert 0.365 to 36.5
+        }
+      } else {
+        // Fallback to structuredOutcomes
+        const outcomes = market.structuredOutcomes || [];
+        const yesOutcome = outcomes.find((o: any) => 
+          String(o.label || '').toLowerCase() === 'yes'
+        );
+        if (yesOutcome) {
+          yesPrice = parseFloat(String(yesOutcome.price || '0'));
+        }
+      }
+      
+      if (yesPrice > 0) {
+        // Check if this market is for home team
+        if (homeTeamName && question.includes(homeTeamName)) {
+          homeWinMarket = { price: yesPrice };
+        }
+        // Check if this market is for away team
+        else if (awayTeamName && question.includes(awayTeamName)) {
+          awayWinMarket = { price: yesPrice };
+        }
+      }
+    }
+  }
+  
+  // If we found both individual team win markets, use those (soccer-style)
+  if (homeWinMarket && awayWinMarket) {
+    return {
+      home: { label: homeTeamName, price: homeWinMarket.price },
+      away: { label: awayTeamName, price: awayWinMarket.price },
+    };
+  }
+  
   // Look through markets to find the moneyline (team vs team) market
   for (const market of game.markets) {
-    const outcomes = market.structuredOutcomes;
+    // Prefer raw outcomes+outcomePrices as they're more reliable than transformed data
+    let outcomes: any[] | null = null;
+    
+    if (market.outcomes && market.outcomePrices) {
+      const rawOutcomes = market.outcomes as string[];
+      const rawPrices = market.outcomePrices as string[];
+      const structuredOutcomes = market.structuredOutcomes || [];
+      if (rawOutcomes.length === 2 && rawPrices.length === 2) {
+        // Convert price from decimal (0.745) to percentage (74.5)
+        // Also get buyPrice from structuredOutcomes if available (from CLOB best_ask)
+        outcomes = rawOutcomes.map((label: string, i: number) => ({
+          label,
+          price: parseFloat(rawPrices[i]) * 100,
+          buyPrice: structuredOutcomes[i]?.buyPrice,
+        }));
+      }
+    }
+    
+    // Fallback to structuredOutcomes if raw data not available
+    if (!outcomes || outcomes.length === 0) {
+      outcomes = market.structuredOutcomes || null;
+    }
+    
     if (!outcomes || outcomes.length !== 2) continue;
     
     // Check if this is a team vs team market (not Over/Under)
     const labels = outcomes.map((o: any) => String(o.label || '').toLowerCase());
     
     // Skip Over/Under, Points, Rebounds, etc.
-    if (labels.some(l => l.includes('over') || l.includes('under') || l.includes('o/u') || 
-                         l.includes('points') || l.includes('rebounds') || l.includes('assists'))) {
+    // Use exact match or word boundary to avoid false positives (e.g., "thunder" contains "under")
+    const shouldSkip = labels.some(l => 
+      l === 'over' || l === 'under' || l === 'o/u' ||
+      l.startsWith('over ') || l.startsWith('under ') ||
+      l.endsWith(' over') || l.endsWith(' under') ||
+      l.includes('points') || l.includes('rebounds') || l.includes('assists')
+    );
+    if (shouldSkip) {
       continue;
     }
     
@@ -260,18 +342,19 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       const label = String(outcome.label || '').toLowerCase();
       const shortLabel = String(outcome.shortLabel || '').toLowerCase();
       const price = parseFloat(String(outcome.price || '50'));
+      const buyPrice = outcome.buyPrice;
       
       // Check if this matches home team
       if (homeTeamName && (label.includes(homeTeamName) || homeTeamName.includes(label))) {
-        homeOutcome = { label: outcome.label, price };
+        homeOutcome = { label: outcome.label, price, buyPrice };
       } else if (homeAbbr && (label === homeAbbr || shortLabel === homeAbbr)) {
-        homeOutcome = { label: outcome.label, price };
+        homeOutcome = { label: outcome.label, price, buyPrice };
       }
       // Check if this matches away team
       else if (awayTeamName && (label.includes(awayTeamName) || awayTeamName.includes(label))) {
-        awayOutcome = { label: outcome.label, price };
+        awayOutcome = { label: outcome.label, price, buyPrice };
       } else if (awayAbbr && (label === awayAbbr || shortLabel === awayAbbr)) {
-        awayOutcome = { label: outcome.label, price };
+        awayOutcome = { label: outcome.label, price, buyPrice };
       }
     }
     
@@ -291,19 +374,19 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       const o1Label = String(o1.label || '').toLowerCase();
       const o2Label = String(o2.label || '').toLowerCase();
       
-      // Check which team appears first in title (usually format: "Home vs Away")
+      // Check which team appears first in title (format: "Away vs Home" or "Away @ Home")
       const o1Pos = titleLower.indexOf(o1Label);
       const o2Pos = titleLower.indexOf(o2Label);
       
       if (o1Pos !== -1 && o2Pos !== -1) {
         if (o1Pos < o2Pos) {
-          // o1 is home (appears first)
-          homeOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')) };
-          awayOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')) };
+          // o1 is away (appears first), o2 is home (appears second)
+          awayOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice };
+          homeOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice };
         } else {
-          // o2 is home (appears first)
-          homeOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')) };
-          awayOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')) };
+          // o2 is away (appears first), o1 is home (appears second)
+          awayOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice };
+          homeOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice };
         }
         return { home: homeOutcome, away: awayOutcome };
       }
@@ -340,20 +423,46 @@ function extractPrices(game: LiveGame): {
   
   if (moneyline.home && moneyline.away) {
     // Get YES prices for each team (raw probability)
-    const homeYesPrice = moneyline.home.price;  // e.g., 50.50
-    const awayYesPrice = moneyline.away.price;  // e.g., 49.50
+    const homeYesPrice = moneyline.home.price;  // e.g., 25.50
+    const awayYesPrice = moneyline.away.price;  // e.g., 74.50
     
-    // Store raw probabilities (keep decimal precision)
-    homeProb = Number(homeYesPrice.toFixed(1));  // e.g., 50.5
-    awayProb = Number(awayYesPrice.toFixed(1));  // e.g., 49.5
+    // Check if this is a 3-way sport (soccer/football) where probabilities don't add to 100
+    // If sum is significantly less than 100, it's a 3-way market (home, draw, away)
+    const sumOfPrices = homeYesPrice + awayYesPrice;
+    const is3WayMarket = sumOfPrices < 95; // Less than 95% means there's a draw probability
     
-    // buyPrice = YES price rounded UP (you buy YES if you think team wins)
-    // sellPrice = NO price rounded UP = ceil(100 - YES price)
-    homeBuy = Math.ceil(homeYesPrice);           // 50.50 → 51
-    homeSell = Math.ceil(100 - homeYesPrice);    // 100 - 50.50 = 49.50 → 50
+    if (is3WayMarket) {
+      // For 3-way markets: round each probability independently using standard rounding
+      homeProb = Math.round(homeYesPrice);  // e.g., 60.50 → 61
+      awayProb = Math.round(awayYesPrice);  // e.g., 15.50 → 16
+    } else {
+      // For 2-way markets: higher one rounds up, lower one rounds down
+      if (homeYesPrice >= awayYesPrice) {
+        homeProb = Math.ceil(homeYesPrice);   // e.g., 74.50 → 75
+        awayProb = Math.floor(awayYesPrice);  // e.g., 25.50 → 25
+      } else {
+        homeProb = Math.floor(homeYesPrice);  // e.g., 25.50 → 25
+        awayProb = Math.ceil(awayYesPrice);   // e.g., 74.50 → 75
+      }
+    }
     
-    awayBuy = Math.ceil(awayYesPrice);           // 49.50 → 50
-    awaySell = Math.ceil(100 - awayYesPrice);    // 100 - 49.50 = 50.50 → 51
+    // buyPrice from CLOB best_ask if available, otherwise calculate from probability
+    // sellPrice = 100 - buyPrice (for the other side)
+    if (moneyline.home.buyPrice !== undefined) {
+      homeBuy = moneyline.home.buyPrice;
+      homeSell = Math.ceil(100 - homeBuy);
+    } else {
+      homeBuy = Math.ceil(homeYesPrice);
+      homeSell = Math.ceil(100 - homeYesPrice);
+    }
+    
+    if (moneyline.away.buyPrice !== undefined) {
+      awayBuy = moneyline.away.buyPrice;
+      awaySell = Math.ceil(100 - awayBuy);
+    } else {
+      awayBuy = Math.ceil(awayYesPrice);
+      awaySell = Math.ceil(100 - awayYesPrice);
+    }
   }
   
   return { homeBuy, homeSell, awayBuy, awaySell, homeProb, awayProb };

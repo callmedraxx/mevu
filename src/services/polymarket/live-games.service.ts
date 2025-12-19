@@ -206,6 +206,7 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
       ufc: ['ufc', 'mma'],
       epl: ['epl', 'premier league', 'premier-league'],
       lal: ['lal', 'la liga', 'la-liga', 'laliga'],
+      valorant: ['valorant', 'val', 'vct'],
     };
     
     const indicators = sportIndicators[sport] || [sport];
@@ -219,7 +220,7 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
   return null;
 }
 
-const STANDARD_LEAGUES = new Set(['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'epl', 'lal']);
+const STANDARD_LEAGUES = new Set(['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'epl', 'lal', 'valorant', 'val']);
 
 function extractLeagueFromSlug(slug: string): string | null {
   if (!slug) return null;
@@ -1010,11 +1011,18 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
   const client = await pool.connect();
   
   try {
+    // Include games that are:
+    // 1. Active and not closed/ended
+    // 2. End date is today or in the future
+    // Note: Don't filter by live here - let the route handler filter by live parameter
     const result = await client.query(
       `SELECT transformed_data, raw_data, period_scores FROM live_games
        WHERE active = true AND closed = false AND (ended = false OR ended IS NULL)
          AND (end_date IS NULL OR DATE(end_date) >= CURRENT_DATE)
-      ORDER BY volume_24hr DESC NULLS LAST, created_at DESC`
+      ORDER BY 
+        CASE WHEN live = true THEN 0 ELSE 1 END,
+        volume_24hr DESC NULLS LAST, 
+        created_at DESC`
     );
     
     return result.rows.map((row) => {
@@ -1072,6 +1080,13 @@ export async function updateGame(gameUpdate: Partial<LiveGame> & { id: string })
   } else {
     updateGameInMemory(gameUpdate);
   }
+}
+
+/**
+ * Update game in cache only (for real-time price updates that already wrote to DB)
+ */
+export function updateGameInCache(gameId: string, updatedGame: LiveGame): void {
+  gamesCache.set(gameId, updatedGame);
 }
 
 export async function updateGameByGameId(gameId: number, updates: Partial<LiveGame>): Promise<void> {
@@ -1186,7 +1201,17 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
       [gameId]
     );
     
-    if (findResult.rows.length === 0) return;
+    if (findResult.rows.length === 0) {
+      // Game doesn't exist - log for debugging (might be NFL or other missing game)
+      logger.warn({
+        message: 'Websocket update received for game not in database - may need refresh',
+        gameId,
+        live: updates.live,
+        score: updates.score,
+        period: updates.period,
+      });
+      return;
+    }
     
     const eventId = findResult.rows[0].id;
     const current = findResult.rows[0].transformed_data 
@@ -1221,12 +1246,13 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
       }
     }
     
-    const updated = { ...current, ...updates, updatedAt: new Date() };
-    
+    // Build atomic JSONB updates to avoid race conditions with CLOB price updates
+    // Each field is updated independently without reading/rewriting the whole object
     const updateFields: string[] = [];
     const values: any[] = [];
     let paramIndex = 1;
     
+    // Column updates (separate from JSONB)
     if (updates.score !== undefined) { updateFields.push(`score = $${paramIndex++}`); values.push(updates.score); }
     if (updates.period !== undefined) { updateFields.push(`period = $${paramIndex++}`); values.push(updates.period); }
     if (updates.elapsed !== undefined) { updateFields.push(`elapsed = $${paramIndex++}`); values.push(updates.elapsed); }
@@ -1239,14 +1265,54 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
       values.push(JSON.stringify(newPeriodScores));
     }
     
-    updateFields.push(`transformed_data = $${paramIndex++}`);
-    values.push(JSON.stringify(updated));
+    // Build atomic JSONB set operations for transformed_data
+    // This preserves existing fields (like markets) while updating only specific fields
+    let jsonbUpdate = 'COALESCE(transformed_data, \'{}\'::jsonb)';
+    
+    if (updates.score !== undefined) {
+      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{score}', to_jsonb($${paramIndex++}::text))`;
+      values.push(updates.score);
+    }
+    if (updates.period !== undefined) {
+      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{period}', to_jsonb($${paramIndex++}::text))`;
+      values.push(updates.period);
+    }
+    if (updates.elapsed !== undefined) {
+      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{elapsed}', to_jsonb($${paramIndex++}::text))`;
+      values.push(updates.elapsed);
+    }
+    if (updates.live !== undefined) {
+      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{live}', to_jsonb($${paramIndex++}::boolean))`;
+      values.push(updates.live);
+    }
+    if (updates.ended !== undefined) {
+      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{ended}', to_jsonb($${paramIndex++}::boolean))`;
+      values.push(updates.ended);
+    }
+    if (updates.active !== undefined) {
+      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{active}', to_jsonb($${paramIndex++}::boolean))`;
+      values.push(updates.active);
+    }
+    if (updates.closed !== undefined) {
+      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{closed}', to_jsonb($${paramIndex++}::boolean))`;
+      values.push(updates.closed);
+    }
+    if (newPeriodScores !== null) {
+      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{periodScores}', $${paramIndex++}::jsonb)`;
+      values.push(JSON.stringify(newPeriodScores));
+    }
+    // Always update timestamp
+    jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{updatedAt}', to_jsonb($${paramIndex++}::text))`;
+    values.push(new Date().toISOString());
+    
+    updateFields.push(`transformed_data = ${jsonbUpdate}`);
     updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
     values.push(eventId);
     
     await client.query(`UPDATE live_games SET ${updateFields.join(', ')} WHERE id = $${paramIndex}`, values);
     
-    const updatedGame = updated as LiveGame;
+    // Build updated game from current + updates for broadcasting
+    const updatedGame = { ...current, ...updates, updatedAt: new Date() } as LiveGame;
     if (newPeriodScores) {
       updatedGame.periodScores = newPeriodScores;
     }
@@ -1388,6 +1454,21 @@ export async function refreshLiveGames(): Promise<number> {
     
     const filteredGames = filterGamesBySports(allGames);
     
+    // Log filtering stats for debugging
+    const nflGames = allGames.filter(g => {
+      const slug = g.slug?.toLowerCase() || '';
+      const title = g.title?.toLowerCase() || '';
+      return slug.includes('nfl') || slug.includes('football') || title.includes('nfl') || title.includes('football');
+    });
+    
+    if (nflGames.length > 0) {
+      logger.info({
+        message: 'NFL games found in API response',
+        totalNfl: nflGames.length,
+        nflSlugs: nflGames.map(g => g.slug).slice(0, 5),
+      });
+    }
+
     if (filteredGames.length === 0) {
       const existingGames = await getAllLiveGames();
       return existingGames.length;
