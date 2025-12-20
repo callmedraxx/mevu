@@ -207,6 +207,8 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
       epl: ['epl', 'premier league', 'premier-league'],
       lal: ['lal', 'la liga', 'la-liga', 'laliga'],
       valorant: ['valorant', 'val', 'vct'],
+      cbb: ['cbb', 'college basketball', 'ncaa basketball', 'ncaab'],
+      cfb: ['cfb', 'college football', 'ncaa football', 'ncaaf'],
     };
     
     const indicators = sportIndicators[sport] || [sport];
@@ -220,7 +222,7 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
   return null;
 }
 
-const STANDARD_LEAGUES = new Set(['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'epl', 'lal', 'valorant', 'val']);
+const STANDARD_LEAGUES = new Set(['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'epl', 'lal', 'valorant', 'val', 'cbb', 'cfb']);
 
 function extractLeagueFromSlug(slug: string): string | null {
   if (!slug) return null;
@@ -647,6 +649,38 @@ export function filterOutEndedGames(games: LiveGameEvent[]): LiveGameEvent[] {
   return games.filter(game => !isGameEnded(game));
 }
 
+/**
+ * Check if a LiveGame is ended/closed
+ */
+export function isLiveGameEnded(game: LiveGame): boolean {
+  if (game.ended === true) return true;
+  if (game.closed === true) return true;
+  
+  // Check if all markets are closed
+  if (game.markets && game.markets.length > 0) {
+    const allMarketsClosed = game.markets.every((m: any) => m.closed === true);
+    if (allMarketsClosed) return true;
+  }
+
+  // Check if end_date + 3 hour grace period has passed
+  if (game.endDate) {
+    const endDate = new Date(game.endDate);
+    const graceTime = 3 * 60 * 60 * 1000; // 3 hours
+    if ((endDate.getTime() + graceTime) < Date.now()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Filter out ended/closed LiveGames
+ */
+export function filterOutEndedLiveGames(games: LiveGame[]): LiveGame[] {
+  return games.filter(game => !isLiveGameEnded(game));
+}
+
 async function cleanupEndedGames(): Promise<number> {
   const isProduction = process.env.NODE_ENV === 'production';
   const GRACE_PERIOD_HOURS = 3; // 3 hour grace period after end_date
@@ -1011,14 +1045,10 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
   const client = await pool.connect();
   
   try {
-    // Include games that are:
-    // 1. Active and not closed/ended
-    // 2. End date is today or in the future
-    // Note: Don't filter by live here - let the route handler filter by live parameter
+    // Fetch all games from database - filtering by ended/closed happens at API layer
+    // This allows ended games to still be fetched by ID or slug
     const result = await client.query(
       `SELECT transformed_data, raw_data, period_scores FROM live_games
-       WHERE active = true AND closed = false AND (ended = false OR ended IS NULL)
-         AND (end_date IS NULL OR DATE(end_date) >= CURRENT_DATE)
       ORDER BY 
         CASE WHEN live = true THEN 0 ELSE 1 END,
         volume_24hr DESC NULLS LAST, 
@@ -1474,17 +1504,13 @@ export async function refreshLiveGames(): Promise<number> {
       return existingGames.length;
     }
     
-    const activeGames = filterOutEndedGames(filteredGames);
-    
-    if (activeGames.length === 0) {
-      const existingGames = await getAllLiveGames();
-      return existingGames.length;
-    }
-    
-    const liveGames = await transformAndEnrichGames(activeGames);
+    // No longer filter out ended games - store all games from Polymarket
+    // Ended/closed games can be filtered at the API layer instead
+    const liveGames = await transformAndEnrichGames(filteredGames);
     await storeGames(liveGames);
     
-    const removedCount = await cleanupEndedGames();
+    // No longer cleanup ended games from database
+    // They remain available for fetching by ID/slug
     
     const allStoredGames = await getAllLiveGames();
     if (liveGamesService) {
@@ -1495,9 +1521,7 @@ export async function refreshLiveGames(): Promise<number> {
       message: 'Live games refreshed',
       totalFetched: allGames.length,
       afterSportFilter: filteredGames.length,
-      afterEndedFilter: activeGames.length,
       stored: liveGames.length,
-      removedEnded: removedCount,
     });
     
     return liveGames.length;

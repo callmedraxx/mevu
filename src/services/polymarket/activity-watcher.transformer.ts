@@ -8,6 +8,8 @@ export interface ActivityWatcherOutcome {
   shortLabel?: string;
   price: number;
   probability: number;
+  buyPrice?: number; // Best ask price for buying this outcome
+  sellPrice?: number; // Best bid price for selling this outcome
   // Trading fields
   clobTokenId?: string; // Required for executing trades
 }
@@ -69,12 +71,19 @@ function deriveProbability(outcome: TransformedOutcome): number {
 function transformOutcome(outcome: TransformedOutcome): ActivityWatcherOutcome {
   const probability = deriveProbability(outcome);
   const price = Number(outcome.price || probability);
+  
+  // buyPrice from best_ask, sellPrice from best_bid (stored in outcome)
+  const buyPrice = outcome.buyPrice !== undefined ? Number(outcome.buyPrice) : undefined;
+  // sellPrice is typically 100 - buyPrice for binary markets, or use bestBid if available
+  const sellPrice = buyPrice !== undefined ? Math.ceil(100 - buyPrice) : undefined;
 
   return {
     label: outcome.label || 'Unknown',
     shortLabel: outcome.shortLabel,
     price: Number(price.toFixed(2)),
     probability,
+    buyPrice,
+    sellPrice,
     // Trading fields
     clobTokenId: outcome.clobTokenId,
   };

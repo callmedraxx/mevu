@@ -54,6 +54,14 @@ const SPORTS_GAMES_CONFIG: SportsGamesConfig = {
     seriesId: 'valorant', // Esports - Valorant
     label: 'Valorant',
   },
+  cbb: {
+    seriesId: '10347', // College Basketball
+    label: 'College Basketball',
+  },
+  cfb: {
+    seriesId: '10348', // College Football
+    label: 'College Football',
+  },
 };
 
 /**

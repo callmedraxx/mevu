@@ -134,6 +134,78 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Fetch transaction hash from CLOB trades endpoint and update trade record
+ * The CLOB client's getTrades() returns trades with transaction_hash once settled on-chain
+ */
+async function fetchAndUpdateTransactionHash(
+  clobClient: any,
+  orderId: string,
+  tradeRecordId: string,
+  privyUserId: string
+): Promise<void> {
+  const maxAttempts = 5;
+  const delayMs = 2000; // 2 seconds between attempts
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Wait before fetching (give time for on-chain settlement)
+      await sleep(delayMs * attempt);
+
+      // Fetch trades from CLOB
+      const trades = await clobClient.getTrades();
+      
+      // Find the trade matching our order ID
+      const matchingTrade = trades?.find((trade: any) => 
+        trade.taker_order_id === orderId || trade.id === orderId
+      );
+
+      if (matchingTrade?.transaction_hash) {
+        // Update trade record with transaction hash
+        await updateTradeRecordById(tradeRecordId, {
+          transactionHash: matchingTrade.transaction_hash,
+        });
+
+        logger.info({
+          message: 'Transaction hash updated for trade',
+          privyUserId,
+          tradeId: tradeRecordId,
+          orderId,
+          transactionHash: matchingTrade.transaction_hash,
+          attempt,
+        });
+        return;
+      }
+
+      logger.debug({
+        message: 'Transaction hash not yet available',
+        privyUserId,
+        tradeId: tradeRecordId,
+        orderId,
+        attempt,
+        tradesCount: trades?.length || 0,
+      });
+    } catch (error) {
+      logger.warn({
+        message: 'Error fetching transaction hash',
+        privyUserId,
+        tradeId: tradeRecordId,
+        orderId,
+        attempt,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  logger.warn({
+    message: 'Could not fetch transaction hash after max attempts',
+    privyUserId,
+    tradeId: tradeRecordId,
+    orderId,
+    maxAttempts,
+  });
+}
+
+/**
  * Execute a trade (buy or sell) on Polymarket
  * Uses RelayerClient for gasless execution
  */
@@ -435,8 +507,6 @@ export async function executeTrade(
       const updatedTrade = await updateTradeRecordById(tradeRecord.id, {
         orderId: orderResponse.orderID,
         status: finalStatus,
-        transactionHash: orderResponse.txHash,
-        blockNumber: orderResponse.blockNumber,
         feeRate: FEE_CONFIG.RATE,
         feeAmount: feeAmount.toFixed(18),
         feeStatus: finalStatus === 'FILLED' ? 'PENDING' : undefined, // Only charge fee if trade filled
@@ -451,6 +521,19 @@ export async function executeTrade(
         finalStatus,
         feeAmount,
       });
+
+      // Fetch transaction hash from CLOB trades endpoint (async, don't block response)
+      if (finalStatus === 'FILLED' && orderResponse.orderID) {
+        fetchAndUpdateTransactionHash(clobClient, orderResponse.orderID, tradeRecord.id, privyUserId).catch((err) => {
+          logger.warn({
+            message: 'Failed to fetch transaction hash',
+            privyUserId,
+            tradeId: tradeRecord.id,
+            orderId: orderResponse.orderID,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
 
       // Transfer fee if trade was filled successfully
       let feeTransferResult: { success: boolean; txHash?: string; error?: string } | null = null;

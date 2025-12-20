@@ -12,6 +12,9 @@ const CLOB_WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 export class ClobWebSocketService {
   private ws: WebSocket | null = null;
   private reconnectAttempts: number = 0;
+  private maxReconnectAttempts: number = 10;
+  private reconnectDelay: number = 5000; // Start with 5 seconds
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private isConnecting: boolean = false;
   private isConnected: boolean = false;
   private messageHistory: ClobWebSocketMessage[] = [];
@@ -19,6 +22,7 @@ export class ClobWebSocketService {
   private maxHistorySize: number = 100;
   private maxOrderBookHistory: number = 50;
   private orderBookUpdateCallbacks: Set<(updates: ClobOrderBookUpdate[]) => void> = new Set();
+  private pendingSubscriptions: string[] = []; // Store subscriptions to re-apply after reconnect
 
   /**
    * Connect to the CLOB WebSocket endpoint
@@ -73,10 +77,10 @@ export class ClobWebSocketService {
       this.isConnected = true;
       this.reconnectAttempts = 0;
       
-      // logger.info({
-//         message: 'CLOB WebSocket connected',
-//         url: CLOB_WS_URL,
-//       });
+      logger.info({
+        message: 'CLOB WebSocket connected',
+        url: CLOB_WS_URL,
+      });
 
       // Log that we're ready to receive messages
       // logger.info({
@@ -111,19 +115,22 @@ export class ClobWebSocketService {
 
       const reasonStr = reason.length > 0 ? reason.toString() : 'No reason provided';
       
-      // logger.warn({
-//         message: 'CLOB WebSocket closed',
-//         code,
-//         reason: reasonStr,
-//         codeMeaning: this.getCloseCodeMeaning(code),
-//         reconnectAttempts: this.reconnectAttempts,
-//       });
+      logger.warn({
+        message: 'CLOB WebSocket closed',
+        code,
+        reason: reasonStr,
+        codeMeaning: this.getCloseCodeMeaning(code),
+        reconnectAttempts: this.reconnectAttempts,
+      });
 
-      // Don't auto-reconnect during testing - let the test script handle it
       // Attempt to reconnect if not a normal closure
-      // if (code !== 1000 && this.reconnectAttempts < this.maxReconnectAttempts) {
-      //   this.scheduleReconnect();
-      // }
+      if (code !== 1000 && this.reconnectAttempts < this.maxReconnectAttempts) {
+        this.scheduleReconnect();
+      } else if (code === 1000) {
+        logger.info({ message: 'CLOB WebSocket closed normally, not reconnecting' });
+      } else {
+        logger.error({ message: 'CLOB WebSocket max reconnect attempts reached', attempts: this.reconnectAttempts });
+      }
     });
 
     this.ws.on('ping', (data: Buffer) => {
@@ -369,22 +376,21 @@ export class ClobWebSocketService {
    */
   subscribeToAssets(assetIds: string[]): void {
     if (!assetIds || assetIds.length === 0) {
-      // logger.warn({
-//         message: 'Cannot subscribe: no asset IDs provided',
-//       });
       return;
     }
+
+    // Store subscriptions for reconnect
+    this.pendingSubscriptions = assetIds;
 
     const subscriptionMessage = {
       assets_ids: assetIds,
       type: 'market',
     };
 
-    // logger.info({
-//       message: 'Subscribing to assets',
-//       assetIds,
-//       count: assetIds.length,
-//     });
+    logger.info({
+      message: 'Subscribing to CLOB assets',
+      count: assetIds.length,
+    });
 
     this.send(subscriptionMessage);
   }
@@ -418,6 +424,59 @@ export class ClobWebSocketService {
     }
     this.isConnected = false;
     this.isConnecting = false;
+    
+    // Clear reconnect timer if any
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  /**
+   * Schedule a reconnection attempt with exponential backoff
+   */
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) {
+      return; // Already scheduled
+    }
+
+    this.reconnectAttempts++;
+    // Exponential backoff: 5s, 10s, 20s, 40s, ... up to 5 minutes max
+    const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1), 300000);
+    
+    logger.info({
+      message: 'Scheduling CLOB WebSocket reconnect',
+      attempt: this.reconnectAttempts,
+      maxAttempts: this.maxReconnectAttempts,
+      delayMs: delay,
+    });
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      
+      try {
+        await this.connect();
+        
+        // Re-subscribe to assets after successful reconnection
+        if (this.isConnected && this.pendingSubscriptions.length > 0) {
+          logger.info({
+            message: 'Re-subscribing to assets after reconnect',
+            assetCount: this.pendingSubscriptions.length,
+          });
+          this.subscribeToAssets(this.pendingSubscriptions);
+        }
+      } catch (error) {
+        logger.error({
+          message: 'Failed to reconnect CLOB WebSocket',
+          error: error instanceof Error ? error.message : String(error),
+        });
+        
+        // Schedule another reconnect if we haven't exceeded max attempts
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.scheduleReconnect();
+        }
+      }
+    }, delay);
   }
 
   /**

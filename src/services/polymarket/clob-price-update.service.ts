@@ -9,6 +9,7 @@ import { clobWebSocketService } from './clob-websocket.service';
 import { ClobPriceChangeUpdate, ClobPriceChange } from './polymarket.types';
 import { getAllLiveGames, updateGame, updateGameInCache, LiveGame } from './live-games.service';
 import { gamesWebSocketService } from './games-websocket.service';
+import { activityWatcherWebSocketService } from './activity-watcher-websocket.service';
 import { pool } from '../../config/database';
 
 // Map asset_id -> game/market info for quick lookup
@@ -23,6 +24,12 @@ export class ClobPriceUpdateService {
   private assetToGameMap: Map<string, AssetGameMapping> = new Map();
   private isSubscribed: boolean = false;
   private subscriptionCheckInterval: NodeJS.Timeout | null = null;
+  
+  // Write queue for batching database updates
+  private pendingWrites: Map<string, { markets: any[]; timestamp: Date }> = new Map();
+  private writeFlushTimer: NodeJS.Timeout | null = null;
+  private writeFlushInterval: number = 500; // Flush every 500ms
+  private isFlushingWrites: boolean = false;
 
   /**
    * Initialize the service and start subscribing to price updates
@@ -114,15 +121,15 @@ export class ClobPriceUpdateService {
       const bestBid = parseFloat(priceChange.best_bid);
       
       // For probability, use mid-price if both exist, otherwise use best_bid
-      // This gives the most stable representation of the market's view
+      // Don't round here - let frontend-game.transformer handle ceil/floor logic
       let probability: number;
       if (bestBid > 0 && bestAsk > 0 && bestAsk < 1) {
-        // Use mid-price for probability
-        probability = Math.round(((bestBid + bestAsk) / 2) * 100);
+        // Use mid-price for probability (no rounding - transformer will handle it)
+        probability = ((bestBid + bestAsk) / 2) * 100;
       } else if (bestBid > 0) {
-        probability = Math.round(bestBid * 100);
+        probability = bestBid * 100;
       } else {
-        probability = Math.round(bestAsk * 100);
+        probability = bestAsk * 100;
       }
       
       const buyPrice = Math.round(bestAsk * 100);  // best_ask * 100 for buyPrice
@@ -214,17 +221,20 @@ export class ClobPriceUpdateService {
           return market;
         });
 
-        // Update game in database directly (bypass cache for speed)
-        await this.updateGamePricesInDatabase(gameId, updatedMarkets);
-
-        // Update cache so API calls get fresh data
+        // Update cache immediately so API calls get fresh data
         const updatedGame = { ...game, markets: updatedMarkets, updatedAt: new Date() };
         updateGameInCache(gameId, updatedGame);
 
         // Broadcast to frontend WebSocket immediately
         await gamesWebSocketService.broadcastPriceUpdate(updatedGame);
+        
+        // Also broadcast to activity watcher WebSocket
+        await activityWatcherWebSocketService.broadcastGameUpdate(updatedGame);
 
-        logger.info({
+        // Queue database write (batched to reduce connection pressure)
+        this.queueDatabaseWrite(gameId, updatedMarkets);
+
+        logger.debug({
           message: 'Game prices updated and broadcast',
           gameId,
           updatesApplied: updates.size,
@@ -240,31 +250,103 @@ export class ClobPriceUpdateService {
   }
 
   /**
-   * Update game prices directly in database (fast path)
-   * Uses atomic JSONB update to avoid race conditions with sports score updates
+   * Queue a database write for batching
+   * This reduces connection pressure by batching multiple updates
    */
-  private async updateGamePricesInDatabase(gameId: string, markets: any[]): Promise<void> {
-    const client = await pool.connect();
+  private queueDatabaseWrite(gameId: string, markets: any[]): void {
+    this.pendingWrites.set(gameId, { markets, timestamp: new Date() });
+    
+    // Start flush timer if not already running
+    if (!this.writeFlushTimer) {
+      this.writeFlushTimer = setTimeout(() => {
+        this.flushPendingWrites();
+      }, this.writeFlushInterval);
+    }
+  }
+
+  /**
+   * Flush all pending database writes in a single connection
+   */
+  private async flushPendingWrites(): Promise<void> {
+    this.writeFlushTimer = null;
+    
+    if (this.pendingWrites.size === 0 || this.isFlushingWrites) {
+      return;
+    }
+    
+    this.isFlushingWrites = true;
+    const writesToFlush = new Map(this.pendingWrites);
+    this.pendingWrites.clear();
+    
+    let client;
     try {
-      // Use atomic JSONB update to set markets and updatedAt without reading first
-      // This avoids race conditions with sports WebSocket score updates
-      await client.query(
-        `UPDATE live_games 
-         SET transformed_data = jsonb_set(
-           jsonb_set(
-             COALESCE(transformed_data, '{}'::jsonb),
-             '{markets}',
-             $1::jsonb
-           ),
-           '{updatedAt}',
-           to_jsonb($2::text)
-         ),
-         updated_at = NOW()
-         WHERE id = $3`,
-        [JSON.stringify(markets), new Date().toISOString(), gameId]
-      );
+      client = await pool.connect();
+      
+      // Execute all updates in a single transaction
+      await client.query('BEGIN');
+      
+      for (const [gameId, { markets, timestamp }] of writesToFlush) {
+        try {
+          await client.query(
+            `UPDATE live_games 
+             SET transformed_data = jsonb_set(
+               jsonb_set(
+                 COALESCE(transformed_data, '{}'::jsonb),
+                 '{markets}',
+                 $1::jsonb
+               ),
+               '{updatedAt}',
+               to_jsonb($2::text)
+             ),
+             updated_at = NOW()
+             WHERE id = $3`,
+            [JSON.stringify(markets), timestamp.toISOString(), gameId]
+          );
+        } catch (error) {
+          logger.error({
+            message: 'Error updating game in batch',
+            gameId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      
+      await client.query('COMMIT');
+      
+      logger.debug({
+        message: 'Flushed pending database writes',
+        count: writesToFlush.size,
+      });
+    } catch (error) {
+      if (client) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {}
+      }
+      logger.error({
+        message: 'Error flushing pending writes',
+        error: error instanceof Error ? error.message : String(error),
+        pendingCount: writesToFlush.size,
+      });
+      
+      // Re-queue failed writes for retry
+      for (const [gameId, data] of writesToFlush) {
+        if (!this.pendingWrites.has(gameId)) {
+          this.pendingWrites.set(gameId, data);
+        }
+      }
     } finally {
-      client.release();
+      if (client) {
+        client.release();
+      }
+      this.isFlushingWrites = false;
+      
+      // If there are still pending writes, schedule another flush
+      if (this.pendingWrites.size > 0 && !this.writeFlushTimer) {
+        this.writeFlushTimer = setTimeout(() => {
+          this.flushPendingWrites();
+        }, this.writeFlushInterval);
+      }
     }
   }
 

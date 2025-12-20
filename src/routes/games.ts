@@ -7,9 +7,11 @@ import { Router, Request, Response } from 'express';
 import { 
   getAllLiveGames, 
   getLiveGameById,
+  getLiveGameBySlug,
   refreshLiveGames,
   liveGamesService,
-  LiveGame 
+  LiveGame,
+  filterOutEndedLiveGames,
 } from '../services/polymarket/live-games.service';
 import { sportsWebSocketService } from '../services/polymarket/sports-websocket.service';
 import { gamesWebSocketService } from '../services/polymarket/games-websocket.service';
@@ -28,7 +30,9 @@ const sseClients: Set<Response> = new Set();
  * Broadcast full games update to all SSE clients
  */
 async function broadcastToClients(games: LiveGame[]): Promise<void> {
-  const frontendGames = await transformToFrontendGames(games);
+  // Filter out ended games before broadcasting
+  const activeGames = filterOutEndedLiveGames(games);
+  const frontendGames = await transformToFrontendGames(activeGames);
   const data = JSON.stringify({ type: 'games_update', games: frontendGames });
   
   for (const client of sseClients) {
@@ -42,7 +46,7 @@ async function broadcastToClients(games: LiveGame[]): Promise<void> {
   logger.debug({
     message: 'Broadcasted games update to SSE clients',
     clientCount: sseClients.size,
-    gameCount: games.length,
+    gameCount: activeGames.length,
   });
 }
 
@@ -122,7 +126,7 @@ router.get('/', async (req: Request, res: Response) => {
  * /api/games/frontend:
  *   get:
  *     summary: Get all games in frontend format
- *     description: Returns all active games transformed into the frontend Game interface. Can filter by sport and live status.
+ *     description: Returns all active games transformed into the frontend Game interface. Can filter by sport and live status. By default, ended/closed games are excluded.
  *     tags: [Games]
  *     parameters:
  *       - in: query
@@ -136,6 +140,12 @@ router.get('/', async (req: Request, res: Response) => {
  *           type: string
  *           enum: [true, false]
  *         description: Filter by live status. 'true' = only live games, 'false' = only non-live games, omitted = all games
+ *       - in: query
+ *         name: includeEnded
+ *         schema:
+ *           type: string
+ *           enum: [true, false]
+ *         description: Include ended/closed games. Defaults to false.
  *     responses:
  *       200:
  *         description: List of frontend-formatted games
@@ -156,7 +166,12 @@ router.get('/frontend', async (req: Request, res: Response) => {
     let games = await getAllLiveGames();
     
     // Apply filters
-    const { sport, live } = req.query;
+    const { sport, live, includeEnded } = req.query;
+    
+    // Filter out ended/closed games by default (unless includeEnded=true)
+    if (includeEnded !== 'true') {
+      games = filterOutEndedLiveGames(games);
+    }
     
     if (sport) {
       games = games.filter(g => g.sport?.toLowerCase() === String(sport).toLowerCase());
@@ -220,9 +235,10 @@ router.get('/stream', async (req: Request, res: Response) => {
     totalClients: sseClients.size,
   });
   
-  // Send initial data
+  // Send initial data (filter out ended games)
   try {
-    const games = await getAllLiveGames();
+    const allGames = await getAllLiveGames();
+    const games = filterOutEndedLiveGames(allGames);
     const frontendGames = await transformToFrontendGames(games);
     res.write(`data: ${JSON.stringify({ type: 'initial', games: frontendGames })}\n\n`);
   } catch (error) {
@@ -324,6 +340,104 @@ router.get('/status', async (req: Request, res: Response) => {
     clobPriceUpdate: clobPriceStatus,
     probabilityHistory: probHistoryStats,
   });
+});
+
+/**
+ * @swagger
+ * /api/games/slug/{slug}:
+ *   get:
+ *     summary: Get a specific live game by slug
+ *     tags: [Games]
+ *     parameters:
+ *       - in: path
+ *         name: slug
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Game slug (e.g., nba-okc-min-2025-12-19)
+ *     responses:
+ *       200:
+ *         description: Game details (raw format)
+ *       404:
+ *         description: Game not found
+ */
+router.get('/slug/:slug', async (req: Request, res: Response) => {
+  try {
+    const { slug } = req.params;
+    const game = await getLiveGameBySlug(slug);
+    
+    if (!game) {
+      return res.status(404).json({
+        success: false,
+        error: 'Game not found',
+      });
+    }
+    
+    res.json({
+      success: true,
+      game,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching game by slug',
+      slug: req.params.slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch game',
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/games/slug/{slug}/frontend:
+ *   get:
+ *     summary: Get a specific live game by slug in frontend format
+ *     tags: [Games]
+ *     parameters:
+ *       - in: path
+ *         name: slug
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Game slug (e.g., nba-okc-min-2025-12-19)
+ *     responses:
+ *       200:
+ *         description: Frontend-formatted game details
+ *       404:
+ *         description: Game not found
+ */
+router.get('/slug/:slug/frontend', async (req: Request, res: Response) => {
+  try {
+    const { slug } = req.params;
+    const game = await getLiveGameBySlug(slug);
+    
+    if (!game) {
+      return res.status(404).json({
+        success: false,
+        error: 'Game not found',
+      });
+    }
+    
+    const frontendGame = await transformToFrontendGame(game);
+    
+    res.json({
+      success: true,
+      game: frontendGame,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching frontend game by slug',
+      slug: req.params.slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch game',
+    });
+  }
 });
 
 /**

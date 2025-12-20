@@ -7,7 +7,7 @@ import WebSocket from 'ws';
 import { WebSocketServer } from 'ws';
 import { Server as HttpServer } from 'http';
 import { logger } from '../../config/logger';
-import { LiveGame, getAllLiveGames, liveGamesService } from './live-games.service';
+import { LiveGame, getAllLiveGames, liveGamesService, filterOutEndedLiveGames, isLiveGameEnded } from './live-games.service';
 import { transformToFrontendGames, transformToFrontendGame, FrontendGame } from './frontend-game.transformer';
 
 // Message types for WebSocket communication
@@ -179,7 +179,9 @@ export class GamesWebSocketService {
    */
   private async sendInitialData(ws: WebSocket): Promise<void> {
     try {
-      const games = await getAllLiveGames();
+      const allGames = await getAllLiveGames();
+      // Filter out ended games for initial data
+      const games = filterOutEndedLiveGames(allGames);
       const frontendGames = await transformToFrontendGames(games);
       
       this.sendToClient(ws, {
@@ -230,7 +232,9 @@ export class GamesWebSocketService {
     if (this.clients.size === 0) return;
 
     try {
-      const frontendGames = await transformToFrontendGames(games);
+      // Filter out ended games before broadcasting
+      const activeGames = filterOutEndedLiveGames(games);
+      const frontendGames = await transformToFrontendGames(activeGames);
       
       this.broadcast({
         type: 'games_update',

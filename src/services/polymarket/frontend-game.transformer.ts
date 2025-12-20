@@ -38,6 +38,7 @@ export interface FrontendGame {
   traders: number;           // 207
   spread: string;            // "1-2¢"
   isLive?: boolean;          // true for in-progress games
+  ended?: boolean;           // true for ended/closed games
   quarter?: string;          // "3Q"
   gameTime?: string;         // "5:45" (time remaining)
   sport?: string;            // "nba", "nfl", etc.
@@ -436,13 +437,14 @@ function extractPrices(game: LiveGame): {
       homeProb = Math.round(homeYesPrice);  // e.g., 60.50 → 61
       awayProb = Math.round(awayYesPrice);  // e.g., 15.50 → 16
     } else {
-      // For 2-way markets: higher one rounds up, lower one rounds down
+      // For 2-way markets: round the higher probability, derive the lower from 100 - higher
+      // This guarantees they always sum to exactly 100%
       if (homeYesPrice >= awayYesPrice) {
-        homeProb = Math.ceil(homeYesPrice);   // e.g., 74.50 → 75
-        awayProb = Math.floor(awayYesPrice);  // e.g., 25.50 → 25
+        homeProb = Math.round(homeYesPrice);  // e.g., 71.6 → 72
+        awayProb = 100 - homeProb;            // e.g., 100 - 72 = 28
       } else {
-        homeProb = Math.floor(homeYesPrice);  // e.g., 25.50 → 25
-        awayProb = Math.ceil(awayYesPrice);   // e.g., 74.50 → 75
+        awayProb = Math.round(awayYesPrice);  // e.g., 71.6 → 72
+        homeProb = 100 - awayProb;            // e.g., 100 - 72 = 28
       }
     }
     
@@ -477,6 +479,37 @@ function calculateSpread(buyPrice: number, sellPrice: number): string {
   const spread = Math.abs(buyPrice - sellPrice);
   if (spread <= 1) return '1¢';
   return `1-${spread}¢`;
+}
+
+/**
+ * Check if a game is ended
+ * Returns true if:
+ * - game.ended is true
+ * - game.closed is true
+ * - All markets are closed
+ * - endDate + 4 hours has passed (fallback)
+ */
+function isGameEnded(game: LiveGame): boolean {
+  // Check explicit ended/closed flags
+  if (game.ended === true) return true;
+  if (game.closed === true) return true;
+  
+  // Check if all markets are closed
+  if (game.markets && game.markets.length > 0) {
+    const allMarketsClosed = game.markets.every((m: any) => m.closed === true);
+    if (allMarketsClosed) return true;
+  }
+
+  // Fallback: Check if endDate + 4 hours has passed
+  if (game.endDate) {
+    const endDate = new Date(game.endDate);
+    const fallbackTime = 4 * 60 * 60 * 1000; // 4 hours in ms
+    if ((endDate.getTime() + fallbackTime) < Date.now()) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -591,6 +624,12 @@ export async function transformToFrontendGame(
   const seedNum = game.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
   const mockTraders = 50 + (seedNum % 500);
   
+  // Determine if game is ended (explicit flag, market closed, or 4 hours past endDate)
+  const gameEnded = isGameEnded(game);
+  
+  // Show scores for both live AND ended games (if available)
+  const showScores = game.live || gameEnded;
+  
   // Build frontend game
   const frontendGame: FrontendGame = {
     id: game.id,
@@ -604,7 +643,7 @@ export async function transformToFrontendGame(
       probability: prices.awayProb,  // Raw YES probability (e.g., 35.5)
       buyPrice: prices.awayBuy,      // YES price rounded up (e.g., 36)
       sellPrice: prices.awaySell,    // NO price rounded up (e.g., 65)
-      score: game.live ? scores.away : undefined,
+      score: showScores ? scores.away : undefined,
     },
     homeTeam: {
       abbr: homeTeam?.abbreviation || slugAbbrevs.home || game.teamIdentifiers?.home?.substring(0, 3).toUpperCase() || titleTeams.home?.substring(0, 3).toUpperCase() || 'HME',
@@ -613,7 +652,7 @@ export async function transformToFrontendGame(
       probability: prices.homeProb,  // Raw YES probability (e.g., 64.5)
       buyPrice: prices.homeBuy,      // YES price rounded up (e.g., 65)
       sellPrice: prices.homeSell,    // NO price rounded up (e.g., 36)
-      score: game.live ? scores.home : undefined,
+      score: showScores ? scores.home : undefined,
     },
     liquidity: formatLiquidity(game.liquidity),
     chartData,
@@ -621,6 +660,7 @@ export async function transformToFrontendGame(
     traders: game.commentCount || mockTraders, // Use comment count or seeded mock
     spread: calculateSpread(prices.homeBuy, prices.homeSell),
     isLive: game.live,
+    ended: gameEnded,
     quarter: game.live ? formatQuarter(game.period) : undefined,
     gameTime: game.live ? formatElapsedTime(game.elapsed) : undefined,
     sport: game.sport,
