@@ -223,6 +223,7 @@ interface TeamOutcome {
   label: string;
   price: number;  // Probability (e.g., 50.50 = 50.50% chance to win)
   buyPrice?: number;  // Best ask price for buying (from CLOB best_ask)
+  sellPrice?: number; // Best bid price for selling (from CLOB best_bid)
 }
 
 /**
@@ -304,11 +305,12 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       const structuredOutcomes = market.structuredOutcomes || [];
       if (rawOutcomes.length === 2 && rawPrices.length === 2) {
         // Convert price from decimal (0.745) to percentage (74.5)
-        // Also get buyPrice from structuredOutcomes if available (from CLOB best_ask)
+        // Also get buyPrice/sellPrice from structuredOutcomes if available (from CLOB)
         outcomes = rawOutcomes.map((label: string, i: number) => ({
           label,
           price: parseFloat(rawPrices[i]) * 100,
           buyPrice: structuredOutcomes[i]?.buyPrice,
+          sellPrice: structuredOutcomes[i]?.sellPrice,
         }));
       }
     }
@@ -344,18 +346,19 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       const shortLabel = String(outcome.shortLabel || '').toLowerCase();
       const price = parseFloat(String(outcome.price || '50'));
       const buyPrice = outcome.buyPrice;
+      const sellPrice = outcome.sellPrice;
       
       // Check if this matches home team
       if (homeTeamName && (label.includes(homeTeamName) || homeTeamName.includes(label))) {
-        homeOutcome = { label: outcome.label, price, buyPrice };
+        homeOutcome = { label: outcome.label, price, buyPrice, sellPrice };
       } else if (homeAbbr && (label === homeAbbr || shortLabel === homeAbbr)) {
-        homeOutcome = { label: outcome.label, price, buyPrice };
+        homeOutcome = { label: outcome.label, price, buyPrice, sellPrice };
       }
       // Check if this matches away team
       else if (awayTeamName && (label.includes(awayTeamName) || awayTeamName.includes(label))) {
-        awayOutcome = { label: outcome.label, price, buyPrice };
+        awayOutcome = { label: outcome.label, price, buyPrice, sellPrice };
       } else if (awayAbbr && (label === awayAbbr || shortLabel === awayAbbr)) {
-        awayOutcome = { label: outcome.label, price, buyPrice };
+        awayOutcome = { label: outcome.label, price, buyPrice, sellPrice };
       }
     }
     
@@ -382,12 +385,12 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       if (o1Pos !== -1 && o2Pos !== -1) {
         if (o1Pos < o2Pos) {
           // o1 is away (appears first), o2 is home (appears second)
-          awayOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice };
-          homeOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice };
+          awayOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice, sellPrice: o1.sellPrice };
+          homeOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice, sellPrice: o2.sellPrice };
         } else {
           // o2 is away (appears first), o1 is home (appears second)
-          awayOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice };
-          homeOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice };
+          awayOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice, sellPrice: o2.sellPrice };
+          homeOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice, sellPrice: o1.sellPrice };
         }
         return { home: homeOutcome, away: awayOutcome };
       }
@@ -448,11 +451,12 @@ function extractPrices(game: LiveGame): {
       }
     }
     
-    // buyPrice from CLOB best_ask if available, otherwise calculate from probability
-    // sellPrice = 100 - buyPrice (for the other side)
+    // buyPrice from CLOB best_ask (what you pay to BUY)
+    // sellPrice from CLOB best_bid (what you get when you SELL)
     if (moneyline.home.buyPrice !== undefined) {
       homeBuy = moneyline.home.buyPrice;
-      homeSell = Math.ceil(100 - homeBuy);
+      // Use actual sellPrice from best_bid if available, otherwise fallback to calculation
+      homeSell = moneyline.home.sellPrice !== undefined ? moneyline.home.sellPrice : Math.ceil(100 - homeBuy);
     } else {
       homeBuy = Math.ceil(homeYesPrice);
       homeSell = Math.ceil(100 - homeYesPrice);
@@ -460,7 +464,8 @@ function extractPrices(game: LiveGame): {
     
     if (moneyline.away.buyPrice !== undefined) {
       awayBuy = moneyline.away.buyPrice;
-      awaySell = Math.ceil(100 - awayBuy);
+      // Use actual sellPrice from best_bid if available, otherwise fallback to calculation
+      awaySell = moneyline.away.sellPrice !== undefined ? moneyline.away.sellPrice : Math.ceil(100 - awayBuy);
     } else {
       awayBuy = Math.ceil(awayYesPrice);
       awaySell = Math.ceil(100 - awayYesPrice);
@@ -484,12 +489,15 @@ function calculateSpread(buyPrice: number, sellPrice: number): string {
 /**
  * Check if a game is ended
  * Returns true if:
- * - game.ended is true
- * - game.closed is true
+ * - game.ended is true (but not if game is live)
+ * - game.closed is true (but not if game is live)
  * - All markets are closed
  * - endDate + 4 hours has passed (fallback)
  */
 function isGameEnded(game: LiveGame): boolean {
+  // If game is live, it cannot be ended (even if ended flag is set incorrectly)
+  if (game.live === true) return false;
+  
   // Check explicit ended/closed flags
   if (game.ended === true) return true;
   if (game.closed === true) return true;
@@ -578,6 +586,12 @@ export async function transformToFrontendGame(
   game: LiveGame,
   historicalChange?: { homePercentChange: number; awayPercentChange: number }
 ): Promise<FrontendGame> {
+  // Ensure consistency: if game is live, it cannot be ended
+  // This is a safety check in case the game object wasn't properly normalized
+  if (game.live === true && game.ended === true && game.closed !== true) {
+    game.ended = false;
+  }
+  
   // Parse score
   const scores = parseScore(game.score);
   

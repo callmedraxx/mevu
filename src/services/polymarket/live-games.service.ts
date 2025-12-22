@@ -470,7 +470,15 @@ async function transformAndEnrichGames(events: LiveGameEvent[]): Promise<LiveGam
       enrichedGame.period = rawEvent.period;
       enrichedGame.elapsed = rawEvent.elapsed;
       enrichedGame.live = rawEvent.live;
-      enrichedGame.ended = rawEvent.ended;
+      // Ensure consistency: if game is live, it cannot be ended
+      // Only set ended=true if the game is truly closed or the end date has passed
+      if (rawEvent.live === true) {
+        // If live is true, ended should be false unless game is explicitly closed
+        enrichedGame.ended = rawEvent.closed === true ? true : false;
+      } else {
+        // If live is false, use the ended value from the API
+        enrichedGame.ended = rawEvent.ended || false;
+      }
       enrichedGame.ticker = rawEvent.ticker || rawEvent.slug || rawEvent.id || 'UNKNOWN';
       enrichedGame.rawData = rawEvent;
       
@@ -620,6 +628,9 @@ export async function fetchLiveGames(): Promise<LiveGameEvent[]> {
 }
 
 function isGameEnded(game: LiveGameEvent): boolean {
+  // If game is live, it cannot be ended (even if ended flag is set incorrectly)
+  if (game.live === true) return false;
+  
   // Check explicit ended/closed flags
   if (game.ended === true) return true;
   if (game.closed === true) return true;
@@ -650,9 +661,25 @@ export function filterOutEndedGames(games: LiveGameEvent[]): LiveGameEvent[] {
 }
 
 /**
+ * Ensure consistency between live and ended flags
+ * If game is live, ended should be false (unless explicitly closed)
+ */
+function ensureLiveEndedConsistency(game: LiveGame): void {
+  if (game.live === true && game.ended === true) {
+    // If live is true, ended should be false unless game is explicitly closed
+    if (game.closed !== true) {
+      game.ended = false;
+    }
+  }
+}
+
+/**
  * Check if a LiveGame is ended/closed
  */
 export function isLiveGameEnded(game: LiveGame): boolean {
+  // If game is live, it cannot be ended (even if ended flag is set incorrectly)
+  if (game.live === true) return false;
+  
   if (game.ended === true) return true;
   if (game.closed === true) return true;
   
@@ -841,69 +868,85 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
   const client = await pool.connect();
   
   try {
-    await client.query('BEGIN');
-    
     if (games.length === 0) {
-      await client.query('COMMIT');
       return;
     }
 
-    // Build bulk insert query
-    const values: any[] = [];
-    const placeholders: string[] = [];
-    let paramIndex = 1;
-
-    for (const game of games) {
-      const ticker = game.ticker || game.slug || game.id || 'UNKNOWN';
-      const rowPlaceholders: string[] = [];
-      
-      // 29 parameters + 2 CURRENT_TIMESTAMP = 31 total (matching 31 columns)
-      for (let i = 0; i < 29; i++) {
-        rowPlaceholders.push(`$${paramIndex++}`);
-      }
-      rowPlaceholders.push('CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP');
-      placeholders.push(`(${rowPlaceholders.join(', ')})`);
-      
-      values.push(
-        game.id, ticker, game.slug, game.title, game.description, game.resolutionSource,
-        game.startDate, game.endDate, game.image, game.icon, game.active, game.closed,
-        game.archived, game.restricted, game.liquidity, game.volume, game.volume24hr,
-        game.competitive, game.sport, game.league, game.seriesId, game.gameId,
-        game.score, game.period, game.elapsed, game.live, game.ended,
-        JSON.stringify(game), JSON.stringify(game.rawData)
-      );
+    // Batch inserts to avoid PostgreSQL index size limits
+    // PostgreSQL has a limit on index entry sizes (~2700 bytes)
+    // Inserting too many rows at once can cause index maintenance issues
+    const BATCH_SIZE = 50; // Process 50 games at a time
+    const batches: LiveGame[][] = [];
+    
+    for (let i = 0; i < games.length; i += BATCH_SIZE) {
+      batches.push(games.slice(i, i + BATCH_SIZE));
     }
 
-    const insertQuery = `
-      INSERT INTO live_games (
-        id, ticker, slug, title, description, resolution_source,
-        start_date, end_date, image, icon, active, closed, archived,
-        restricted, liquidity, volume, volume_24hr, competitive,
-        sport, league, series_id, game_id, score, period, elapsed, live, ended,
-        transformed_data, raw_data, created_at, updated_at
-      ) VALUES ${placeholders.join(', ')}
-      ON CONFLICT (id) DO UPDATE SET
-        ticker = EXCLUDED.ticker, slug = EXCLUDED.slug, title = EXCLUDED.title,
-        description = EXCLUDED.description, resolution_source = EXCLUDED.resolution_source,
-        start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
-        image = EXCLUDED.image, icon = EXCLUDED.icon, active = EXCLUDED.active,
-        closed = EXCLUDED.closed, archived = EXCLUDED.archived, restricted = EXCLUDED.restricted,
-        liquidity = EXCLUDED.liquidity, volume = EXCLUDED.volume, volume_24hr = EXCLUDED.volume_24hr,
-        competitive = EXCLUDED.competitive, sport = EXCLUDED.sport, league = EXCLUDED.league,
-        series_id = EXCLUDED.series_id, game_id = EXCLUDED.game_id, score = EXCLUDED.score,
-        period = EXCLUDED.period, elapsed = EXCLUDED.elapsed, live = EXCLUDED.live,
-        ended = EXCLUDED.ended, transformed_data = EXCLUDED.transformed_data,
-        raw_data = EXCLUDED.raw_data, updated_at = CURRENT_TIMESTAMP
-    `;
+    await client.query('BEGIN');
+    
+    for (const batch of batches) {
+      // Build bulk insert query for this batch
+      const values: any[] = [];
+      const placeholders: string[] = [];
+      let paramIndex = 1;
 
-    await client.query(insertQuery, values);
+      for (const game of batch) {
+        const ticker = game.ticker || game.slug || game.id || 'UNKNOWN';
+        const rowPlaceholders: string[] = [];
+        
+        // 29 parameters + 2 CURRENT_TIMESTAMP = 31 total (matching 31 columns)
+        for (let i = 0; i < 29; i++) {
+          rowPlaceholders.push(`$${paramIndex++}`);
+        }
+        rowPlaceholders.push('CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP');
+        placeholders.push(`(${rowPlaceholders.join(', ')})`);
+        
+        values.push(
+          game.id, ticker, game.slug, game.title, game.description, game.resolutionSource,
+          game.startDate, game.endDate, game.image, game.icon, game.active, game.closed,
+          game.archived, game.restricted, game.liquidity, game.volume, game.volume24hr,
+          game.competitive, game.sport, game.league, game.seriesId, game.gameId,
+          game.score, game.period, game.elapsed, game.live, game.ended,
+          JSON.stringify(game), JSON.stringify(game.rawData)
+        );
+      }
+
+      const insertQuery = `
+        INSERT INTO live_games (
+          id, ticker, slug, title, description, resolution_source,
+          start_date, end_date, image, icon, active, closed, archived,
+          restricted, liquidity, volume, volume_24hr, competitive,
+          sport, league, series_id, game_id, score, period, elapsed, live, ended,
+          transformed_data, raw_data, created_at, updated_at
+        ) VALUES ${placeholders.join(', ')}
+        ON CONFLICT (id) DO UPDATE SET
+          ticker = EXCLUDED.ticker, slug = EXCLUDED.slug, title = EXCLUDED.title,
+          description = EXCLUDED.description, resolution_source = EXCLUDED.resolution_source,
+          start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
+          image = EXCLUDED.image, icon = EXCLUDED.icon, active = EXCLUDED.active,
+          closed = EXCLUDED.closed, archived = EXCLUDED.archived, restricted = EXCLUDED.restricted,
+          liquidity = EXCLUDED.liquidity, volume = EXCLUDED.volume, volume_24hr = EXCLUDED.volume_24hr,
+          competitive = EXCLUDED.competitive, sport = EXCLUDED.sport, league = EXCLUDED.league,
+          series_id = EXCLUDED.series_id, game_id = EXCLUDED.game_id, score = EXCLUDED.score,
+          period = EXCLUDED.period, elapsed = EXCLUDED.elapsed, live = EXCLUDED.live,
+          ended = EXCLUDED.ended, transformed_data = EXCLUDED.transformed_data,
+          raw_data = EXCLUDED.raw_data, updated_at = CURRENT_TIMESTAMP
+      `;
+
+      await client.query(insertQuery, values);
+    }
+
     await client.query('COMMIT');
     
     for (const game of games) {
       gamesCache.set(game.id, game);
     }
     
-    logger.info({ message: 'Games stored in database', count: games.length });
+    logger.info({ 
+      message: 'Games stored in database', 
+      count: games.length,
+      batches: batches.length 
+    });
   } catch (error) {
     try {
       await client.query('ROLLBACK');
@@ -916,6 +959,7 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
     logger.error({
       message: 'Error storing games in database',
       error: error instanceof Error ? error.message : String(error),
+      gameCount: games.length,
     });
     throw error;
   } finally {
@@ -958,10 +1002,15 @@ export async function getAllLiveGames(): Promise<LiveGame[]> {
   } else {
     const games = Array.from(inMemoryGames.values());
     
+    // Ensure consistency for in-memory games
+    games.forEach(ensureLiveEndedConsistency);
+    
     if (games.length === 0) {
       logger.info({ message: 'In-memory storage is empty, fetching live games from API' });
       await refreshLiveGames();
-      return Array.from(inMemoryGames.values());
+      const refreshedGames = Array.from(inMemoryGames.values());
+      refreshedGames.forEach(ensureLiveEndedConsistency);
+      return refreshedGames;
     }
     
     return games;
@@ -974,11 +1023,30 @@ export async function getLiveGameById(id: string): Promise<LiveGame | null> {
   if (isProduction) {
     // Check cache first
     if (gamesCache.has(id)) {
-      return gamesCache.get(id) || null;
+      const game = gamesCache.get(id);
+      if (game) {
+        ensureLiveEndedConsistency(game);
+        // Update cache with fixed game object
+        gamesCache.set(id, game);
+        return game;
+      }
+      return null;
     }
-    return await getLiveGameByIdFromDatabase(id);
+    const game = await getLiveGameByIdFromDatabase(id);
+    if (game) {
+      // Update cache with the game from database (already has consistency fix applied)
+      gamesCache.set(id, game);
+    }
+    return game;
   } else {
-    return inMemoryGames.get(id) || null;
+    const game = inMemoryGames.get(id);
+    if (game) {
+      ensureLiveEndedConsistency(game);
+      // Update in-memory storage with fixed game object
+      inMemoryGames.set(id, game);
+      return game;
+    }
+    return null;
   }
 }
 
@@ -1008,25 +1076,18 @@ async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null>
     if (result.rows.length === 0) return null;
     
     const row = result.rows[0];
+    let game: LiveGame;
+    
     if (row.transformed_data) {
-      const game = typeof row.transformed_data === 'string' 
+      game = typeof row.transformed_data === 'string' 
         ? JSON.parse(row.transformed_data) 
         : row.transformed_data;
       if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
       if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
-      
-      // Add period_scores from database if available
-      if (row.period_scores) {
-        game.periodScores = typeof row.period_scores === 'string'
-          ? JSON.parse(row.period_scores)
-          : row.period_scores;
-      }
-      
-      return game as LiveGame;
+    } else {
+      const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
+      game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
     }
-    
-    const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
-    const game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
     
     // Add period_scores from database if available
     if (row.period_scores) {
@@ -1034,6 +1095,9 @@ async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null>
         ? JSON.parse(row.period_scores)
         : row.period_scores;
     }
+    
+    // Ensure consistency between live and ended flags
+    ensureLiveEndedConsistency(game);
     
     return game;
   } finally {
@@ -1056,25 +1120,18 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
     );
     
     return result.rows.map((row) => {
+      let game: LiveGame;
+      
       if (row.transformed_data) {
-        const game = typeof row.transformed_data === 'string' 
+        game = typeof row.transformed_data === 'string' 
           ? JSON.parse(row.transformed_data) 
           : row.transformed_data;
         if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
         if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
-        
-        // Add period_scores from database if available
-        if (row.period_scores) {
-          game.periodScores = typeof row.period_scores === 'string'
-            ? JSON.parse(row.period_scores)
-            : row.period_scores;
-        }
-        
-        return game as LiveGame;
+      } else {
+        const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
+        game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
       }
-      
-      const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
-      const game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
       
       // Add period_scores from database if available
       if (row.period_scores) {
@@ -1082,6 +1139,9 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
           ? JSON.parse(row.period_scores)
           : row.period_scores;
       }
+      
+      // Ensure consistency between live and ended flags
+      ensureLiveEndedConsistency(game);
       
       return game;
     });
@@ -1276,6 +1336,16 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
       }
     }
     
+    // Ensure consistency: if game is live, it cannot be ended
+    // Use the live value from updates if provided, otherwise use current value
+    const isLive = updates.live !== undefined ? updates.live : current.live;
+    if (isLive === true && updates.ended === true) {
+      // If live is true, ended should be false unless game is explicitly closed
+      if (updates.closed !== true && current.closed !== true) {
+        updates.ended = false;
+      }
+    }
+    
     // Build atomic JSONB updates to avoid race conditions with CLOB price updates
     // Each field is updated independently without reading/rewriting the whole object
     const updateFields: string[] = [];
@@ -1374,6 +1444,16 @@ function updateGameByGameIdInMemory(gameId: number, updates: Partial<LiveGame>):
             game.periodScores || null
           );
           updates.periodScores = newPeriodScores;
+        }
+      }
+      
+      // Ensure consistency: if game is live, it cannot be ended
+      // Use the live value from updates if provided, otherwise use current value
+      const isLive = updates.live !== undefined ? updates.live : game.live;
+      if (isLive === true && updates.ended === true) {
+        // If live is true, ended should be false unless game is explicitly closed
+        if (updates.closed !== true && game.closed !== true) {
+          updates.ended = false;
         }
       }
       

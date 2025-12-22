@@ -193,13 +193,13 @@ export async function redeemPosition(
     return { success: false, error: 'User does not have an embedded wallet' };
   }
 
-  // Get position details from database (including negative_risk flag)
+  // Get position details from database (including negative_risk flag and outcome_index)
   const client = await pool.connect();
   let position: any;
 
   try {
     const result = await client.query(
-      `SELECT asset, condition_id, size, cur_price, current_value, title, outcome, event_id, negative_risk
+      `SELECT asset, condition_id, size, cur_price, current_value, title, outcome, event_id, negative_risk, outcome_index
        FROM user_positions
        WHERE privy_user_id = $1 AND condition_id = $2`,
       [privyUserId, conditionId]
@@ -259,23 +259,33 @@ export async function redeemPosition(
       // Convert size to raw amount (6 decimals for USDC-based tokens)
       const rawAmount = BigInt(Math.floor(parseFloat(position.size) * 1e6));
       
+      // For binary markets: outcome_index 0 = index set 1, outcome_index 1 = index set 2
+      // The Neg Risk Adapter requires amounts for both index sets
+      // We provide the amount for the outcome we have, and 0 for the other
+      const outcomeIndex = position.outcome_index ?? 0; // Default to 0 if not set
+      const indexSet1Amount = outcomeIndex === 0 ? rawAmount : BigInt(0);
+      const indexSet2Amount = outcomeIndex === 1 ? rawAmount : BigInt(0);
+      
+      logger.info({
+        message: 'Using Neg Risk Adapter for redemption',
+        privyUserId,
+        conditionId,
+        outcomeIndex,
+        rawAmount: rawAmount.toString(),
+        indexSet1Amount: indexSet1Amount.toString(),
+        indexSet2Amount: indexSet2Amount.toString(),
+      });
+      
       redeemData = encodeFunctionData({
         abi: NEG_RISK_REDEEM_ABI,
         functionName: 'redeemPositions',
         args: [
           conditionId as `0x${string}`,
           INDEX_SETS,
-          [rawAmount, rawAmount], // amounts for both outcomes
+          [indexSet1Amount, indexSet2Amount], // amounts for [index1, index2]
         ],
       });
       targetContract = NEG_RISK_ADAPTER_ADDRESS;
-
-      logger.info({
-        message: 'Using Neg Risk Adapter for redemption',
-        privyUserId,
-        conditionId,
-        rawAmount: rawAmount.toString(),
-      });
     } else {
       // Standard markets: use the CTF contract directly
       redeemData = encodeFunctionData({
@@ -311,23 +321,89 @@ export async function redeemPosition(
       `Redeem ${position.outcome} position: ${position.title}`
     );
 
-    // Wait for transaction confirmation
-    const txResult = await response.wait();
+    logger.info({
+      message: 'Relayer execute response received',
+      privyUserId,
+      conditionId,
+      responseType: typeof response,
+      responseKeys: response ? Object.keys(response) : null,
+      hasWait: response && typeof response.wait === 'function',
+    });
 
-    if (!txResult || !txResult.transactionHash) {
+    // Wait for transaction confirmation
+    let txResult: any;
+    try {
+      txResult = await response.wait();
+      
+      logger.info({
+        message: 'Transaction wait completed',
+        privyUserId,
+        conditionId,
+        txResultType: typeof txResult,
+        txResultKeys: txResult ? Object.keys(txResult) : null,
+        txResultValue: txResult ? JSON.stringify(txResult, null, 2) : null,
+        hasTransactionHash: txResult && 'transactionHash' in txResult,
+        transactionHash: txResult?.transactionHash,
+        state: txResult?.state,
+        status: txResult?.status,
+      });
+    } catch (waitError) {
+      logger.error({
+        message: 'Error waiting for transaction',
+        privyUserId,
+        conditionId,
+        error: waitError instanceof Error ? waitError.message : String(waitError),
+        errorStack: waitError instanceof Error ? waitError.stack : undefined,
+      });
+      throw waitError;
+    }
+
+    // Check for transaction hash in various possible fields
+    const transactionHash = txResult?.transactionHash || txResult?.hash || txResult?.txHash || txResult?.tx?.hash;
+    
+    // Check if transaction failed (relayer may return hash even if transaction failed on-chain)
+    const transactionState = txResult?.state;
+    const transactionStatus = txResult?.status;
+    const isFailed = transactionState === 'FAILED' || 
+                     transactionState === 'REVERTED' ||
+                     transactionStatus === 'FAILED' ||
+                     transactionStatus === 'REVERTED' ||
+                     (txResult && 'failed' in txResult && txResult.failed === true);
+    
+    if (!txResult || !transactionHash) {
+      logger.error({
+        message: 'Transaction failed - no hash returned',
+        privyUserId,
+        conditionId,
+        txResult,
+        isNegativeRisk,
+      });
       throw new Error('Transaction failed - no hash returned');
+    }
+    
+    if (isFailed) {
+      logger.error({
+        message: 'Transaction failed on-chain',
+        privyUserId,
+        conditionId,
+        transactionHash,
+        state: transactionState,
+        status: transactionStatus,
+        isNegativeRisk,
+      });
+      throw new Error(`Transaction failed on-chain. Hash: ${transactionHash}. This may indicate the redemption contract call reverted. For negative risk markets, ensure you have the correct outcome and sufficient balance.`);
     }
 
     logger.info({
       message: 'Redemption transaction confirmed',
       privyUserId,
       conditionId,
-      transactionHash: txResult.transactionHash,
+      transactionHash,
     });
 
     // Update redemption record
     await updateTradeRecordById(redemptionRecord.id, {
-      transactionHash: txResult.transactionHash,
+      transactionHash,
       status: 'FILLED',
     });
 
@@ -363,7 +439,7 @@ export async function redeemPosition(
 
     return {
       success: true,
-      transactionHash: txResult.transactionHash,
+      transactionHash,
       redemptionId: redemptionRecord.id,
       redeemedAmount: redeemAmount.toFixed(6),
     };

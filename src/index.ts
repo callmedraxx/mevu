@@ -16,6 +16,7 @@ import { sportsWebSocketService } from './services/polymarket/sports-websocket.s
 import { gamesWebSocketService } from './services/polymarket/games-websocket.service';
 import { activityWatcherWebSocketService } from './services/polymarket/activity-watcher-websocket.service';
 import { clobPriceUpdateService } from './services/polymarket/clob-price-update.service';
+import { positionsWebSocketService } from './services/positions/positions-websocket.service';
 import { initializeProbabilityHistoryTable, cleanupOldProbabilityHistory } from './services/polymarket/probability-history.service';
 import { logger } from './config/logger';
 import { runMigrations } from './scripts/run-migrations';
@@ -247,6 +248,7 @@ const server = http.createServer(app);
 // These services handle their own upgrade requests with noServer mode
 gamesWebSocketService.initialize(server, '/ws/games');
 activityWatcherWebSocketService.initialize(server, '/ws/activity');
+positionsWebSocketService.initialize(server);
 
 // Start server
 server.listen(PORT, () => {
@@ -265,6 +267,7 @@ process.on('SIGTERM', () => {
   logger.info({ message: 'SIGTERM received, shutting down gracefully' });
   gamesWebSocketService.shutdown();
   activityWatcherWebSocketService.shutdown();
+  positionsWebSocketService.shutdown();
   clobPriceUpdateService.shutdown();
   server.close(() => {
     logger.info({ message: 'HTTP server closed' });
@@ -276,6 +279,7 @@ process.on('SIGINT', () => {
   logger.info({ message: 'SIGINT received, shutting down gracefully' });
   gamesWebSocketService.shutdown();
   activityWatcherWebSocketService.shutdown();
+  positionsWebSocketService.shutdown();
   clobPriceUpdateService.shutdown();
   server.close(() => {
     logger.info({ message: 'HTTP server closed' });

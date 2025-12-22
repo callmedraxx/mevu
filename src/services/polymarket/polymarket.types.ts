@@ -190,6 +190,7 @@ export interface TransformedOutcome {
   groupItemThreshold?: string; // Threshold for group items
   isWinner?: boolean; // True if this outcome won (for resolved markets)
   buyPrice?: number; // Best ask price for buying (from CLOB best_ask * 100)
+  sellPrice?: number; // Best bid price for selling (from CLOB best_bid * 100)
 }
 
 export interface TransformedMarket {

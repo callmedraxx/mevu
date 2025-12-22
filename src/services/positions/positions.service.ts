@@ -7,6 +7,7 @@ import axios from 'axios';
 import { pool } from '../../config/database';
 import { logger } from '../../config/logger';
 import { getUserByPrivyId } from '../privy/user.service';
+import { getAllLiveGames } from '../polymarket/live-games.service';
 import {
   PolymarketPosition,
   UserPosition,
@@ -16,10 +17,185 @@ import {
 
 const POLYMARKET_DATA_API_URL = 'https://data-api.polymarket.com';
 
-// Cache to track when positions were last fetched from Polymarket (per user)
-// This prevents excessive API calls when frontend polls frequently
-const lastFetchTime = new Map<string, number>();
-const CACHE_TTL_MS = 100; // 100 milliseconds - only fetch from Polymarket if data is older than this
+/**
+ * Build a price lookup map from our live games data
+ * Maps clobTokenId -> { buyPrice, sellPrice }
+ * 
+ * buyPrice = best_ask (what you pay to BUY)
+ * sellPrice = best_bid (what you GET when you SELL) - used for position valuation
+ * 
+ * Also returns a set of assets from ended games (these should not be enriched)
+ */
+async function buildPriceLookupFromLiveGames(): Promise<{
+  priceMap: Map<string, { buyPrice: number; sellPrice: number }>;
+  endedAssets: Set<string>;
+}> {
+  const priceMap = new Map<string, { buyPrice: number; sellPrice: number }>();
+  const endedAssets = new Set<string>();
+  
+  try {
+    const games = await getAllLiveGames();
+    
+    for (const game of games) {
+      if (!game.markets) continue;
+      
+      // Check if game is ended
+      const isEnded = game.ended === true || game.closed === true;
+      
+      for (const market of game.markets) {
+        const outcomes = market.structuredOutcomes;
+        if (!outcomes) continue;
+        
+        for (const outcome of outcomes) {
+          if (!outcome.clobTokenId) continue;
+          
+          // Track assets from ended games
+          if (isEnded) {
+            endedAssets.add(outcome.clobTokenId);
+            continue; // Don't add prices for ended games
+          }
+          
+          // Only use prices if we have ACTUAL sellPrice from CLOB (not calculated)
+          // This ensures we're using real order book data
+          if (outcome.sellPrice === undefined) {
+            // No real sellPrice, skip this asset
+            continue;
+          }
+          
+          // buyPrice is best_ask (what you'd pay to buy)
+          let buyPrice = 0;
+          if (outcome.buyPrice !== undefined) {
+            buyPrice = (typeof outcome.buyPrice === 'number' ? outcome.buyPrice : parseFloat(String(outcome.buyPrice))) / 100;
+          }
+          
+          // sellPrice is best_bid (what you actually get when selling)
+          let sellPrice = (typeof outcome.sellPrice === 'number' ? outcome.sellPrice : parseFloat(String(outcome.sellPrice))) / 100;
+          
+          if (buyPrice > 0 || sellPrice > 0) {
+            priceMap.set(outcome.clobTokenId, {
+              buyPrice,
+              sellPrice,
+            });
+          }
+        }
+      }
+    }
+    
+    logger.debug({
+      message: 'Built price lookup map from live games',
+      uniqueAssets: priceMap.size,
+      endedAssets: endedAssets.size,
+    });
+  } catch (error) {
+    logger.warn({
+      message: 'Failed to build price lookup from live games',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  
+  return { priceMap, endedAssets };
+}
+
+/**
+ * Enrich PolymarketPosition[] with real-time prices from our live games data
+ * This replaces stale curPrice from Polymarket with our CLOB WebSocket prices
+ * 
+ * For LIVE games: Uses sellPrice (best_bid) for position valuation
+ * For ENDED/REDEEMABLE games: Keep Polymarket's curPrice (which reflects final outcome)
+ * 
+ * @param endedAssets - Set of asset IDs that belong to ended games (don't enrich these)
+ */
+function enrichPositionsWithLivePrices(
+  positions: PolymarketPosition[],
+  priceLookup: Map<string, { buyPrice: number; sellPrice: number }>,
+  endedAssets: Set<string> = new Set()
+): PolymarketPosition[] {
+  return positions.map(position => {
+    // For redeemable positions OR positions from ended games, keep Polymarket's curPrice
+    // Polymarket knows the final/settlement outcome better than our stale CLOB data
+    if (position.redeemable || endedAssets.has(position.asset)) {
+      // Keep original Polymarket data for ended games
+      return position;
+    }
+    
+    const livePrice = priceLookup.get(position.asset);
+    
+    // Only enrich if we have a valid sellPrice (not just a fallback calculation)
+    // Check if this looks like real CLOB data vs calculated fallback
+    if (!livePrice || livePrice.sellPrice <= 0) {
+      // No valid live sell price available, keep original Polymarket data
+      return position;
+    }
+    
+    // For live games: Use sellPrice (best_bid) for position valuation
+    // This is what you'd actually GET if you sold now
+    const size = position.size;
+    const initialValue = position.initialValue;
+    const newCurPrice = livePrice.sellPrice; // best_bid - what you get when selling
+    const newCurrentValue = size * newCurPrice;
+    const newCashPnl = newCurrentValue - initialValue;
+    const newPercentPnl = initialValue > 0 ? (newCashPnl / initialValue) * 100 : 0;
+    
+    return {
+      ...position,
+      curPrice: newCurPrice,
+      currentValue: newCurrentValue,
+      cashPnl: newCashPnl,
+      percentPnl: newPercentPnl,
+    };
+  });
+}
+
+/**
+ * Enrich UserPosition[] (from database) with real-time prices from our live games data
+ * Uses buyPrice for position valuation to match frontend display
+ */
+function enrichUserPositionsWithLivePrices(
+  positions: UserPosition[],
+  priceLookup: Map<string, { buyPrice: number; sellPrice: number }>
+): UserPosition[] {
+  let enrichedCount = 0;
+  
+  const enriched = positions.map(position => {
+    const livePrice = priceLookup.get(position.asset);
+    
+    if (!livePrice || livePrice.buyPrice <= 0) {
+      // No live price available, keep original
+      return position;
+    }
+    
+    // Calculate new values based on buyPrice (current market price)
+    const size = parseFloat(position.size);
+    const initialValue = parseFloat(position.initialValue);
+    const newCurPrice = livePrice.buyPrice;
+    const newCurrentValue = size * newCurPrice;
+    const newCashPnl = newCurrentValue - initialValue;
+    const newPercentPnl = initialValue > 0 ? (newCashPnl / initialValue) * 100 : 0;
+    
+    const originalCurPrice = parseFloat(position.curPrice);
+    if (Math.abs(originalCurPrice - newCurPrice) > 0.001) {
+      enrichedCount++;
+    }
+    
+    return {
+      ...position,
+      curPrice: newCurPrice.toFixed(6),
+      currentValue: newCurrentValue.toFixed(6),
+      cashPnl: newCashPnl.toFixed(6),
+      percentPnl: newPercentPnl.toFixed(4),
+    };
+  });
+  
+  if (enrichedCount > 0) {
+    logger.info({
+      message: 'Enriched positions with live buyPrice',
+      totalPositions: positions.length,
+      updatedWithLivePrices: enrichedCount,
+    });
+  }
+  
+  return enriched;
+}
 
 /**
  * Fetch positions from Polymarket Data API
@@ -316,13 +492,11 @@ async function updateUserPortfolio(privyUserId: string, portfolio: number): Prom
 
 /**
  * Fetch and store positions for a user
- * Uses caching to prevent excessive Polymarket API calls
- * @param forceRefresh - If true, ignores cache and fetches from Polymarket
+ * Always fetches fresh data from Polymarket for real-time accuracy
  */
 export async function fetchAndStorePositions(
   privyUserId: string,
-  params: PositionsQueryParams = {},
-  forceRefresh: boolean = false
+  params: PositionsQueryParams = {}
 ): Promise<UserPosition[]> {
   // Get user to verify they exist and get proxy wallet
   const user = await getUserByPrivyId(privyUserId);
@@ -338,35 +512,35 @@ export async function fetchAndStorePositions(
     return [];
   }
 
-  // Check cache - only fetch from Polymarket if data is stale or forceRefresh is true
-  const lastFetch = lastFetchTime.get(privyUserId) || 0;
-  const now = Date.now();
-  const isStale = (now - lastFetch) > CACHE_TTL_MS;
-
-  if (!isStale && !forceRefresh) {
-    // Data is fresh, return from database
-    logger.debug({
-      message: 'Using cached positions (not stale yet)',
-      privyUserId,
-      cacheAge: now - lastFetch,
-      cacheTTL: CACHE_TTL_MS,
-    });
-    return await getPositionsFromDatabase(privyUserId);
-  }
-
-  // Fetch positions from Polymarket
+  // Always fetch fresh positions from Polymarket (no caching)
   const polymarketPositions = await fetchPositionsFromPolymarket(
     user.proxyWalletAddress,
     params
   );
 
-  // Update cache timestamp
-  lastFetchTime.set(privyUserId, now);
+  // Enrich positions with real-time prices from our live games (CLOB WebSocket data)
+  // This replaces stale curPrice from Polymarket Data API with accurate prices
+  // Note: Ended games are excluded from enrichment to preserve Polymarket's settlement prices
+  const { priceMap, endedAssets } = await buildPriceLookupFromLiveGames();
+  const enrichedPositions = enrichPositionsWithLivePrices(polymarketPositions, priceMap, endedAssets);
 
-  // Store positions in database
-  await upsertPositions(privyUserId, user.proxyWalletAddress, polymarketPositions);
+  // Log enrichment stats
+  const enrichedCount = enrichedPositions.filter((p, i) => 
+    p.curPrice !== polymarketPositions[i].curPrice
+  ).length;
+  if (enrichedCount > 0) {
+    logger.info({
+      message: 'Enriched positions with live prices',
+      privyUserId,
+      totalPositions: enrichedPositions.length,
+      enrichedWithLivePrices: enrichedCount,
+    });
+  }
 
-  // Calculate and update portfolio
+  // Store enriched positions in database
+  await upsertPositions(privyUserId, user.proxyWalletAddress, enrichedPositions);
+
+  // Calculate and update portfolio (now based on live prices)
   const portfolio = await calculatePortfolio(privyUserId);
   await updateUserPortfolio(privyUserId, portfolio);
 

@@ -141,7 +141,9 @@ async function fetchAndUpdateTransactionHash(
   clobClient: any,
   orderId: string,
   tradeRecordId: string,
-  privyUserId: string
+  privyUserId: string,
+  side?: string,
+  originalSize?: string
 ): Promise<void> {
   const maxAttempts = 5;
   const delayMs = 2000; // 2 seconds between attempts
@@ -160,13 +162,67 @@ async function fetchAndUpdateTransactionHash(
       );
 
       if (matchingTrade?.transaction_hash) {
-        // Update trade record with transaction hash
-        await updateTradeRecordById(tradeRecordId, {
+        // Build update object with transaction hash
+        const updateData: any = {
           transactionHash: matchingTrade.transaction_hash,
-        });
+        };
+
+        // For SELL orders, update with actual fill price and recalculate costUsdc
+        // CLOB returns actual fill data: price, size
+        if (side === 'SELL' && matchingTrade.price && matchingTrade.size) {
+          const actualFillPrice = parseFloat(matchingTrade.price);
+          const actualFillSize = parseFloat(matchingTrade.size);
+          const actualCostUsdc = actualFillPrice * actualFillSize;
+          const actualFeeAmount = actualCostUsdc * FEE_CONFIG.RATE;
+
+          updateData.price = actualFillPrice.toFixed(18);
+          updateData.size = actualFillSize.toFixed(18);
+          updateData.costUsdc = actualCostUsdc.toFixed(18);
+          updateData.feeAmount = actualFeeAmount.toFixed(18);
+
+          logger.info({
+            message: '📊 SELL trade updated with actual fill data',
+            privyUserId,
+            tradeId: tradeRecordId,
+            orderId,
+            originalSize,
+            actualFillPrice,
+            actualFillSize,
+            actualCostUsdc: actualCostUsdc.toFixed(6),
+            actualFeeAmount: actualFeeAmount.toFixed(6),
+          });
+        }
+
+        // For BUY orders, also capture actual fill data for accuracy
+        if (side === 'BUY' && matchingTrade.price && matchingTrade.size) {
+          const actualFillPrice = parseFloat(matchingTrade.price);
+          const actualFillSize = parseFloat(matchingTrade.size);
+          // Recalculate actual cost based on fill data (for partial fills or price changes)
+          const actualCostUsdc = actualFillPrice * actualFillSize;
+          const actualFeeAmount = actualCostUsdc * FEE_CONFIG.RATE;
+
+          updateData.price = actualFillPrice.toFixed(18);
+          updateData.size = actualFillSize.toFixed(18);
+          updateData.costUsdc = actualCostUsdc.toFixed(18);
+          updateData.feeAmount = actualFeeAmount.toFixed(18);
+
+          logger.info({
+            message: '📊 BUY trade updated with actual fill data',
+            privyUserId,
+            tradeId: tradeRecordId,
+            orderId,
+            actualFillPrice,
+            actualFillSize,
+            actualCostUsdc: actualCostUsdc.toFixed(6),
+            actualFeeAmount: actualFeeAmount.toFixed(6),
+          });
+        }
+
+        // Update trade record
+        await updateTradeRecordById(tradeRecordId, updateData);
 
         logger.info({
-          message: 'Transaction hash updated for trade',
+          message: 'Transaction hash and fill data updated for trade',
           privyUserId,
           tradeId: tradeRecordId,
           orderId,
@@ -214,15 +270,27 @@ export async function executeTrade(
 ): Promise<CreateTradeResponse> {
   const { privyUserId, marketInfo, side, orderType, size, price } = request;
 
+  // ============ TRADE REQUEST RECEIVED ============
+  const requestedShares = parseFloat(size);
+  const pricePerShare = parseFloat(price);
+  const estimatedTradeCost = requestedShares * pricePerShare;
+  const estimatedFee = estimatedTradeCost * FEE_CONFIG.RATE;
+  
   logger.info({
-    message: 'Executing trade',
+    message: '🔔 TRADE REQUEST RECEIVED',
     privyUserId,
     marketId: marketInfo.marketId,
-    clobTokenId: marketInfo.clobTokenId,
-    side,
+    clobTokenId: marketInfo.clobTokenId?.substring(0, 20) + '...',
+    outcome: marketInfo.outcome,
+    side: side === TradeSide.BUY ? 'BUY' : 'SELL',
     orderType,
-    size,
-    price,
+    // Request details
+    requestedShares,
+    pricePerShare,
+    // Estimated costs (before execution)
+    estimatedTradeCostUsdc: estimatedTradeCost.toFixed(6),
+    estimatedFeeUsdc: estimatedFee.toFixed(6),
+    estimatedTotalUsdc: (estimatedTradeCost + estimatedFee).toFixed(6),
   });
 
   try {
@@ -483,20 +551,70 @@ export async function executeTrade(
       const clobStatus = typeof rawStatus === 'string' ? rawStatus.toUpperCase() : '';
       let finalStatus: string;
       
+      // Log the full CLOB response for debugging
+      logger.info({
+        message: 'CLOB order response details',
+        privyUserId,
+        orderId: orderResponse.orderID,
+        clobStatus,
+        rawStatus,
+        hasMatchedOrders: !!orderResponse.matchedOrders?.length,
+        matchedOrdersCount: orderResponse.matchedOrders?.length || 0,
+        sizeMatched: orderResponse.size_matched || orderResponse.sizeMatched,
+        amountMatched: orderResponse.amount_matched || orderResponse.amountMatched,
+        responseKeys: Object.keys(orderResponse),
+      });
+      
       if (clobStatus === 'MATCHED' || clobStatus === 'FILLED' || clobStatus === 'EXECUTED') {
         finalStatus = 'FILLED';
       } else if (clobStatus === 'LIVE' || clobStatus === 'OPEN') {
         // Limit order placed but not yet filled - keep as PENDING
         finalStatus = 'PENDING';
       } else if (clobStatus === 'CANCELLED' || clobStatus === 'REJECTED') {
+        // Explicitly cancelled/rejected by CLOB
         finalStatus = 'CANCELLED';
       } else if (!orderResponse.orderID) {
         // No orderID and no valid status - likely an error
         throw new Error('Order failed: no orderID returned from CLOB');
       } else {
-        // For FOK/FAK orders, if we got an orderID it likely succeeded
-        // Default to FILLED for market orders that got a response
-        finalStatus = (orderType === OrderType.FOK || orderType === OrderType.FAK) ? 'FILLED' : 'PENDING';
+        // We have an orderID but unclear status
+        // For FOK orders: if CLOB accepted the order (gave us an ID), it was filled
+        // FOK is all-or-nothing - if not filled, CLOB would return CANCELLED/REJECTED
+        // For FAK orders: same logic - partial fills are returned immediately
+        // 
+        // Trust the CLOB: if we got an orderID without explicit CANCELLED/REJECTED,
+        // the order was accepted and processed
+        
+        // Check for explicit fill indicators as confirmation
+        const hasMatchedOrders = orderResponse.matchedOrders && orderResponse.matchedOrders.length > 0;
+        const hasSizeMatched = parseFloat(orderResponse.size_matched || orderResponse.sizeMatched || '0') > 0;
+        const hasAmountMatched = parseFloat(orderResponse.amount_matched || orderResponse.amountMatched || '0') > 0;
+        
+        if (hasMatchedOrders || hasSizeMatched || hasAmountMatched) {
+          logger.info({
+            message: 'Order confirmed filled via response indicators',
+            privyUserId,
+            orderId: orderResponse.orderID,
+            hasMatchedOrders,
+            hasSizeMatched,
+            hasAmountMatched,
+          });
+        }
+        
+        // For FOK/FAK: if we got an orderID and no CANCELLED/REJECTED, consider it filled
+        // The transaction hash fetcher will verify and update async
+        if (orderType === OrderType.FOK || orderType === OrderType.FAK) {
+          finalStatus = 'FILLED';
+          logger.info({
+            message: 'FOK/FAK order accepted by CLOB with orderID - marking as FILLED',
+            privyUserId,
+            orderId: orderResponse.orderID,
+            orderType,
+          });
+        } else {
+          // Limit orders without explicit status
+          finalStatus = 'PENDING';
+        }
       }
 
       // Calculate actual fee based on trade cost
@@ -522,11 +640,35 @@ export async function executeTrade(
         feeAmount,
       });
 
-      // Fetch transaction hash from CLOB trades endpoint (async, don't block response)
+      // ============ DETAILED FUND TRACKING LOG ============
+      logger.info({
+        message: '💰 FUND TRACKING - TRADE SUMMARY',
+        privyUserId,
+        tradeId: tradeRecord.id,
+        side: side === TradeSide.BUY ? 'BUY' : 'SELL',
+        orderType,
+        // Order details
+        requestedShares: parseFloat(size),
+        pricePerShare: parseFloat(price),
+        // Cost breakdown
+        tradeCostUsdc: actualCost.toFixed(6),
+        platformFeeRate: `${(FEE_CONFIG.RATE * 100).toFixed(2)}%`,
+        platformFeeUsdc: feeAmount.toFixed(6),
+        totalCostUsdc: (actualCost + feeAmount).toFixed(6),
+        // For verification
+        expectedSharesIfFilled: parseFloat(size),
+        expectedUsdcSpentIfBuy: side === TradeSide.BUY ? (actualCost + feeAmount).toFixed(6) : 'N/A',
+        expectedUsdcReceivedIfSell: side === TradeSide.SELL ? (actualCost - feeAmount).toFixed(6) : 'N/A',
+        status: finalStatus,
+      });
+
+      // Fetch transaction hash and actual fill data from CLOB trades endpoint (async, don't block response)
+      // This also updates price/size/costUsdc for SELL orders with actual fill data
       if (finalStatus === 'FILLED' && orderResponse.orderID) {
-        fetchAndUpdateTransactionHash(clobClient, orderResponse.orderID, tradeRecord.id, privyUserId).catch((err) => {
+        const tradeSide = side === TradeSide.BUY ? 'BUY' : 'SELL';
+        fetchAndUpdateTransactionHash(clobClient, orderResponse.orderID, tradeRecord.id, privyUserId, tradeSide, size).catch((err) => {
           logger.warn({
-            message: 'Failed to fetch transaction hash',
+            message: 'Failed to fetch transaction hash and fill data',
             privyUserId,
             tradeId: tradeRecord.id,
             orderId: orderResponse.orderID,
@@ -615,8 +757,30 @@ export async function executeTrade(
         }
       }
 
+      // If order was explicitly CANCELLED by CLOB, return failure
+      if (finalStatus === 'CANCELLED') {
+        logger.warn({
+          message: 'Order was explicitly cancelled/rejected by CLOB',
+          privyUserId,
+          tradeId: tradeRecord.id,
+          orderId: orderResponse.orderID,
+          clobStatus,
+        });
+        
+        return {
+          success: false,
+          orderId: orderResponse.orderID,
+          status: 'CANCELLED',
+          errorCode: 'ORDER_REJECTED',
+          userMessage: 'Order was rejected. There may not be enough liquidity at this price. Try a smaller amount or adjust your price.',
+          message: `Order cancelled by CLOB: ${clobStatus}`,
+          retryable: true,
+          trade: { ...finalTrade, status: 'CANCELLED' },
+        };
+      }
+      
       return {
-        success: true,
+        success: finalStatus === 'FILLED',
         orderId: orderResponse.orderID,
         transactionHash: orderResponse.txHash,
         status: finalStatus,

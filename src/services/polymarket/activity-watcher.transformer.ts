@@ -72,10 +72,16 @@ function transformOutcome(outcome: TransformedOutcome): ActivityWatcherOutcome {
   const probability = deriveProbability(outcome);
   const price = Number(outcome.price || probability);
   
-  // buyPrice from best_ask, sellPrice from best_bid (stored in outcome)
+  // buyPrice from best_ask (what you pay to BUY)
   const buyPrice = outcome.buyPrice !== undefined ? Number(outcome.buyPrice) : undefined;
-  // sellPrice is typically 100 - buyPrice for binary markets, or use bestBid if available
-  const sellPrice = buyPrice !== undefined ? Math.ceil(100 - buyPrice) : undefined;
+  // sellPrice from best_bid (what you GET when you SELL)
+  // Use actual sellPrice from outcome if available, otherwise fallback to 100 - buyPrice
+  let sellPrice: number | undefined;
+  if (outcome.sellPrice !== undefined) {
+    sellPrice = Number(outcome.sellPrice);
+  } else if (buyPrice !== undefined) {
+    sellPrice = Math.ceil(100 - buyPrice); // fallback
+  }
 
   return {
     label: outcome.label || 'Unknown',

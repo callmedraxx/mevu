@@ -10,6 +10,7 @@ import { ClobPriceChangeUpdate, ClobPriceChange } from './polymarket.types';
 import { getAllLiveGames, updateGame, updateGameInCache, LiveGame } from './live-games.service';
 import { gamesWebSocketService } from './games-websocket.service';
 import { activityWatcherWebSocketService } from './activity-watcher-websocket.service';
+import { positionsWebSocketService } from '../positions/positions-websocket.service';
 import { pool } from '../../config/database';
 
 // Map asset_id -> game/market info for quick lookup
@@ -146,6 +147,13 @@ export class ClobPriceUpdateService {
         buyPrice,
       });
 
+      // Broadcast to positions WebSocket for users holding this asset
+      positionsWebSocketService.onPriceUpdate(priceChange.asset_id, {
+        price: probability,
+        buyPrice,
+        sellPrice,
+      });
+
       // Group updates by game
       if (!gamesToUpdate.has(mapping.gameId)) {
         const games = await getAllLiveGames();
@@ -184,8 +192,10 @@ export class ClobPriceUpdateService {
                 // price field stores the probability (from trade price)
                 price: update.probability.toFixed(1),
                 probability: update.probability,
-                // buyPrice is from best_ask
+                // buyPrice is from best_ask (what you pay to BUY)
                 buyPrice: update.buyPrice,
+                // sellPrice is from best_bid (what you get when you SELL)
+                sellPrice: update.sellPrice,
               };
             }
             return outcome;

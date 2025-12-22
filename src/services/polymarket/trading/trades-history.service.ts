@@ -263,6 +263,11 @@ export async function updateTradeRecordById(
     transactionHash?: string;
     blockNumber?: number;
     blockTimestamp?: Date;
+    // Actual fill data from CLOB
+    price?: string;
+    size?: string;
+    costUsdc?: string;
+    // Fee fields
     feeUsdc?: string;
     feeRate?: number;
     feeAmount?: string;
@@ -312,9 +317,46 @@ export async function updateTradeRecordById(
       updateFields.push(`block_timestamp = $${paramIndex++}`);
       updateValues.push(updates.blockTimestamp);
     }
+    // Actual fill data from CLOB (for accurate SELL pricing)
+    if (updates.price !== undefined) {
+      updateFields.push(`price = $${paramIndex++}`);
+      updateValues.push(updates.price);
+    }
+    if (updates.size !== undefined) {
+      updateFields.push(`size = $${paramIndex++}`);
+      updateValues.push(updates.size);
+    }
+    if (updates.costUsdc !== undefined) {
+      updateFields.push(`cost_usdc = $${paramIndex++}`);
+      updateValues.push(updates.costUsdc);
+    }
     if (updates.feeUsdc !== undefined) {
       updateFields.push(`fee_usdc = $${paramIndex++}`);
       updateValues.push(updates.feeUsdc);
+    }
+    if (updates.feeRate !== undefined) {
+      updateFields.push(`fee_rate = $${paramIndex++}`);
+      updateValues.push(updates.feeRate);
+    }
+    if (updates.feeAmount !== undefined) {
+      updateFields.push(`fee_amount = $${paramIndex++}`);
+      updateValues.push(updates.feeAmount);
+    }
+    if (updates.feeStatus !== undefined) {
+      updateFields.push(`fee_status = $${paramIndex++}`);
+      updateValues.push(updates.feeStatus);
+    }
+    if (updates.feeTxHash !== undefined) {
+      updateFields.push(`fee_tx_hash = $${paramIndex++}`);
+      updateValues.push(updates.feeTxHash);
+    }
+    if (updates.feeRetryCount !== undefined) {
+      updateFields.push(`fee_retry_count = $${paramIndex++}`);
+      updateValues.push(updates.feeRetryCount);
+    }
+    if (updates.feeLastRetry !== undefined) {
+      updateFields.push(`fee_last_retry = $${paramIndex++}`);
+      updateValues.push(updates.feeLastRetry);
     }
     if (updates.errorMessage !== undefined) {
       // Store error message in metadata
