@@ -269,6 +269,10 @@ export async function executeTrade(
   request: CreateTradeRequest
 ): Promise<CreateTradeResponse> {
   const { privyUserId, marketInfo, side, orderType, size, price } = request;
+  
+  // Timing tracking for performance analysis
+  const tradeStartTime = Date.now();
+  const timings: Record<string, number> = {};
 
   // ============ TRADE REQUEST RECEIVED ============
   const requestedShares = parseFloat(size);
@@ -295,7 +299,9 @@ export async function executeTrade(
 
   try {
     // Validate user
+    const userStartTime = Date.now();
     const user = await getUserByPrivyId(privyUserId);
+    timings.getUserByPrivyId = Date.now() - userStartTime;
     if (!user) {
       throw new Error('User not found');
     }
@@ -391,7 +397,9 @@ export async function executeTrade(
 
     try {
       // Get CLOB client
+      const clobClientStartTime = Date.now();
       const clobClient = await getClobClientForUser(privyUserId, request.userJwt);
+      timings.getClobClient = Date.now() - clobClientStartTime;
 
       // For FOK and FAK orders, use market order method
       // For LIMIT orders, use limit order method
@@ -445,6 +453,7 @@ export async function executeTrade(
               });
             }
 
+            const orderStartTime = Date.now();
             orderResponse = await clobClient.createAndPostMarketOrder(
               {
                 tokenID: marketInfo.clobTokenId,
@@ -454,6 +463,7 @@ export async function executeTrade(
               {}, // Options (tickSize, negativeRisk, etc.)
               clobOrderType
             );
+            timings.createMarketOrder = Date.now() - orderStartTime;
             
             logger.info({
               message: 'Market order created',
@@ -462,6 +472,7 @@ export async function executeTrade(
               clobOrderType,
               orderId: orderResponse?.orderID,
               attempt,
+              orderTimeMs: timings.createMarketOrder,
             });
           } else {
             // Use limit order for LIMIT/MARKET orders
@@ -778,6 +789,17 @@ export async function executeTrade(
           trade: { ...finalTrade, status: 'CANCELLED' },
         };
       }
+      
+      // Log total trade timing
+      timings.total = Date.now() - tradeStartTime;
+      logger.info({
+        message: '⏱️ TRADE TIMING BREAKDOWN',
+        privyUserId,
+        side: side === TradeSide.BUY ? 'BUY' : 'SELL',
+        status: finalStatus,
+        timingsMs: timings,
+        totalSeconds: (timings.total / 1000).toFixed(2),
+      });
       
       return {
         success: finalStatus === 'FILLED',

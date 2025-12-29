@@ -19,6 +19,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@balldontlie/sdk": "^1.2.2",
     "@polymarket/builder-relayer-client": "^0.0.8",
     "@polymarket/builder-signing-sdk": "^0.0.8",
     "@polymarket/clob-client": "^4.22.8",

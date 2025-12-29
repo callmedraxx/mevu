@@ -351,12 +351,12 @@ export class ActivityWatcherWebSocketService {
    * Broadcast single game update to subscribed clients
    */
   async broadcastGameUpdate(game: LiveGame): Promise<void> {
-    logger.info({
-      message: 'Activity watcher broadcastGameUpdate called',
-      gameId: game.id,
-      slug: game.slug,
-      totalSubscriptions: this.slugClients.size,
-    });
+    // logger.info({
+    //   message: 'Activity watcher broadcastGameUpdate called',
+    //   gameId: game.id,
+    //   slug: game.slug,
+    //   totalSubscriptions: this.slugClients.size,
+    // });
 
     if (this.slugClients.size === 0) {
       return;
@@ -367,11 +367,11 @@ export class ActivityWatcherWebSocketService {
     if (game.slug) matchingSlugs.push(game.slug.toLowerCase());
     matchingSlugs.push(game.id.toLowerCase());
 
-    logger.info({
-      message: 'Looking for matching slugs',
-      matchingSlugs,
-      subscribedSlugs: Array.from(this.slugClients.keys()),
-    });
+    // logger.info({
+    //   message: 'Looking for matching slugs',
+    //   matchingSlugs,
+    //   subscribedSlugs: Array.from(this.slugClients.keys()),
+    // });
 
     for (const slug of matchingSlugs) {
       const clients = this.slugClients.get(slug);

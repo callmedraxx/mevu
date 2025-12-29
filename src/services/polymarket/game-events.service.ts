@@ -281,7 +281,15 @@ export class GameEventsService {
         message: 'No league found for sport, skipping team enrichment',
         sport,
       });
-      return events.map((e) => ({ ...e }));
+      // Still extract team identifiers even if no league is configured
+      return events.map((event) => {
+        const gameEvent: GameEvent = { ...event };
+        const teamIdentifiers = this.extractTeamsFromEvent(event);
+        if (teamIdentifiers.home || teamIdentifiers.away) {
+          gameEvent.teamIdentifiers = teamIdentifiers;
+        }
+        return gameEvent;
+      });
     }
 
     // Fetch all teams for the league
@@ -301,8 +309,15 @@ export class GameEventsService {
         league,
         error: error instanceof Error ? error.message : String(error),
       });
-      // Continue without teams - events will still be returned
-      return events.map((e) => ({ ...e }));
+      // Still extract team identifiers even if team fetching fails
+      return events.map((event) => {
+        const gameEvent: GameEvent = { ...event };
+        const teamIdentifiers = this.extractTeamsFromEvent(event);
+        if (teamIdentifiers.home || teamIdentifiers.away) {
+          gameEvent.teamIdentifiers = teamIdentifiers;
+        }
+        return gameEvent;
+      });
     }
 
     // Create lookup maps for faster team matching
@@ -512,7 +527,8 @@ export class GameEventsService {
     for (const part of parts) {
       // Skip date-like parts (numbers) and sport name
       if (/^\d+$/.test(part)) continue;
-      if (part.length >= 2 && part.length <= 5 && /^[A-Z]+$/.test(part)) {
+      // Match team abbreviations (2-10 letters to handle longer team names like HARVRD, BALLST)
+      if (part.length >= 2 && part.length <= 10 && /^[A-Z]+$/i.test(part)) {
         teamAbbrevs.push(part);
       }
     }

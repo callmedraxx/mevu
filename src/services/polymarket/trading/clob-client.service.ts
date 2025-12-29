@@ -31,6 +31,8 @@ export async function getClobClientForUser(
   privyUserId: string,
   userJwt?: string
 ): Promise<ClobClient> {
+  const startTime = Date.now();
+  
   // Check cache first
   const cached = clobClientCache.get(privyUserId);
   if (cached) {
@@ -38,12 +40,16 @@ export async function getClobClientForUser(
       message: 'Reusing cached CLOB client',
       privyUserId,
       proxyWalletAddress: cached.proxyWalletAddress,
+      cacheHit: true,
     });
     return cached.clobClient;
   }
 
   // Get user info
+  const userStartTime = Date.now();
   const user = await getUserByPrivyId(privyUserId);
+  const userTimeMs = Date.now() - userStartTime;
+  
   if (!user) {
     throw new Error('User not found');
   }
@@ -53,16 +59,19 @@ export async function getClobClientForUser(
   }
 
   logger.info({
-    message: 'Creating CLOB client for user',
+    message: 'Creating CLOB client for user (cache miss)',
     privyUserId,
     proxyWalletAddress: user.proxyWalletAddress,
+    userQueryTimeMs: userTimeMs,
   });
 
   // Get wallet ID for faster signing
+  const walletIdStartTime = Date.now();
   const walletId = await privyService.getWalletIdByAddress(
     privyUserId,
     user.embeddedWalletAddress
   );
+  const walletIdTimeMs = Date.now() - walletIdStartTime;
 
   // Create Privy signer adapter
   const signer = createPrivySigner(

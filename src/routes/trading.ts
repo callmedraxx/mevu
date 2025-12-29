@@ -299,6 +299,16 @@ router.post('/buy', async (req: Request, res: Response) => {
  *         description: Internal server error
  */
 router.post('/sell', async (req: Request, res: Response) => {
+  // Log immediately when request arrives
+  logger.info({
+    message: '🔴 SELL ENDPOINT HIT - Request received',
+    timestamp: new Date().toISOString(),
+    contentLength: req.headers['content-length'],
+    contentType: req.headers['content-type'],
+    hasBody: !!req.body,
+    bodyKeys: req.body ? Object.keys(req.body) : [],
+  });
+  
   try {
     const {
       privyUserId,

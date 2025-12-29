@@ -88,6 +88,21 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Global request logging for debugging
+app.use((req, res, next) => {
+  if (req.path.includes('/trading/') || req.path.includes('/sell') || req.path.includes('/buy')) {
+    logger.info({
+      message: '📥 TRADING REQUEST INCOMING',
+      method: req.method,
+      path: req.path,
+      ip: req.ip,
+      contentLength: req.headers['content-length'],
+      userAgent: req.headers['user-agent']?.substring(0, 50),
+    });
+  }
+  next();
+});
+
 // Swagger setup
 const swaggerSpec = swaggerJsdoc(swaggerOptions);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -147,23 +162,34 @@ async function initializeServices() {
       logger.info({ message: 'Database migrations completed' });
     }
     
-    // Initialize Privy service
+    // Initialize Privy service (no DB connection needed)
     logger.info({ message: 'Initializing Privy service...' });
     privyService.initialize();
     
+    // Stagger database-dependent service initialization to prevent connection pool exhaustion
     // Initialize users table
     logger.info({ message: 'Initializing users table...' });
     await initializeUsersTable();
+    
+    // Small delay to allow previous connection to complete
+    await new Promise(resolve => setTimeout(resolve, 500));
     
     // Initialize probability history table
     // logger.info({ message: 'Initializing probability history table...' });
     await initializeProbabilityHistoryTable();
     
-    // Start live games polling service
+    // Longer delay before starting services that make immediate DB connections
+    // This prevents connection pool exhaustion
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Start live games polling service (delayed initial refresh built into service)
     // logger.info({ message: 'Starting live games service...' });
     liveGamesService.start();
     
-    // Start teams refresh service
+    // Additional delay before starting teams refresh service
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Start teams refresh service (delayed initial refresh built into service)
     // logger.info({ message: 'Starting teams refresh service...' });
     teamsRefreshService.start();
     

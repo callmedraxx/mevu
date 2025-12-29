@@ -222,12 +222,12 @@ export class ClobWebSocketService {
     // Check if this is a price_change event (the format we want)
     const msg = message as any;
     if (msg && typeof msg === 'object' && msg.event_type === 'price_change' && msg.price_changes) {
-      logger.info({
-        message: 'CLOB price_change event received',
-        market: msg.market?.substring(0, 20) + '...',
-        priceChangeCount: msg.price_changes.length,
-        timestamp: msg.timestamp,
-      });
+      // logger.info({
+      //   message: 'CLOB price_change event received',
+      //   market: msg.market?.substring(0, 20) + '...',
+      //   priceChangeCount: msg.price_changes.length,
+      //   timestamp: msg.timestamp,
+      // });
 
       // Notify callbacks with the price changes
       if (this.orderBookUpdateCallbacks.size > 0) {

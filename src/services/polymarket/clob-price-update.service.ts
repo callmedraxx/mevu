@@ -136,16 +136,16 @@ export class ClobPriceUpdateService {
       const buyPrice = Math.round(bestAsk * 100);  // best_ask * 100 for buyPrice
       const sellPrice = Math.round(bestBid * 100); // best_bid * 100 for sellPrice
 
-      logger.info({
-        message: 'Processing price change',
-        assetId: priceChange.asset_id.substring(0, 20) + '...',
-        gameId: mapping.gameId,
-        outcome: mapping.outcomeLabel,
-        bestBid,
-        bestAsk,
-        probability,
-        buyPrice,
-      });
+      // logger.info({
+      //   message: 'Processing price change',
+      //   assetId: priceChange.asset_id.substring(0, 20) + '...',
+      //   gameId: mapping.gameId,
+      //   outcome: mapping.outcomeLabel,
+      //   bestBid,
+      //   bestAsk,
+      //   probability,
+      //   buyPrice,
+      // });
 
       // Broadcast to positions WebSocket for users holding this asset
       positionsWebSocketService.onPriceUpdate(priceChange.asset_id, {

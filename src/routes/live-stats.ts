@@ -1,12 +1,8 @@
-/**
- * Live Stats Routes
- * Endpoints for fetching live game statistics including period scores
- */
-
 import { Router, Request, Response } from 'express';
 import { logger } from '../config/logger';
 import { getLiveGameById, getLiveGameBySlug } from '../services/polymarket/live-games.service';
 import { transformToLiveStats } from '../services/polymarket/live-stats.transformer';
+import { fetchAndStorePlayerStats, getPlayerStats, fetchPeriodScores } from '../services/balldontlie/balldontlie.service';
 
 const router = Router();
 
@@ -60,6 +56,131 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
 
     // Transform to live stats format
     const stats = await transformToLiveStats(game);
+
+    // For NBA, NFL, CBB, and soccer games, fetch fresh period scores from Ball Don't Lie API
+    // NBA/NFL: quarter-by-quarter scores
+    // CBB (NCAAB): half-by-half scores
+    // Soccer: 1H/2H scores derived from goals
+    const sport = game.sport?.toLowerCase() || '';
+    const supportedPeriodScoreSports = ['nba', 'nfl', 'cbb', 'ncaab', 'epl', 'lal', 'laliga', 'ser', 'seriea', 'bund', 'bundesliga', 'lig', 'ligue1'];
+    if (supportedPeriodScoreSports.includes(sport)) {
+      try {
+        const periodScores = await fetchPeriodScores(game);
+        if (periodScores) {
+          // Convert to the expected PeriodScores format (index signature compatible)
+          const convertedScores: Record<string, { home: number; away: number }> = {};
+          for (const [key, value] of Object.entries(periodScores)) {
+            if (value && typeof value === 'object' && 'home' in value && 'away' in value) {
+              convertedScores[key] = {
+                home: value.home ?? 0,
+                away: value.away ?? 0,
+              };
+            }
+          }
+          stats.periodScores = convertedScores;
+          logger.info({
+            message: 'Updated period scores from Ball Don\'t Lie',
+            gameId: game.id,
+            sport,
+            periodScores: convertedScores,
+          });
+        }
+      } catch (error) {
+        logger.warn({
+          message: 'Failed to fetch period scores from Ball Don\'t Lie (non-blocking)',
+          gameId: game.id,
+          sport,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // Continue with existing period scores from database
+      }
+    }
+
+    // Fetch player stats - first check database, then API if needed
+    try {
+      logger.info({
+        message: 'Fetching player stats for game',
+        gameId: game.id,
+        sport: game.sport,
+      });
+      
+      // First, check if stats already exist in database (fast path)
+      let playerStats = await getPlayerStats(game.id);
+      
+      if (playerStats.length > 0) {
+        logger.info({
+          message: 'Found existing player stats in database',
+          gameId: game.id,
+          statsCount: playerStats.length,
+        });
+        stats.playerStats = playerStats;
+      } else {
+        // No cached stats - need to fetch from API
+        // Use a longer timeout for European soccer leagues which require extra API calls
+        // (rosters endpoint for player names/positions)
+        const isSoccerLeague = ['epl', 'lal', 'laliga', 'ser', 'seriea', 'bund', 'bundesliga', 'lig', 'ligue1'].includes(game.sport?.toLowerCase() || '');
+        const timeoutMs = isSoccerLeague ? 15000 : 8000; // 15 seconds for soccer, 8 for others
+        
+        logger.info({
+          message: 'No cached stats, fetching from API',
+          gameId: game.id,
+          sport: game.sport,
+          timeoutMs,
+        });
+        
+        const statsPromise = fetchAndStorePlayerStats(game);
+        const timeoutPromise = new Promise<any[]>((resolve) => 
+          setTimeout(() => {
+            logger.warn({
+              message: 'Player stats fetch timed out',
+              gameId: game.id,
+              timeoutMs,
+            });
+            resolve([]);
+          }, timeoutMs)
+        );
+        
+        playerStats = await Promise.race([statsPromise, timeoutPromise]);
+        
+        // If the fetch timed out but might have stored data, check database again
+        if (playerStats.length === 0) {
+          // Wait a moment for any in-flight storage to complete
+          await new Promise(resolve => setTimeout(resolve, 500));
+          playerStats = await getPlayerStats(game.id);
+          
+          if (playerStats.length > 0) {
+            logger.info({
+              message: 'Found player stats in database after timeout',
+              gameId: game.id,
+              statsCount: playerStats.length,
+            });
+          }
+        }
+        
+        logger.info({
+          message: 'Player stats fetch completed',
+          gameId: game.id,
+          statsCount: playerStats.length,
+        });
+        
+        if (playerStats.length > 0) {
+          stats.playerStats = playerStats;
+        } else {
+          logger.warn({
+            message: 'No player stats returned',
+            gameId: game.id,
+          });
+        }
+      }
+    } catch (error) {
+      // Log error but don't fail the request
+      logger.error({
+        message: 'Failed to fetch player stats (non-blocking)',
+        gameId: game.id,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    }
 
     res.json({
       success: true,

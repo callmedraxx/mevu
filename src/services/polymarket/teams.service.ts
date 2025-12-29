@@ -130,27 +130,28 @@ export class TeamsService {
    * @param league - League name
    */
   async upsertTeams(teams: Team[], league: string): Promise<void> {
+    // Logo downloading is disabled
     // Download ESPN logos for teams (by abbreviation)
-    try {
-      logger.info({
-        message: 'Downloading ESPN logos for teams',
-        league,
-        teamCount: teams.length,
-      });
-      
-      const teamsToDownload = teams.map(team => ({
-        league: team.league,
-        abbreviation: team.abbreviation,
-      }));
-      
-      await logoMappingService.downloadLogosForTeams(teamsToDownload);
-    } catch (error) {
-      logger.warn({
-        message: 'Error downloading ESPN logos, continuing with original logos',
-        league,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    // try {
+    //   logger.info({
+    //     message: 'Downloading ESPN logos for teams',
+    //     league,
+    //     teamCount: teams.length,
+    //   });
+    //   
+    //   const teamsToDownload = teams.map(team => ({
+    //     league: team.league,
+    //     abbreviation: team.abbreviation,
+    //   }));
+    //   
+    //   await logoMappingService.downloadLogosForTeams(teamsToDownload);
+    // } catch (error) {
+    //   logger.warn({
+    //     message: 'Error downloading ESPN logos, continuing with original logos',
+    //     league,
+    //     error: error instanceof Error ? error.message : String(error),
+    //   });
+    // }
 
     // Replace logo URLs before storing (lookup by abbreviation)
     const teamsWithReplacedLogos = teams.map(team => this.replaceLogoUrl(team));

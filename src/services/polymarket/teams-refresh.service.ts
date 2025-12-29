@@ -35,8 +35,11 @@ export class TeamsRefreshService {
       intervalSeconds: TEAMS_REFRESH_INTERVAL,
     });
 
-    // Refresh immediately on startup
-    this.refreshAllTeams();
+    // Delay initial refresh to prevent connection pool exhaustion during startup
+    // Wait 3 seconds to allow other services to initialize first
+    setTimeout(() => {
+      this.refreshAllTeams();
+    }, 3000);
 
     // Then refresh at interval
     this.interval = setInterval(() => {

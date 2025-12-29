@@ -40,10 +40,11 @@ export const pool: Pool = (() => {
       
       poolInstance = new Pool({
         connectionString,
-        // With PgBouncer, we can have more client connections since PgBouncer pools server connections
-        max: 50, // Increased since PgBouncer handles the actual PostgreSQL connections
+        // Reduced pool size to prevent connection exhaustion during startup
+        // PgBouncer will handle the actual PostgreSQL connection pooling
+        max: 50, // taken to 100 to allow more concurrent flow and less delay in updates
         idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 10000, // 10 seconds
+        connectionTimeoutMillis: 5000, // Reduced from 10s to 5s to fail faster
         // Add retry logic and better error handling
         allowExitOnIdle: false,
         // Keep connections alive
@@ -91,4 +92,51 @@ export const pool: Pool = (() => {
 
 // In-memory storage for development
 export const memoryStore = new Map<string, any>();
+
+/**
+ * Wrapper around pool.connect() with retry logic and exponential backoff
+ * This prevents connection pool exhaustion during startup when many services
+ * try to connect simultaneously
+ */
+export async function connectWithRetry(
+  maxRetries: number = 3,
+  initialDelay: number = 100
+): Promise<any> {
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  
+  if (nodeEnv !== 'production') {
+    throw new Error('Database pool not available in development mode. Use in-memory storage instead.');
+  }
+  
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        // Exponential backoff: 100ms, 200ms, 400ms
+        const delay = initialDelay * Math.pow(2, attempt - 1);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      
+      return await pool.connect();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      
+      // Don't retry on non-retryable errors
+      const errorMessage = lastError.message.toLowerCase();
+      if (errorMessage.includes('password') || 
+          errorMessage.includes('authentication') ||
+          errorMessage.includes('permission denied')) {
+        throw lastError;
+      }
+      
+      // If this was the last attempt, throw the error
+      if (attempt === maxRetries) {
+        throw lastError;
+      }
+    }
+  }
+  
+  throw lastError || new Error('Failed to connect to database after retries');
+}
 

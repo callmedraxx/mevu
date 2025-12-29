@@ -13,6 +13,7 @@ import balancesRouter from './balances';
 import tradingRouter from './trading';
 import positionsRouter from './positions';
 import webhooksRouter from './webhooks';
+import priceHistoryRouter from './price-history';
 
 const router = Router();
 
@@ -81,5 +82,8 @@ router.use('/positions', positionsRouter);
 
 // Webhooks routes (Alchemy, etc.)
 router.use('/webhooks', webhooksRouter);
+
+// Price history routes (CLOB price history)
+router.use('/price-history', priceHistoryRouter);
 
 export default router;

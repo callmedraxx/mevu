@@ -194,6 +194,9 @@ export class LogoMappingService {
    * @returns Logo URL if successful, null otherwise
    */
   async downloadAndMapLogo(league: string, abbreviation: string): Promise<string | null> {
+    // Logo downloading is disabled
+    return null;
+    /* DISABLED
     try {
       // Check if already mapped
       if (this.hasLogo(league, abbreviation)) {
@@ -261,6 +264,7 @@ export class LogoMappingService {
       });
       return null;
     }
+    */
   }
 
   /**
@@ -270,6 +274,9 @@ export class LogoMappingService {
   async downloadLogosForTeams(
     teams: Array<{ league: string; abbreviation: string }>
   ): Promise<Map<string, string>> {
+    // Logo downloading is disabled
+    return new Map<string, string>();
+    /* DISABLED
     const results = new Map<string, string>();
 
     logger.info({
@@ -316,6 +323,7 @@ export class LogoMappingService {
     });
 
     return results;
+    */
   }
 
   /**

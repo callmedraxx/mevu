@@ -187,30 +187,63 @@ function extractTeamsFromTitle(title: string): { home?: string; away?: string } 
 /**
  * Extract team abbreviations from slug (format: sport-away-home-date)
  * Returns { away: 'SEA', home: 'UTA' } for slug like 'nhl-sea-utah-2025-12-13'
+ * 
+ * @param slug - The game slug
+ * @param gameSport - The actual sport of the game (e.g., 'cbb', 'nfl') - used to avoid skipping team abbreviations that happen to match sport identifiers
  */
-function extractAbbrevsFromSlug(slug: string | undefined): { away?: string; home?: string } {
+function extractAbbrevsFromSlug(slug: string | undefined, gameSport?: string): { away?: string; home?: string } {
   if (!slug) return {};
   
   const slugParts = slug.split('-');
   const teamAbbrevs: string[] = [];
   
-  // Common sport identifiers to skip
-  const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+  // Common sport identifiers
+  const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls']);
   
-  for (const part of slugParts) {
+  for (let i = 0; i < slugParts.length; i++) {
+    const part = slugParts[i];
+    const partLower = part.toLowerCase();
+    
     // Skip numbers (dates)
     if (/^\d+$/.test(part)) continue;
-    // Skip sport identifier (first part is usually sport)
-    if (slugParts.indexOf(part) === 0 && sportIdentifiers.has(part.toLowerCase())) continue;
-    // Match team abbreviations (2-5 letters)
-    if (part.length >= 2 && part.length <= 5 && /^[a-z]+$/i.test(part)) {
+    
+    // Always skip the first part if it's a sport identifier (that's the actual sport in the slug)
+    if (i === 0 && sportIdentifiers.has(partLower)) {
+      continue;
+    }
+    
+    // For other positions: only skip if it matches the game's actual sport
+    // This prevents skipping team abbreviations that happen to match sport identifiers
+    // (e.g., "nfl" in "cbb-colmb-nfl-2025-12-28" is "North Florida", not "National Football League")
+    if (i > 0 && gameSport && partLower === gameSport.toLowerCase() && sportIdentifiers.has(partLower)) {
+      continue;
+    }
+    
+    // Match team abbreviations (2-10 letters to handle longer team names like HARVRD, BALLST)
+    if (part.length >= 2 && part.length <= 10 && /^[a-z]+$/i.test(part)) {
       teamAbbrevs.push(part.toUpperCase());
     }
   }
   
   if (teamAbbrevs.length >= 2) {
     // Slug format: sport-away-home-date, so first team is away, second is home
+    logger.debug({
+      message: 'Extracted team abbreviations from slug',
+      slug,
+      gameSport,
+      away: teamAbbrevs[0],
+      home: teamAbbrevs[1],
+    });
     return { away: teamAbbrevs[0], home: teamAbbrevs[1] };
+  }
+  
+  if (teamAbbrevs.length > 0) {
+    logger.warn({
+      message: 'Insufficient team abbreviations extracted from slug',
+      slug,
+      gameSport,
+      extracted: teamAbbrevs,
+    });
   }
   
   return {};
@@ -235,11 +268,48 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     return { home: null, away: null };
   }
   
-  // Get team identifiers to match
-  const homeTeamName = game.homeTeam?.name?.toLowerCase() || game.teamIdentifiers?.home?.toLowerCase() || '';
-  const awayTeamName = game.awayTeam?.name?.toLowerCase() || game.teamIdentifiers?.away?.toLowerCase() || '';
-  const homeAbbr = game.homeTeam?.abbreviation?.toLowerCase() || '';
-  const awayAbbr = game.awayTeam?.abbreviation?.toLowerCase() || '';
+  // Get team identifiers to match - try multiple sources
+  let homeTeamName = game.homeTeam?.name?.toLowerCase() || game.teamIdentifiers?.home?.toLowerCase() || '';
+  let awayTeamName = game.awayTeam?.name?.toLowerCase() || game.teamIdentifiers?.away?.toLowerCase() || '';
+  let homeAbbr = game.homeTeam?.abbreviation?.toLowerCase() || '';
+  let awayAbbr = game.awayTeam?.abbreviation?.toLowerCase() || '';
+  
+  // Fallback: Extract team names from title if teams aren't enriched
+  if (!homeTeamName && !awayTeamName && game.title) {
+    const title = game.title;
+    // Try common separators: "vs", "vs.", "@", "at"
+    const separators = [' vs. ', ' vs ', ' @ ', ' at '];
+    for (const sep of separators) {
+      const parts = title.split(sep);
+      if (parts.length === 2) {
+        awayTeamName = parts[0].trim().toLowerCase();
+        homeTeamName = parts[1].trim().toLowerCase();
+        break;
+      }
+    }
+  }
+  
+  // Fallback: Extract from slug if available (format: sport-away-home-date)
+  if (!homeTeamName && !awayTeamName && game.slug) {
+    const slugParts = game.slug.split('-');
+    // Skip sport identifier and date, get team abbreviations
+    const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+    const teamParts: string[] = [];
+    for (let i = 1; i < slugParts.length; i++) {
+      const part = slugParts[i];
+      // Skip if it's a date (YYYY-MM-DD pattern) or sport identifier
+      if (/^\d{4}-\d{2}-\d{2}/.test(part) || sportIdentifiers.has(part.toLowerCase())) {
+        continue;
+      }
+      if (part.length >= 2 && part.length <= 10) {
+        teamParts.push(part.toLowerCase());
+      }
+    }
+    if (teamParts.length >= 2) {
+      awayAbbr = teamParts[0];
+      homeAbbr = teamParts[1];
+    }
+  }
   
   // SOCCER/FOOTBALL: First try to find individual "Will X win?" markets
   // These are Yes/No markets where each team has their own market
@@ -333,6 +403,21 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       l.endsWith(' over') || l.endsWith(' under') ||
       l.includes('points') || l.includes('rebounds') || l.includes('assists')
     );
+    
+    // Debug logging for specific game
+    if (game.id === '117348') {
+      logger.info({
+        message: 'DEBUG findMoneylineMarket checking market',
+        gameId: game.id,
+        marketQuestion: market.question,
+        labels,
+        shouldSkip,
+        outcomes: outcomes?.map((o: any) => ({ label: o.label, price: o.price })),
+        homeTeamName,
+        awayTeamName,
+      });
+    }
+    
     if (shouldSkip) {
       continue;
     }
@@ -348,17 +433,40 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       const buyPrice = outcome.buyPrice;
       const sellPrice = outcome.sellPrice;
       
-      // Check if this matches home team
-      if (homeTeamName && (label.includes(homeTeamName) || homeTeamName.includes(label))) {
-        homeOutcome = { label: outcome.label, price, buyPrice, sellPrice };
-      } else if (homeAbbr && (label === homeAbbr || shortLabel === homeAbbr)) {
-        homeOutcome = { label: outcome.label, price, buyPrice, sellPrice };
+      // Check if this matches home team (more flexible matching)
+      if (homeTeamName) {
+        // Try full name match (partial or exact)
+        if (label.includes(homeTeamName) || homeTeamName.includes(label) || 
+            label === homeTeamName || homeTeamName === label) {
+          homeOutcome = { label: outcome.label, price, buyPrice, sellPrice };
+          continue;
+        }
       }
-      // Check if this matches away team
-      else if (awayTeamName && (label.includes(awayTeamName) || awayTeamName.includes(label))) {
-        awayOutcome = { label: outcome.label, price, buyPrice, sellPrice };
-      } else if (awayAbbr && (label === awayAbbr || shortLabel === awayAbbr)) {
-        awayOutcome = { label: outcome.label, price, buyPrice, sellPrice };
+      if (homeAbbr) {
+        // Try abbreviation match
+        if (label === homeAbbr || shortLabel === homeAbbr || 
+            label.includes(homeAbbr) || shortLabel.includes(homeAbbr)) {
+          homeOutcome = { label: outcome.label, price, buyPrice, sellPrice };
+          continue;
+        }
+      }
+      
+      // Check if this matches away team (more flexible matching)
+      if (awayTeamName) {
+        // Try full name match (partial or exact)
+        if (label.includes(awayTeamName) || awayTeamName.includes(label) ||
+            label === awayTeamName || awayTeamName === label) {
+          awayOutcome = { label: outcome.label, price, buyPrice, sellPrice };
+          continue;
+        }
+      }
+      if (awayAbbr) {
+        // Try abbreviation match
+        if (label === awayAbbr || shortLabel === awayAbbr ||
+            label.includes(awayAbbr) || shortLabel.includes(awayAbbr)) {
+          awayOutcome = { label: outcome.label, price, buyPrice, sellPrice };
+          continue;
+        }
       }
     }
     
@@ -368,20 +476,44 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     }
     
     // Fallback: if this looks like a team market (2 outcomes, both have team-like names)
-    // Assume first is home, second is away (or vice versa based on title parsing)
+    // Use title or market question to determine order: "Away vs Home" or "Away @ Home"
     if (outcomes.length === 2 && !labels.some(l => l.includes('yes') || l.includes('no'))) {
       const o1 = outcomes[0];
       const o2 = outcomes[1];
       
-      // Use title to determine order: "Heat vs. Magic" -> Heat is home
-      const titleLower = (game.title || '').toLowerCase();
+      // Use title or market question to determine order
+      const titleLower = (game.title || market.question || '').toLowerCase();
       const o1Label = String(o1.label || '').toLowerCase();
       const o2Label = String(o2.label || '').toLowerCase();
       
-      // Check which team appears first in title (format: "Away vs Home" or "Away @ Home")
-      const o1Pos = titleLower.indexOf(o1Label);
-      const o2Pos = titleLower.indexOf(o2Label);
+      // Try to find team names in title/question (more flexible matching)
+      let o1Pos = titleLower.indexOf(o1Label);
+      let o2Pos = titleLower.indexOf(o2Label);
       
+      // If exact match fails, try matching key words (team name parts)
+      if (o1Pos === -1) {
+        const o1Words = o1Label.split(/\s+/).filter((w: string) => w.length > 3);
+        for (const word of o1Words) {
+          const pos = titleLower.indexOf(word);
+          if (pos !== -1) {
+            o1Pos = pos;
+            break;
+          }
+        }
+      }
+      
+      if (o2Pos === -1) {
+        const o2Words = o2Label.split(/\s+/).filter((w: string) => w.length > 3);
+        for (const word of o2Words) {
+          const pos = titleLower.indexOf(word);
+          if (pos !== -1) {
+            o2Pos = pos;
+            break;
+          }
+        }
+      }
+      
+      // If we found both teams in title, determine order
       if (o1Pos !== -1 && o2Pos !== -1) {
         if (o1Pos < o2Pos) {
           // o1 is away (appears first), o2 is home (appears second)
@@ -392,6 +524,16 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
           awayOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice, sellPrice: o2.sellPrice };
           homeOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice, sellPrice: o1.sellPrice };
         }
+        return { home: homeOutcome, away: awayOutcome };
+      }
+      
+      // Last resort: if market question matches game title exactly, assume standard order
+      // Most markets follow "Away vs Home" format
+      if (market.question && game.title && 
+          market.question.toLowerCase() === game.title.toLowerCase()) {
+        // Standard format: first outcome is away, second is home
+        awayOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice, sellPrice: o1.sellPrice };
+        homeOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice, sellPrice: o2.sellPrice };
         return { home: homeOutcome, away: awayOutcome };
       }
     }
@@ -424,6 +566,18 @@ function extractPrices(game: LiveGame): {
   
   // Find moneyline market with team outcomes
   const moneyline = findMoneylineMarket(game);
+  
+  // Debug logging for specific game
+  if (game.id === '117348') {
+    logger.info({
+      message: 'DEBUG extractPrices for game 117348',
+      gameId: game.id,
+      teamIdentifiers: game.teamIdentifiers,
+      moneylineHome: moneyline.home,
+      moneylineAway: moneyline.away,
+      marketCount: game.markets?.length,
+    });
+  }
   
   if (moneyline.home && moneyline.away) {
     // Get YES prices for each team (raw probability)
@@ -606,7 +760,29 @@ export async function transformToFrontendGame(
   const titleTeams = extractTeamsFromTitle(game.title);
   
   // Extract team abbreviations from slug as fallback (format: sport-away-home-date)
-  const slugAbbrevs = extractAbbrevsFromSlug(game.slug);
+  // Pass the game's sport to avoid incorrectly skipping team abbreviations that match sport identifiers
+  const slugAbbrevs = extractAbbrevsFromSlug(game.slug, game.sport || game.league);
+  
+  // Log warnings if slug extraction seems incorrect
+  if (game.slug && (slugAbbrevs.away || slugAbbrevs.home)) {
+    const finalAwayAbbr = awayTeam?.abbreviation || slugAbbrevs.away || game.teamIdentifiers?.away?.substring(0, 3).toUpperCase() || titleTeams.away?.substring(0, 3).toUpperCase() || 'AWY';
+    const finalHomeAbbr = homeTeam?.abbreviation || slugAbbrevs.home || game.teamIdentifiers?.home?.substring(0, 3).toUpperCase() || titleTeams.home?.substring(0, 3).toUpperCase() || 'HME';
+    
+    // Check if slug-extracted abbreviations match sport identifiers (common mistake)
+    const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+    if (sportIdentifiers.has(finalAwayAbbr.toLowerCase()) || sportIdentifiers.has(finalHomeAbbr.toLowerCase())) {
+      // logger.warn({
+      //   message: 'Team abbreviation matches sport identifier - likely slug parsing error',
+      //   gameId: game.id,
+      //   slug: game.slug,
+      //   sport: game.sport,
+      //   awayAbbr: finalAwayAbbr,
+      //   homeAbbr: finalHomeAbbr,
+      //   awayTeamName: awayTeam?.name || game.teamIdentifiers?.away,
+      //   homeTeamName: homeTeam?.name || game.teamIdentifiers?.home,
+      // });
+    }
+  }
   
   // Generate chart data based on home team's win probability
   // Use game.id as seed for consistent mock data (TODO: use real historical data)

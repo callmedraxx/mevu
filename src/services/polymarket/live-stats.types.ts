@@ -25,6 +25,42 @@ export interface FinalScore {
 }
 
 /**
+ * Player stat structure
+ */
+export interface PlayerStat {
+  player_id: number;
+  player_first_name: string;
+  player_last_name: string;
+  player_position: string | null;
+  team_id: number | null;
+  team_abbreviation: string | null;
+  team_name: string | null;
+  is_home: boolean;
+  min: string | null;
+  fgm: number | null;
+  fga: number | null;
+  fg_pct: number | null;
+  fg3m: number | null;
+  fg3a: number | null;
+  fg3_pct: number | null;
+  ftm: number | null;
+  fta: number | null;
+  ft_pct: number | null;
+  oreb: number | null;
+  dreb: number | null;
+  reb: number | null;
+  ast: number | null;
+  stl: number | null;
+  blk: number | null;
+  turnover: number | null;
+  pf: number | null;
+  pts: number | null;
+  sport: string | null;
+  sport_stats: any; // JSONB - sport-specific stats
+  stats_updated_at: Date;
+}
+
+/**
  * Live stats response structure
  */
 export interface LiveStats {
@@ -34,4 +70,5 @@ export interface LiveStats {
   finalScore: FinalScore | null; // null for NS (not started) games
   currentPeriod: string;
   isLive: boolean;
+  playerStats?: PlayerStat[]; // Optional player stats
 }

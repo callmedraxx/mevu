@@ -16,6 +16,7 @@ export interface WhaleTrade {
     homeTeam: FrontendTeam;
     awayTeam: FrontendTeam;
   };
+  teamFor: 'home' | 'away' | null; // Which team this trade was for (null if unknown/non-team market)
   amount: number;                 // Trade amount in dollars (price * size)
   price: number;                  // Price in cents (price * 100)
   time: string;                   // ISO timestamp from created_at

@@ -306,12 +306,12 @@ class PositionsWebSocketService {
     
     if (!affectedUsers || affectedUsers.size === 0) return;
 
-    logger.info({
-      message: 'Broadcasting position price update',
-      assetId: assetId.substring(0, 20) + '...',
-      affectedUserCount: affectedUsers.size,
-      priceData,
-    });
+    // logger.info({
+    //   message: 'Broadcasting position price update',
+    //   assetId: assetId.substring(0, 20) + '...',
+    //   affectedUserCount: affectedUsers.size,
+    //   priceData,
+    // });
 
     // Build the update message
     // For position holders, curPrice = sellPrice (best_bid) = what they can actually sell for

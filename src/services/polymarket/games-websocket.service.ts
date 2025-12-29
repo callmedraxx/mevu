@@ -298,12 +298,12 @@ export class GamesWebSocketService {
         timestamp: new Date().toISOString(),
       });
 
-      logger.info({
-        message: 'Broadcasted price update to WebSocket clients',
-        clientCount: this.clients.size,
-        gameId: game.id,
-        slug: game.slug,
-      });
+      // logger.info({
+      //   message: 'Broadcasted price update to WebSocket clients',
+      //   clientCount: this.clients.size,
+      //   gameId: game.id,
+      //   slug: game.slug,
+      // });
     } catch (error) {
       logger.error({
         message: 'Error broadcasting price update',

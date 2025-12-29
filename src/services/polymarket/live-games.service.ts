@@ -197,23 +197,47 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
   
   const sportsConfig = getAllSportsGamesConfig();
   
+  // PRIORITY 1: Check the first part of the slug as the sport identifier
+  // Slug format is: sport-away-home-date, so the first part is always the sport
+  const firstSlugPart = slug.split('-')[0];
+  
+  // Check if first slug part matches a sport directly
+  if (firstSlugPart && firstSlugPart in sportsConfig) {
+    return firstSlugPart;
+  }
+  
+  // PRIORITY 2: Check sport indicators with first slug part priority
+  const sportIndicators: Record<string, string[]> = {
+    nfl: ['nfl', 'football'],
+    nba: ['nba', 'basketball'],
+    mlb: ['mlb', 'baseball'],
+    nhl: ['nhl', 'hockey'],
+    ufc: ['ufc', 'mma'],
+    epl: ['epl', 'premier league', 'premier-league'],
+    lal: ['lal', 'la liga', 'la-liga', 'laliga'],
+    valorant: ['valorant', 'val', 'vct'],
+    cbb: ['cbb', 'college basketball', 'ncaa basketball', 'ncaab'],
+    cfb: ['cfb', 'college football', 'ncaa football', 'ncaaf'],
+  };
+  
+  // First, check if first slug part matches any sport's indicators
   for (const [sport] of Object.entries(sportsConfig)) {
-    const sportIndicators: Record<string, string[]> = {
-      nfl: ['nfl', 'football'],
-      nba: ['nba', 'basketball'],
-      mlb: ['mlb', 'baseball'],
-      nhl: ['nhl', 'hockey'],
-      ufc: ['ufc', 'mma'],
-      epl: ['epl', 'premier league', 'premier-league'],
-      lal: ['lal', 'la liga', 'la-liga', 'laliga'],
-      valorant: ['valorant', 'val', 'vct'],
-      cbb: ['cbb', 'college basketball', 'ncaa basketball', 'ncaab'],
-      cfb: ['cfb', 'college football', 'ncaa football', 'ncaaf'],
-    };
-    
     const indicators = sportIndicators[sport] || [sport];
     for (const indicator of indicators) {
-      if (slug.includes(indicator) || title.includes(indicator)) {
+      if (firstSlugPart === indicator) {
+        return sport;
+      }
+    }
+  }
+  
+  // PRIORITY 3: Fallback to substring matching in slug/title (for non-standard formats)
+  for (const [sport] of Object.entries(sportsConfig)) {
+    const indicators = sportIndicators[sport] || [sport];
+    for (const indicator of indicators) {
+      const slugMatch = slug.includes(indicator);
+      const titleMatch = title.includes(indicator);
+      
+      if (slugMatch || titleMatch) {
         return sport;
       }
     }
@@ -292,7 +316,7 @@ function convertToPolymarketEvent(event: LiveGameEvent): PolymarketEvent {
   };
 }
 
-function extractTeamsFromEvent(event: TransformedEvent): { home?: string; away?: string } {
+function extractTeamsFromEvent(event: TransformedEvent, sport?: string): { home?: string; away?: string } {
   const title = event.title || '';
   const separators = [' vs. ', ' vs ', ' @ ', ' at ', ' - '];
   
@@ -317,16 +341,30 @@ function extractTeamsFromEvent(event: TransformedEvent): { home?: string; away?:
   const slugParts = slug.split('-');
   const teamAbbrevs: string[] = [];
   
-  // Common sport identifiers to skip
-  const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+  // Common sport identifiers
+  const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls']);
   
-  for (const part of slugParts) {
+  for (let i = 0; i < slugParts.length; i++) {
+    const part = slugParts[i];
+    const partLower = part.toLowerCase();
+    
     // Skip numbers
     if (/^\d+$/.test(part)) continue;
-    // Skip sport identifier (first part is usually sport)
-    if (slugParts.indexOf(part) === 0 && sportIdentifiers.has(part.toLowerCase())) continue;
-    // Match team abbreviations (2-5 letters)
-    if (part.length >= 2 && part.length <= 5 && /^[a-z]+$/i.test(part)) {
+    
+    // Always skip the first part if it's a sport identifier (that's the actual sport in the slug)
+    if (i === 0 && sportIdentifiers.has(partLower)) {
+      continue;
+    }
+    
+    // For other positions: only skip if it matches the game's actual sport
+    // This prevents skipping team abbreviations that happen to match sport identifiers
+    // (e.g., "nfl" in "cbb-colmb-nfl-2025-12-28" is "North Florida", not "National Football League")
+    if (i > 0 && sport && partLower === sport.toLowerCase() && sportIdentifiers.has(partLower)) {
+      continue;
+    }
+    
+    // Match team abbreviations (2-10 letters to handle longer team names like HARVRD, BALLST)
+    if (part.length >= 2 && part.length <= 10 && /^[a-z]+$/i.test(part)) {
       teamAbbrevs.push(part.toUpperCase());
     }
   }
@@ -386,8 +424,18 @@ function matchTeamUsingLookup(
 
 async function enrichEventsWithTeams(events: TransformedEvent[], sport: string): Promise<LiveGame[]> {
   const league = getLeagueForSport(sport);
+  
+  // Even if no league is configured, still extract team identifiers from slugs/titles
+  // so they can be used as fallback team names
   if (!league) {
-    return events.map((e) => ({ ...e, createdAt: new Date(), updatedAt: new Date(), rawData: {} as LiveGameEvent }));
+    return events.map((event) => {
+      const liveGame: LiveGame = { ...event, createdAt: new Date(), updatedAt: new Date(), rawData: {} as LiveGameEvent };
+      const teamIdentifiers = extractTeamsFromEvent(event, sport);
+      if (teamIdentifiers.home || teamIdentifiers.away) {
+        liveGame.teamIdentifiers = teamIdentifiers;
+      }
+      return liveGame;
+    });
   }
 
   let teams: Team[] = [];
@@ -399,7 +447,15 @@ async function enrichEventsWithTeams(events: TransformedEvent[], sport: string):
       sport, league,
       error: error instanceof Error ? error.message : String(error),
     });
-    return events.map((e) => ({ ...e, createdAt: new Date(), updatedAt: new Date(), rawData: {} as LiveGameEvent }));
+    // Still extract team identifiers even if team fetching fails
+    return events.map((event) => {
+      const liveGame: LiveGame = { ...event, createdAt: new Date(), updatedAt: new Date(), rawData: {} as LiveGameEvent };
+      const teamIdentifiers = extractTeamsFromEvent(event, sport);
+      if (teamIdentifiers.home || teamIdentifiers.away) {
+        liveGame.teamIdentifiers = teamIdentifiers;
+      }
+      return liveGame;
+    });
   }
 
   const teamsByAbbreviation = new Map<string, Team>();
@@ -414,7 +470,7 @@ async function enrichEventsWithTeams(events: TransformedEvent[], sport: string):
 
   return events.map((event) => {
     const liveGame: LiveGame = { ...event, createdAt: new Date(), updatedAt: new Date(), rawData: {} as LiveGameEvent };
-    const teamIdentifiers = extractTeamsFromEvent(event);
+    const teamIdentifiers = extractTeamsFromEvent(event, sport);
     
     if (teamIdentifiers.home || teamIdentifiers.away) {
       liveGame.teamIdentifiers = teamIdentifiers;
@@ -894,8 +950,27 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
         const ticker = game.ticker || game.slug || game.id || 'UNKNOWN';
         const rowPlaceholders: string[] = [];
         
-        // 29 parameters + 2 CURRENT_TIMESTAMP = 31 total (matching 31 columns)
-        for (let i = 0; i < 29; i++) {
+        // Calculate period scores if game has score and period
+        let periodScores = game.periodScores || null;
+        if (!periodScores && game.score && game.period && game.period !== 'NS') {
+          const currentScore = parseScoreString(game.score);
+          if (currentScore) {
+            // Initial storage: no previous period, no previous score, no period change
+            periodScores = calculatePeriodScores(
+              currentScore,
+              game.period,
+              null, // No previous period scores when first storing
+              undefined, // No previous period
+              null, // No previous score
+              false // No period change (initial storage)
+            );
+            // Update game object with calculated period scores
+            game.periodScores = periodScores;
+          }
+        }
+        
+        // 30 parameters (29 + period_scores) + 2 CURRENT_TIMESTAMP = 32 total
+        for (let i = 0; i < 30; i++) {
           rowPlaceholders.push(`$${paramIndex++}`);
         }
         rowPlaceholders.push('CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP');
@@ -907,6 +982,7 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
           game.archived, game.restricted, game.liquidity, game.volume, game.volume24hr,
           game.competitive, game.sport, game.league, game.seriesId, game.gameId,
           game.score, game.period, game.elapsed, game.live, game.ended,
+          periodScores ? JSON.stringify(periodScores) : null,
           JSON.stringify(game), JSON.stringify(game.rawData)
         );
       }
@@ -917,7 +993,7 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
           start_date, end_date, image, icon, active, closed, archived,
           restricted, liquidity, volume, volume_24hr, competitive,
           sport, league, series_id, game_id, score, period, elapsed, live, ended,
-          transformed_data, raw_data, created_at, updated_at
+          period_scores, transformed_data, raw_data, created_at, updated_at
         ) VALUES ${placeholders.join(', ')}
         ON CONFLICT (id) DO UPDATE SET
           ticker = EXCLUDED.ticker, slug = EXCLUDED.slug, title = EXCLUDED.title,
@@ -929,7 +1005,9 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
           competitive = EXCLUDED.competitive, sport = EXCLUDED.sport, league = EXCLUDED.league,
           series_id = EXCLUDED.series_id, game_id = EXCLUDED.game_id, score = EXCLUDED.score,
           period = EXCLUDED.period, elapsed = EXCLUDED.elapsed, live = EXCLUDED.live,
-          ended = EXCLUDED.ended, transformed_data = EXCLUDED.transformed_data,
+          ended = EXCLUDED.ended, 
+          period_scores = COALESCE(EXCLUDED.period_scores, live_games.period_scores),
+          transformed_data = EXCLUDED.transformed_data,
           raw_data = EXCLUDED.raw_data, updated_at = CURRENT_TIMESTAMP
       `;
 
@@ -1053,24 +1131,50 @@ export async function getLiveGameById(id: string): Promise<LiveGame | null> {
 export async function getLiveGameBySlug(slug: string): Promise<LiveGame | null> {
   if (!slug) return null;
   const target = slug.toLowerCase();
-  const games = await getAllLiveGames();
   
-  return games.find((game) => {
-    const slugMatch = game.slug && game.slug.toLowerCase() === target;
-    const tickerMatch = game.ticker && game.ticker.toLowerCase() === target;
-    const idMatch = game.id.toLowerCase() === target;
-    const rawSlugMatch = game.rawData?.slug && String(game.rawData.slug).toLowerCase() === target;
-    return slugMatch || tickerMatch || idMatch || rawSlugMatch;
-  }) || null;
+  const isProduction = process.env.NODE_ENV === 'production';
+  
+  if (isProduction) {
+    // Try database query first (more efficient)
+    const game = await getLiveGameBySlugFromDatabase(target);
+    if (game) {
+      // Update cache
+      gamesCache.set(game.id, game);
+      return game;
+    }
+    
+    // Fallback to in-memory search if database query fails
+    const games = await getAllLiveGames();
+    return games.find((game) => {
+      const slugMatch = game.slug && game.slug.toLowerCase() === target;
+      const tickerMatch = game.ticker && game.ticker.toLowerCase() === target;
+      const idMatch = game.id.toLowerCase() === target;
+      const rawSlugMatch = game.rawData?.slug && String(game.rawData.slug).toLowerCase() === target;
+      return slugMatch || tickerMatch || idMatch || rawSlugMatch;
+    }) || null;
+  } else {
+    // Development: search in-memory
+    const games = await getAllLiveGames();
+    return games.find((game) => {
+      const slugMatch = game.slug && game.slug.toLowerCase() === target;
+      const tickerMatch = game.ticker && game.ticker.toLowerCase() === target;
+      const idMatch = game.id.toLowerCase() === target;
+      const rawSlugMatch = game.rawData?.slug && String(game.rawData.slug).toLowerCase() === target;
+      return slugMatch || tickerMatch || idMatch || rawSlugMatch;
+    }) || null;
+  }
 }
 
-async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null> {
+async function getLiveGameBySlugFromDatabase(slug: string): Promise<LiveGame | null> {
   const client = await pool.connect();
   
   try {
+    // Query by slug (case-insensitive)
     const result = await client.query(
-      `SELECT transformed_data, raw_data, period_scores FROM live_games WHERE id = $1`,
-      [id]
+      `SELECT transformed_data, raw_data, period_scores, balldontlie_game_id FROM live_games 
+       WHERE LOWER(slug) = $1 OR LOWER(ticker) = $1 OR LOWER(id) = $1
+       LIMIT 1`,
+      [slug]
     );
     
     if (result.rows.length === 0) return null;
@@ -1080,7 +1184,7 @@ async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null>
     
     if (row.transformed_data) {
       game = typeof row.transformed_data === 'string' 
-        ? JSON.parse(row.transformed_data) 
+        ? JSON.parse(row.transformed_data)
         : row.transformed_data;
       if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
       if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
@@ -1094,6 +1198,64 @@ async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null>
       game.periodScores = typeof row.period_scores === 'string'
         ? JSON.parse(row.period_scores)
         : row.period_scores;
+    }
+    
+    // Add balldontlie_game_id from database if available
+    if (row.balldontlie_game_id) {
+      (game as any).balldontlie_game_id = row.balldontlie_game_id;
+    }
+    
+    // Ensure consistency between live and ended flags
+    ensureLiveEndedConsistency(game);
+    
+    return game;
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching game by slug from database',
+      slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null> {
+  const client = await pool.connect();
+  
+  try {
+    const result = await client.query(
+      `SELECT transformed_data, raw_data, period_scores, balldontlie_game_id FROM live_games WHERE id = $1`,
+      [id]
+    );
+    
+    if (result.rows.length === 0) return null;
+    
+    const row = result.rows[0];
+    let game: LiveGame;
+    
+    if (row.transformed_data) {
+      game = typeof row.transformed_data === 'string' 
+        ? JSON.parse(row.transformed_data)
+        : row.transformed_data;
+      if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
+      if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
+    } else {
+      const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
+      game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
+    }
+    
+    // Add period_scores from database if available
+    if (row.period_scores) {
+      game.periodScores = typeof row.period_scores === 'string'
+        ? JSON.parse(row.period_scores)
+        : row.period_scores;
+    }
+    
+    // Add balldontlie_game_id from database if available
+    if (row.balldontlie_game_id) {
+      (game as any).balldontlie_game_id = row.balldontlie_game_id;
     }
     
     // Ensure consistency between live and ended flags
@@ -1112,7 +1274,7 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
     // Fetch all games from database - filtering by ended/closed happens at API layer
     // This allows ended games to still be fetched by ID or slug
     const result = await client.query(
-      `SELECT transformed_data, raw_data, period_scores FROM live_games
+      `SELECT transformed_data, raw_data, period_scores, balldontlie_game_id FROM live_games
       ORDER BY 
         CASE WHEN live = true THEN 0 ELSE 1 END,
         volume_24hr DESC NULLS LAST, 
@@ -1138,6 +1300,11 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
         game.periodScores = typeof row.period_scores === 'string'
           ? JSON.parse(row.period_scores)
           : row.period_scores;
+      }
+      
+      // Add balldontlie_game_id from database if available
+      if (row.balldontlie_game_id) {
+        (game as any).balldontlie_game_id = row.balldontlie_game_id;
       }
       
       // Ensure consistency between live and ended flags
@@ -1201,6 +1368,13 @@ function normalizePeriodKey(period: string | undefined): string | null {
   
   const periodLower = period.toLowerCase().trim();
   
+  // Handle "End Q1", "End Q2", etc. - normalize to "q1", "q2", etc.
+  if (periodLower.startsWith('end ')) {
+    const periodWithoutEnd = periodLower.replace(/^end\s+/, '').trim();
+    // Recursively call with the period without "end" prefix
+    return normalizePeriodKey(periodWithoutEnd);
+  }
+  
   // Handle quarters (NBA, NFL)
   if (periodLower === 'q1' || periodLower === '1q' || periodLower === '1st') return 'q1';
   if (periodLower === 'q2' || periodLower === '2q' || periodLower === '2nd') return 'q2';
@@ -1216,8 +1390,14 @@ function normalizePeriodKey(period: string | undefined): string | null {
   if (periodLower === '1h' || periodLower === '1st half' || periodLower === 'first half') return '1h';
   if (periodLower === '2h' || periodLower === '2nd half' || periodLower === 'second half') return '2h';
   
+  // Handle halftime (transition period)
+  if (periodLower === 'ht' || periodLower === 'halftime' || periodLower === 'half') return 'ht';
+  
   // Handle overtime
   if (periodLower === 'ot' || periodLower === 'overtime') return 'ot';
+  
+  // Handle final/finished
+  if (periodLower === 'final' || periodLower === 'vft' || periodLower === 'finished') return 'final';
   
   // Return lowercase version if no match
   return periodLower;
@@ -1239,47 +1419,78 @@ function parseScoreString(scoreStr: string | undefined): { home: number; away: n
 }
 
 /**
- * Calculate period scores from current total and previous period scores
+ * Calculate period scores - snapshots cumulative scores when periods change
+ * When period changes (e.g., Q1 → Q2), snapshots the PREVIOUS period's cumulative score
+ * When period doesn't change but score changes, updates the current period's cumulative score
+ * IMPORTANT: Period scores are only final when the period ends (e.g., "End Q2")
+ * While a period is ongoing (e.g., "Q2"), the score should be updated with live score changes
  */
 function calculatePeriodScores(
   currentScore: { home: number; away: number },
   currentPeriod: string,
-  previousPeriodScores: Record<string, { home: number; away: number }> | null
+  previousPeriodScores: Record<string, { home: number; away: number }> | null,
+  previousPeriod: string | undefined,
+  previousScore: { home: number; away: number } | null,
+  periodChanged: boolean
 ): Record<string, { home: number; away: number }> {
-  const periodKey = normalizePeriodKey(currentPeriod);
-  if (!periodKey) return previousPeriodScores || {};
+  const currentPeriodKey = normalizePeriodKey(currentPeriod);
+  if (!currentPeriodKey) return previousPeriodScores || {};
   
-  // If period already exists, don't recalculate (period score is final when period ends)
-  if (previousPeriodScores && previousPeriodScores[periodKey]) {
-    return previousPeriodScores;
-  }
+  // Always preserve all existing period scores - never remove them
+  const result = { ...(previousPeriodScores || {}) };
   
-  // Calculate sum of previous periods
-  let previousHomeTotal = 0;
-  let previousAwayTotal = 0;
+  // Check if current period is an "end of period" state
+  // This includes: "End Q2", "HT" (halftime), "Final", "VFT" (verified final)
+  const currentPeriodLower = currentPeriod.toLowerCase().trim();
+  const isPeriodEnded = 
+    currentPeriodLower.startsWith('end ') ||
+    currentPeriodLower === 'ht' ||
+    currentPeriodLower === 'halftime' ||
+    currentPeriodLower === 'half' ||
+    currentPeriodLower === 'final' ||
+    currentPeriodLower === 'vft' ||
+    currentPeriodLower === 'finished';
   
-  if (previousPeriodScores) {
-    for (const periodScore of Object.values(previousPeriodScores)) {
-      previousHomeTotal += periodScore.home;
-      previousAwayTotal += periodScore.away;
+  // If period changed, snapshot the PREVIOUS period's cumulative score
+  // This ensures we capture the score at the end of the previous period before transitioning
+  if (periodChanged && previousPeriod && previousScore) {
+    const previousPeriodKey = normalizePeriodKey(previousPeriod);
+    if (previousPeriodKey && previousPeriodKey !== currentPeriodKey) {
+      // Snapshot the previous period's score if it hasn't been stored yet
+      // Once stored, never overwrite (period ended, score is final)
+      // This is critical for transitions like Q2 → HT, where Q2 needs to be snapshotted
+      if (!result[previousPeriodKey]) {
+        result[previousPeriodKey] = {
+          home: previousScore.home,
+          away: previousScore.away,
+        };
+      }
     }
   }
   
-  // Current period score = current total - sum of previous periods
-  const periodScore = {
-    home: currentScore.home - previousHomeTotal,
-    away: currentScore.away - previousAwayTotal,
-  };
-  
-  // Only add if scores are non-negative (sanity check)
-  if (periodScore.home >= 0 && periodScore.away >= 0) {
-    return {
-      ...(previousPeriodScores || {}),
-      [periodKey]: periodScore,
+  // Update or set the current period's cumulative score
+  // If period has ended (e.g., "End Q2", "HT"), only set if it doesn't exist yet (score is final)
+  // If period is ongoing (e.g., "Q2"), always update (live score changes)
+  if (!isPeriodEnded) {
+    // Period is ongoing, update the score (even if it already exists)
+    // This allows live score updates during an active period
+    result[currentPeriodKey] = {
+      home: currentScore.home,
+      away: currentScore.away,
     };
+  } else {
+    // Period has ended (e.g., "End Q2", "HT"), only set if it doesn't exist yet
+    // Once set, never overwrite (period ended, score is final)
+    // Note: HT (halftime) is a transition period, but we still store its score
+    if (!result[currentPeriodKey]) {
+      result[currentPeriodKey] = {
+        home: currentScore.home,
+        away: currentScore.away,
+      };
+    }
   }
   
-  return previousPeriodScores || {};
+  return result;
 }
 
 async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<LiveGame>): Promise<void> {
@@ -1293,13 +1504,13 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
     
     if (findResult.rows.length === 0) {
       // Game doesn't exist - log for debugging (might be NFL or other missing game)
-      logger.warn({
-        message: 'Websocket update received for game not in database - may need refresh',
-        gameId,
-        live: updates.live,
-        score: updates.score,
-        period: updates.period,
-      });
+      // logger.warn({
+      //   message: 'Websocket update received for game not in database - may need refresh',
+      //   gameId,
+      //   live: updates.live,
+      //   score: updates.score,
+      //   period: updates.period,
+      // });
       return;
     }
     
@@ -1322,15 +1533,25 @@ async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<Liv
     const periodChanged = updates.period !== undefined && updates.period !== previousPeriod;
     const scoreChanged = updates.score !== undefined && updates.score !== previousScore;
     
-    // Calculate period scores if period or score changed
+    // Calculate period scores if:
+    // 1. Period or score changed, OR
+    // 2. We have score/period but no previous period scores (initializing)
     let newPeriodScores = previousPeriodScores;
-    if ((periodChanged || scoreChanged) && updates.score && updates.period && updates.period !== 'NS') {
+    const hasScoreAndPeriod = updates.score && updates.period && updates.period !== 'NS';
+    const shouldCalculatePeriodScores = (periodChanged || scoreChanged || !previousPeriodScores) && hasScoreAndPeriod;
+    
+    if (shouldCalculatePeriodScores && updates.score && updates.period) {
       const currentScore = parseScoreString(updates.score);
+      const previousScoreParsed = previousScore ? parseScoreString(previousScore) : null;
+      
       if (currentScore) {
         newPeriodScores = calculatePeriodScores(
           currentScore,
           updates.period,
-          previousPeriodScores
+          previousPeriodScores,
+          previousPeriod,
+          previousScoreParsed,
+          periodChanged
         );
         updates.periodScores = newPeriodScores;
       }
@@ -1433,15 +1654,25 @@ function updateGameByGameIdInMemory(gameId: number, updates: Partial<LiveGame>):
       const periodChanged = updates.period !== undefined && updates.period !== game.period;
       const scoreChanged = updates.score !== undefined && updates.score !== game.score;
       
-      // Calculate period scores if period or score changed
+      // Calculate period scores if:
+      // 1. Period or score changed, OR
+      // 2. We have score/period but no previous period scores (initializing)
       let newPeriodScores = game.periodScores;
-      if ((periodChanged || scoreChanged) && updates.score && updates.period && updates.period !== 'NS') {
+      const hasScoreAndPeriod = updates.score && updates.period && updates.period !== 'NS';
+      const shouldCalculatePeriodScores = (periodChanged || scoreChanged || !game.periodScores) && hasScoreAndPeriod;
+      
+      if (shouldCalculatePeriodScores && updates.score && updates.period) {
         const currentScore = parseScoreString(updates.score);
+        const previousScoreParsed = game.score ? parseScoreString(game.score) : null;
+        
         if (currentScore) {
           newPeriodScores = calculatePeriodScores(
             currentScore,
             updates.period,
-            game.periodScores || null
+            game.periodScores || null,
+            game.period,
+            previousScoreParsed,
+            periodChanged
           );
           updates.periodScores = newPeriodScores;
         }
@@ -1634,12 +1865,16 @@ export class LiveGamesService {
 
     this.isRunning = true;
     
-    refreshLiveGames().catch((error) => {
-      logger.error({
-        message: 'Error in initial live games fetch',
-        error: error instanceof Error ? error.message : String(error),
+    // Delay initial refresh to prevent connection pool exhaustion during startup
+    // Wait 2 seconds to allow other services to initialize first
+    setTimeout(() => {
+      refreshLiveGames().catch((error) => {
+        logger.error({
+          message: 'Error in initial live games fetch',
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
-    });
+    }, 2000);
 
     this.pollingInterval = setInterval(() => {
       refreshLiveGames().catch((error) => {

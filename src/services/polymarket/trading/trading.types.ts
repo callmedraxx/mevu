@@ -19,7 +19,7 @@ export enum OrderType {
  * Fee configuration
  */
 export const FEE_CONFIG = {
-  RATE: 0.005, // 0.5%
+  RATE: 0.01, // 1%
   WALLET: '0x23895DdD9D2a22215080C0529614e471e1006BDf',
   MAX_RETRIES: 5,
 };
