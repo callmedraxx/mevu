@@ -28,6 +28,76 @@ function isSoccerSport(sport: BallDontLieSport | null): boolean {
 }
 
 /**
+ * Convert a UTC date to the Ball Don't Lie API's expected timezone and extract the date string.
+ * - For US sports (NBA, NFL, MLB, NHL, NCAAF, NCAAB): Use US Eastern timezone
+ * - For European soccer leagues: Use Europe timezone based on league
+ * 
+ * The Ball Don't Lie API uses local dates for the `dates[]` query parameter,
+ * not UTC dates. For example, a game at 2025-12-30T03:30:00Z (UTC) which is
+ * 10:30 PM Eastern on Dec 29 should be queried with date=2025-12-29.
+ * 
+ * @param utcDate - Date object in UTC
+ * @param sport - The sport to determine the appropriate timezone
+ * @returns Date string in YYYY-MM-DD format in the API's expected timezone
+ */
+function convertToApiTimezone(utcDate: Date, sport: string): string {
+  const bdSport = getBalldontlieSport(sport);
+  
+  // Determine timezone based on sport
+  let timezone: string;
+  if (isSoccerSport(bdSport)) {
+    // European soccer leagues use their respective timezones
+    // Most use CET (Central European Time) or GMT
+    switch (bdSport) {
+      case 'epl':
+        timezone = 'Europe/London'; // GMT/BST
+        break;
+      case 'laliga':
+        timezone = 'Europe/Madrid'; // CET/CEST
+        break;
+      case 'seriea':
+        timezone = 'Europe/Rome'; // CET/CEST
+        break;
+      case 'bundesliga':
+        timezone = 'Europe/Berlin'; // CET/CEST
+        break;
+      case 'ligue1':
+        timezone = 'Europe/Paris'; // CET/CEST
+        break;
+      default:
+        timezone = 'Europe/London';
+    }
+  } else {
+    // US sports use Eastern timezone (where most leagues are headquartered)
+    timezone = 'America/New_York';
+  }
+  
+  // Convert UTC to the target timezone and extract date
+  // Using toLocaleDateString with the timezone option
+  const options: Intl.DateTimeFormatOptions = {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  };
+  
+  // Format: MM/DD/YYYY -> convert to YYYY-MM-DD
+  const localeDateStr = utcDate.toLocaleDateString('en-US', options);
+  const [month, day, year] = localeDateStr.split('/');
+  const apiDateStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+  
+  logger.debug({
+    message: 'Converted UTC date to API timezone',
+    utcDate: utcDate.toISOString(),
+    sport,
+    timezone,
+    apiDateStr,
+  });
+  
+  return apiDateStr;
+}
+
+/**
  * Sport mapping from our internal sport names to Ball Don't Lie API sport names
  * Maps CFB → NCAAF and CBB → NCAAB for Ball Don't Lie API compatibility
  * Supported sports: NBA, NFL, MLB, NHL, EPL, NCAAF, NCAAB, Bundesliga, La Liga, Serie A, Ligue 1
@@ -2286,46 +2356,67 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
   }
 
   try {
-    // Extract date from slug (format: sport-away-home-YYYY-MM-DD) or startDate
+    // Extract date for Ball Don't Lie API query
+    // IMPORTANT: The Ball Don't Lie API uses LOCAL dates (US Eastern for US sports,
+    // European timezones for soccer) not UTC dates. We must convert properly.
     let dateStr: string | null = null;
     
-    // Try to extract date from slug first (more reliable)
-    if (game.slug) {
-      const slugParts = game.slug.split('-');
-      // Look for YYYY-MM-DD pattern in slug
+    // Use endDate (game time) as primary source since it's the actual scheduled time
+    if (game.endDate) {
+      const endDate = new Date(game.endDate);
+      // Convert from UTC to the API's expected timezone
+      dateStr = convertToApiTimezone(endDate, game.sport);
+    }
+    
+    // Fallback to slug date if no endDate
+    // The slug date is already in local time (US for US sports), so we can use it directly
+    if (!dateStr && game.slug) {
       const dateMatch = game.slug.match(/(\d{4}-\d{2}-\d{2})/);
       if (dateMatch) {
         dateStr = dateMatch[1];
       }
     }
     
-    // Fallback to startDate if slug doesn't have date
+    // Final fallback to startDate (convert to API timezone)
     if (!dateStr && game.startDate) {
       const startDate = new Date(game.startDate);
-      dateStr = startDate.toISOString().split('T')[0]; // YYYY-MM-DD
+      dateStr = convertToApiTimezone(startDate, game.sport);
     }
     
     if (!dateStr) {
       logger.warn({
-        message: 'Cannot extract date from slug or startDate',
+        message: 'Cannot extract date from slug, endDate, or startDate',
         gameId: game.id,
         slug: game.slug,
         startDate: game.startDate,
+        endDate: game.endDate,
       });
       return null;
     }
 
     logger.info({
-      message: 'Extracted date for game mapping',
+      message: 'Extracted date for game mapping (converted to API timezone)',
       gameId: game.id,
       dateStr,
       slug: game.slug,
       startDate: game.startDate,
+      endDate: game.endDate,
+      sport: game.sport,
     });
 
     // Get games/matches for that date
     const bdSport = getBalldontlieSport(game.sport);
     let balldontlieGames = await ballDontLieClient.getGamesByDate(game.sport, dateStr);
+    
+    // If no games found, this might be a timezone edge case or the game isn't scheduled yet
+    if (balldontlieGames.length === 0) {
+      logger.info({
+        message: 'No games found for converted date',
+        gameId: game.id,
+        dateStr,
+        sport: game.sport,
+      });
+    }
     
     // Soccer leagues return matches with kickoff timestamp - filter by exact date if needed
     if (isSoccerSport(bdSport) && dateStr && balldontlieGames.length > 0) {
@@ -2841,7 +2932,7 @@ export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
     try {
       const recentStats = await client.query(
         `SELECT COUNT(*) as count FROM game_player_stats 
-         WHERE game_id = $1 AND stats_updated_at > NOW() - INTERVAL '5 minutes'`,
+         WHERE game_id = $1 AND stats_updated_at > NOW() - INTERVAL '10 seconds'`,
         [game.id]
       );
 

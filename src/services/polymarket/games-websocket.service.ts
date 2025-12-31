@@ -313,6 +313,20 @@ export class GamesWebSocketService {
   }
 
   /**
+   * Broadcast pre-transformed frontend game to all connected clients (ultra-fast path)
+   * This skips the transformation step entirely for maximum speed
+   */
+  broadcastFrontendGame(frontendGame: FrontendGame, type: 'price_update' | 'game_update' = 'price_update'): void {
+    if (this.clients.size === 0) return;
+
+    this.broadcast({
+      type: type as any,
+      game: frontendGame,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
    * Send message to a specific client
    */
   private sendToClient(ws: WebSocket, message: WSMessage): void {

@@ -411,6 +411,42 @@ export class ActivityWatcherWebSocketService {
   }
 
   /**
+   * Broadcast pre-transformed activity watcher game to subscribed clients (ultra-fast path)
+   * This skips the transformation step entirely for maximum speed
+   */
+  broadcastActivityWatcherGame(game: ActivityWatcherGame): void {
+    if (this.slugClients.size === 0) {
+      return;
+    }
+
+    // Find all slugs that match this game
+    const matchingSlugs: string[] = [];
+    if (game.slug) matchingSlugs.push(game.slug.toLowerCase());
+    matchingSlugs.push(game.id.toLowerCase());
+
+    const data = JSON.stringify({
+      type: 'game_update',
+      game,
+      timestamp: new Date().toISOString(),
+    });
+
+    for (const slug of matchingSlugs) {
+      const clients = this.slugClients.get(slug);
+      if (!clients || clients.size === 0) continue;
+
+      for (const client of clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(data, { compress: false });
+          } catch (error) {
+            this.unsubscribeClient(client);
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * Send message to a specific client
    */
   private sendToClient(ws: WebSocket, message: WSMessage): void {

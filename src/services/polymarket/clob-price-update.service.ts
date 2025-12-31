@@ -12,6 +12,18 @@ import { gamesWebSocketService } from './games-websocket.service';
 import { activityWatcherWebSocketService } from './activity-watcher-websocket.service';
 import { positionsWebSocketService } from '../positions/positions-websocket.service';
 import { pool } from '../../config/database';
+import { transformToFrontendGame, FrontendGame } from './frontend-game.transformer';
+import { transformToActivityWatcherGame, ActivityWatcherGame } from './activity-watcher.transformer';
+
+// Cache for probability changes per game (avoids DB lookup during hot path)
+interface CachedProbabilityChange {
+  homePercentChange: number;
+  awayPercentChange: number;
+  timestamp: number;
+}
+
+// Long TTL for cached probability changes (5 minutes) since historical data doesn't change rapidly
+const PROB_CHANGE_CACHE_TTL = 5 * 60 * 1000;
 
 // Map asset_id -> game/market info for quick lookup
 interface AssetGameMapping {
@@ -29,8 +41,11 @@ export class ClobPriceUpdateService {
   // Write queue for batching database updates
   private pendingWrites: Map<string, { markets: any[]; timestamp: Date }> = new Map();
   private writeFlushTimer: NodeJS.Timeout | null = null;
-  private writeFlushInterval: number = 500; // Flush every 500ms
+  private writeFlushInterval: number = 100; // Flush every 100ms for faster DB persistence
   private isFlushingWrites: boolean = false;
+
+  // Cache for probability changes per game (avoids DB lookup during hot path broadcasts)
+  private probabilityChangeCache: Map<string, CachedProbabilityChange> = new Map();
 
   /**
    * Initialize the service and start subscribing to price updates
@@ -62,18 +77,42 @@ export class ClobPriceUpdateService {
     // Set up price change handler
     this.setupPriceChangeHandler();
 
+    // Wait for games to be loaded from database/API before subscribing
+    // The live games service starts with a 2-second delay, so we wait 5 seconds
+    // to ensure games are available
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
     // Subscribe to all games
     await this.subscribeToAllGames();
 
-    // Set up periodic re-subscription check (every 5 minutes)
-    this.subscriptionCheckInterval = setInterval(() => {
+    // Set up aggressive initial re-subscription (10 seconds) to catch any games
+    // that may not have been loaded yet, then switch to 5-minute interval
+    let initialResubscribeCount = 0;
+    const initialInterval = setInterval(() => {
+      initialResubscribeCount++;
       this.subscribeToAllGames().catch((error) => {
         logger.error({
-          message: 'Error in periodic subscription check',
+          message: 'Error in initial subscription check',
           error: error instanceof Error ? error.message : String(error),
         });
       });
-    }, 5 * 60 * 1000);
+      
+      // After 3 initial checks (30 seconds total), switch to 5-minute interval
+      if (initialResubscribeCount >= 3) {
+        clearInterval(initialInterval);
+        logger.info({ message: 'Initial CLOB subscription checks complete, switching to 5-minute interval' });
+        
+        // Set up regular periodic re-subscription check (every 5 minutes)
+        this.subscriptionCheckInterval = setInterval(() => {
+          this.subscribeToAllGames().catch((error) => {
+            logger.error({
+              message: 'Error in periodic subscription check',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }, 5 * 60 * 1000);
+      }
+    }, 10 * 1000); // Every 10 seconds initially
 
     logger.info({ message: 'CLOB price update service initialized' });
   }
@@ -235,17 +274,26 @@ export class ClobPriceUpdateService {
         const updatedGame = { ...game, markets: updatedMarkets, updatedAt: new Date() };
         updateGameInCache(gameId, updatedGame);
 
-        // Broadcast to frontend WebSocket immediately
-        await gamesWebSocketService.broadcastPriceUpdate(updatedGame);
+        // Get cached probability change or use defaults (skip DB lookup)
+        const cachedProbChange = this.getCachedProbabilityChange(gameId);
         
-        // Also broadcast to activity watcher WebSocket
-        await activityWatcherWebSocketService.broadcastGameUpdate(updatedGame);
+        // Pre-transform ONCE for both broadcasts (avoid double transformation)
+        // Pass cached historical change to skip DB lookup in transformer
+        const frontendGame = await transformToFrontendGame(updatedGame, cachedProbChange);
+        
+        // Transform for activity watcher (simplified version)
+        const activityWatcherGame = await transformToActivityWatcherGame(updatedGame);
+
+        // Broadcast to BOTH WebSockets in parallel using fire-and-forget (no await)
+        // These are synchronous sends after transformation - ultra low latency
+        gamesWebSocketService.broadcastFrontendGame(frontendGame, 'price_update');
+        activityWatcherWebSocketService.broadcastActivityWatcherGame(activityWatcherGame);
 
         // Queue database write (batched to reduce connection pressure)
         this.queueDatabaseWrite(gameId, updatedMarkets);
 
         logger.debug({
-          message: 'Game prices updated and broadcast',
+          message: 'Game prices updated and broadcast (optimized path)',
           gameId,
           updatesApplied: updates.size,
         });
@@ -257,6 +305,34 @@ export class ClobPriceUpdateService {
         });
       }
     }
+  }
+
+  /**
+   * Get cached probability change for a game, or return defaults
+   * This avoids DB lookups during the hot price update path
+   */
+  private getCachedProbabilityChange(gameId: string): { homePercentChange: number; awayPercentChange: number } | undefined {
+    const cached = this.probabilityChangeCache.get(gameId);
+    if (cached && (Date.now() - cached.timestamp) < PROB_CHANGE_CACHE_TTL) {
+      return {
+        homePercentChange: cached.homePercentChange,
+        awayPercentChange: cached.awayPercentChange,
+      };
+    }
+    // Return undefined to use default (0) in transformer - will be updated async
+    return undefined;
+  }
+
+  /**
+   * Update the probability change cache for a game
+   * Called by background processes that can afford DB lookups
+   */
+  updateProbabilityChangeCache(gameId: string, homePercentChange: number, awayPercentChange: number): void {
+    this.probabilityChangeCache.set(gameId, {
+      homePercentChange,
+      awayPercentChange,
+      timestamp: Date.now(),
+    });
   }
 
   /**
