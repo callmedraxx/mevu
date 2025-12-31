@@ -478,6 +478,12 @@ import {
   redeemAllPositions,
 } from '../services/polymarket/trading/redemption.service';
 
+import {
+  withdrawUsdc,
+  getWithdrawalHistory,
+  WithdrawalRequest,
+} from '../services/polymarket/trading/withdrawal.service';
+
 /**
  * @swagger
  * /api/trading/redeem/available:
@@ -748,6 +754,280 @@ router.post('/redeem/all', async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       message: error instanceof Error ? error.message : 'Internal server error',
+    });
+  }
+});
+
+// ==================== WITHDRAWAL ENDPOINTS ====================
+
+/**
+ * @swagger
+ * /api/trading/withdraw:
+ *   post:
+ *     summary: Withdraw USDC.e from proxy wallet
+ *     description: |
+ *       Withdraw USDC.e from the user's proxy wallet to any wallet address on the Polygon POS network.
+ *       Uses gasless transactions via RelayerClient - the transaction is signed by the user's Privy embedded wallet.
+ *       
+ *       **Important notes:**
+ *       - The destination address must be a valid Ethereum/Polygon address
+ *       - Amount is in USDC (e.g., "10.5" = 10.5 USDC)
+ *       - USDC uses 6 decimals
+ *       - The user must have sufficient USDC.e balance in their proxy wallet
+ *       - Transaction is gasless (Polymarket relayer pays for gas)
+ *     tags: [Trading]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - privyUserId
+ *               - toAddress
+ *               - amountUsdc
+ *             properties:
+ *               privyUserId:
+ *                 type: string
+ *                 description: User's Privy ID
+ *                 example: "did:privy:cmj921f4201dql40c3nubss93"
+ *               toAddress:
+ *                 type: string
+ *                 description: Destination wallet address on Polygon
+ *                 example: "0x742d35Cc6634C0532925a3b844Bc9e7595f4E0d3"
+ *               amountUsdc:
+ *                 type: string
+ *                 description: Amount of USDC.e to withdraw (e.g., "10.5")
+ *                 example: "10.5"
+ *     responses:
+ *       200:
+ *         description: Withdrawal successful
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 transactionHash:
+ *                   type: string
+ *                   description: Transaction hash on Polygon
+ *                   example: "0x1234567890abcdef..."
+ *                 fromAddress:
+ *                   type: string
+ *                   description: User's proxy wallet address
+ *                   example: "0xabc123..."
+ *                 toAddress:
+ *                   type: string
+ *                   description: Destination address
+ *                   example: "0x742d35Cc6634C0532925a3b844Bc9e7595f4E0d3"
+ *                 amountUsdc:
+ *                   type: string
+ *                   description: Amount withdrawn
+ *                   example: "10.5"
+ *       400:
+ *         description: Invalid request (missing fields, invalid address, or insufficient balance)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Invalid destination address format"
+ *       404:
+ *         description: User not found or no proxy wallet
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "User not found"
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ */
+router.post('/withdraw', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId, toAddress, amountUsdc } = req.body;
+
+    // Validate required fields
+    if (!privyUserId) {
+      return res.status(400).json({
+        success: false,
+        error: 'privyUserId is required',
+      });
+    }
+
+    if (!toAddress) {
+      return res.status(400).json({
+        success: false,
+        error: 'toAddress is required',
+      });
+    }
+
+    if (!amountUsdc) {
+      return res.status(400).json({
+        success: false,
+        error: 'amountUsdc is required',
+      });
+    }
+
+    logger.info({
+      message: 'Withdrawal request received',
+      privyUserId,
+      toAddress,
+      amountUsdc,
+    });
+
+    const request: WithdrawalRequest = {
+      privyUserId: String(privyUserId),
+      toAddress: String(toAddress),
+      amountUsdc: String(amountUsdc),
+    };
+
+    const result = await withdrawUsdc(request);
+
+    if (!result.success) {
+      // Determine appropriate status code based on error
+      const statusCode = result.error?.includes('not found') ? 404 : 400;
+      return res.status(statusCode).json(result);
+    }
+
+    return res.status(200).json(result);
+  } catch (error) {
+    logger.error({
+      message: 'Error in withdrawal endpoint',
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Internal server error',
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/trading/withdraw/history:
+ *   get:
+ *     summary: Get withdrawal history for a user
+ *     description: Retrieve the history of USDC.e withdrawals for a user
+ *     tags: [Trading]
+ *     parameters:
+ *       - in: query
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User's Privy ID
+ *         example: "did:privy:cmj921f4201dql40c3nubss93"
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 50
+ *           minimum: 1
+ *           maximum: 100
+ *         description: Maximum number of withdrawals to return
+ *     responses:
+ *       200:
+ *         description: Withdrawal history retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 withdrawals:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                         format: uuid
+ *                       fromAddress:
+ *                         type: string
+ *                         description: User's proxy wallet address
+ *                       toAddress:
+ *                         type: string
+ *                         description: Destination address
+ *                       amountUsdc:
+ *                         type: string
+ *                         description: Amount withdrawn
+ *                       transactionHash:
+ *                         type: string
+ *                         description: Transaction hash on Polygon
+ *                       status:
+ *                         type: string
+ *                         enum: [PENDING, SUCCESS, FAILED]
+ *                       error:
+ *                         type: string
+ *                         nullable: true
+ *                         description: Error message if status is FAILED
+ *                       createdAt:
+ *                         type: string
+ *                         format: date-time
+ *                 total:
+ *                   type: integer
+ *                   description: Number of withdrawals returned
+ *       400:
+ *         description: Missing privyUserId
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/withdraw/history', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId, limit } = req.query;
+
+    if (!privyUserId) {
+      return res.status(400).json({
+        success: false,
+        error: 'privyUserId is required',
+      });
+    }
+
+    const parsedLimit = limit ? Math.min(Math.max(parseInt(String(limit), 10), 1), 100) : 50;
+    const withdrawals = await getWithdrawalHistory(String(privyUserId), parsedLimit);
+
+    return res.status(200).json({
+      success: true,
+      withdrawals,
+      total: withdrawals.length,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error in withdrawal history endpoint',
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Internal server error',
     });
   }
 });

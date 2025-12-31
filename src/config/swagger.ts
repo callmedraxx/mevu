@@ -59,7 +59,7 @@ const swaggerDefinition: SwaggerDefinition = {
     },
     {
       name: 'Trading',
-      description: 'Buy and sell markets on Polymarket CLOB with gasless transactions',
+      description: 'Buy and sell markets on Polymarket CLOB with gasless transactions. Also includes USDC.e withdrawal functionality.',
     },
     {
       name: 'Positions',
