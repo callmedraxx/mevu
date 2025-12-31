@@ -65,6 +65,10 @@ const swaggerDefinition: SwaggerDefinition = {
       name: 'Positions',
       description: 'User positions and portfolio tracking endpoints',
     },
+    {
+      name: 'PlayByPlay',
+      description: 'Live play-by-play data for games. Supports NBA, NFL, NHL, NCAAF, NCAAB (plays) and EPL, La Liga, Serie A, Bundesliga, Ligue 1 (match events)',
+    },
   ],
   components: {
     schemas: {

@@ -14,6 +14,7 @@ import tradingRouter from './trading';
 import positionsRouter from './positions';
 import webhooksRouter from './webhooks';
 import priceHistoryRouter from './price-history';
+import playByPlayRouter from './playbyplay';
 
 const router = Router();
 
@@ -85,5 +86,8 @@ router.use('/webhooks', webhooksRouter);
 
 // Price history routes (CLOB price history)
 router.use('/price-history', priceHistoryRouter);
+
+// Play-by-play routes (live game events from Ball Don't Lie)
+router.use('/playbyplay', playByPlayRouter);
 
 export default router;
