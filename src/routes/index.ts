@@ -15,6 +15,7 @@ import positionsRouter from './positions';
 import webhooksRouter from './webhooks';
 import priceHistoryRouter from './price-history';
 import playByPlayRouter from './playbyplay';
+import whaleProfileRouter from './whale-profile';
 
 const router = Router();
 
@@ -89,5 +90,8 @@ router.use('/price-history', priceHistoryRouter);
 
 // Play-by-play routes (live game events from Ball Don't Lie)
 router.use('/playbyplay', playByPlayRouter);
+
+// Whale profile routes (whale trading data from Polymarket)
+router.use('/whale-profile', whaleProfileRouter);
 
 export default router;

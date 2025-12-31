@@ -69,6 +69,10 @@ const swaggerDefinition: SwaggerDefinition = {
       name: 'PlayByPlay',
       description: 'Live play-by-play data for games. Supports NBA, NFL, NHL, NCAAF, NCAAB (plays) and EPL, La Liga, Serie A, Bundesliga, Ligue 1 (match events)',
     },
+    {
+      name: 'WhaleProfile',
+      description: 'Whale trader profile data from Polymarket. Get stats, positions, trades, and charts for any wallet.',
+    },
   ],
   components: {
     schemas: {
