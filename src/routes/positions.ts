@@ -12,6 +12,11 @@ import {
   refreshPositions,
 } from '../services/positions/positions.service';
 import { PositionsQueryParams } from '../services/positions/positions.types';
+import {
+  calculatePnLSnapshot,
+  getHistoricalPnL,
+  updatePnLSnapshot,
+} from '../services/positions/pnl-tracking.service';
 
 const router = Router();
 
@@ -233,14 +238,20 @@ router.get('/:privyUserId/portfolio', async (req: Request, res: Response) => {
   try {
     const { privyUserId } = req.params;
 
+    // Get comprehensive P&L snapshot (includes realized + unrealized)
+    const pnlSnapshot = await calculatePnLSnapshot(privyUserId);
+    
+    // Also get portfolio summary for backward compatibility
     const summary = await getPortfolioSummary(privyUserId);
 
     res.json({
       success: true,
       portfolio: summary.portfolio,
       totalPositions: summary.totalPositions,
-      totalPnl: summary.totalPnl,
-      totalPercentPnl: summary.totalPercentPnl,
+      totalPnl: pnlSnapshot.totalPnl,
+      realizedPnl: pnlSnapshot.realizedPnl,
+      unrealizedPnl: pnlSnapshot.unrealizedPnl,
+      totalPercentPnl: pnlSnapshot.totalPercentPnl,
     });
   } catch (error) {
     logger.error({
@@ -357,6 +368,152 @@ router.get('/portfolio/:privyUserId/stream', async (req: Request, res: Response)
       remainingClients: clients?.size || 0,
     });
   });
+});
+
+/**
+ * @swagger
+ * /api/positions/{privyUserId}/pnl/history:
+ *   get:
+ *     summary: Get historical P&L data for charting
+ *     description: |
+ *       Returns historical P&L snapshots for charting overall profit/loss over time.
+ *       Includes both realized and unrealized P&L.
+ *     tags: [Positions]
+ *     parameters:
+ *       - in: path
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: The Privy user ID
+ *       - in: query
+ *         name: days
+ *         schema:
+ *           type: integer
+ *           default: 30
+ *           minimum: 1
+ *           maximum: 365
+ *         description: Number of days to look back
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 100
+ *           minimum: 1
+ *           maximum: 1000
+ *         description: Maximum number of data points to return
+ *     responses:
+ *       200:
+ *         description: Historical P&L data retrieved successfully
+ */
+router.get('/:privyUserId/pnl/history', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId } = req.params;
+    const days = req.query.days ? parseInt(String(req.query.days), 10) : 30;
+    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 100;
+
+    const historicalData = await getHistoricalPnL(privyUserId, {
+      days: Math.min(Math.max(days, 1), 365),
+      limit: Math.min(Math.max(limit, 1), 1000),
+    });
+
+    res.json({
+      success: true,
+      data: historicalData,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching historical P&L',
+      privyUserId: req.params.privyUserId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Internal server error',
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/positions/{privyUserId}/pnl/current:
+ *   get:
+ *     summary: Get current P&L snapshot
+ *     description: Returns current comprehensive P&L data (realized + unrealized)
+ *     tags: [Positions]
+ */
+router.get('/:privyUserId/pnl/current', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId } = req.params;
+
+    const snapshot = await calculatePnLSnapshot(privyUserId);
+
+    res.json({
+      success: true,
+      totalPnl: snapshot.totalPnl,
+      realizedPnl: snapshot.realizedPnl,
+      unrealizedPnl: snapshot.unrealizedPnl,
+      portfolioValue: snapshot.portfolioValue,
+      usdcBalance: snapshot.usdcBalance,
+      totalValue: snapshot.totalValue,
+      totalPercentPnl: snapshot.totalPercentPnl,
+      // Additional tracking fields
+      estimatedDeposits: snapshot.estimatedDeposits,
+      externalWithdrawals: snapshot.externalWithdrawals,
+      tradingIn: snapshot.tradingIn,
+      tradingOut: snapshot.tradingOut,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching current P&L',
+      privyUserId: req.params.privyUserId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Internal server error',
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/positions/{privyUserId}/pnl/update:
+ *   post:
+ *     summary: Update P&L snapshot (store current state)
+ *     description: Calculates and stores current P&L snapshot for historical tracking
+ *     tags: [Positions]
+ */
+router.post('/:privyUserId/pnl/update', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId } = req.params;
+
+    const snapshot = await updatePnLSnapshot(privyUserId);
+
+    res.json({
+      success: true,
+      message: 'P&L snapshot updated',
+      snapshot: {
+        totalPnl: snapshot.totalPnl,
+        realizedPnl: snapshot.realizedPnl,
+        unrealizedPnl: snapshot.unrealizedPnl,
+        snapshotAt: snapshot.snapshotAt,
+      },
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error updating P&L snapshot',
+      privyUserId: req.params.privyUserId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Internal server error',
+    });
+  }
 });
 
 export default router;

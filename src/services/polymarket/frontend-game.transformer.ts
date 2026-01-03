@@ -323,13 +323,13 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     // Check if this is a "Will X win?" market
     if (question.includes('will') && question.includes('win')) {
       // Prefer raw outcomePrices as they're more reliable
-      let yesPrice = 0;
+      let yesPrice: number | null = null; // Use null to indicate "not found"
       
       if (market.outcomes && market.outcomePrices) {
         const rawOutcomes = market.outcomes as string[];
         const rawPrices = market.outcomePrices as string[];
         const yesIndex = rawOutcomes.findIndex(o => o.toLowerCase() === 'yes');
-        if (yesIndex !== -1 && rawPrices[yesIndex]) {
+        if (yesIndex !== -1 && rawPrices[yesIndex] !== undefined) {
           yesPrice = parseFloat(rawPrices[yesIndex]) * 100; // Convert 0.365 to 36.5
         }
       } else {
@@ -343,7 +343,9 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
         }
       }
       
-      if (yesPrice > 0) {
+      // Check if we actually found a valid price (including 0% which is valid for a losing team)
+      // yesPrice !== null means we found the market, even if the price is 0%
+      if (yesPrice !== null && !isNaN(yesPrice)) {
         // Check if this market is for home team
         if (homeTeamName && question.includes(homeTeamName)) {
           homeWinMarket = { price: yesPrice };
@@ -392,17 +394,34 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     
     if (!outcomes || outcomes.length !== 2) continue;
     
-    // Check if this is a team vs team market (not Over/Under)
+    // Check if this is a team vs team market (not Over/Under, Spread, etc.)
     const labels = outcomes.map((o: any) => String(o.label || '').toLowerCase());
+    const questionLower = (market.question || '').toLowerCase();
     
-    // Skip Over/Under, Points, Rebounds, etc.
+    // Skip non-moneyline markets based on question content
+    const isSpreadMarket = questionLower.includes('spread') || 
+                           questionLower.includes('(-') || 
+                           questionLower.includes('(+') ||
+                           questionLower.includes('handicap');
+    const isTotalsMarket = questionLower.includes('o/u') || 
+                           questionLower.includes('over/under') ||
+                           questionLower.includes('total');
+    const isPropsMarket = questionLower.includes('both teams') ||
+                          questionLower.includes('first goal') ||
+                          questionLower.includes('clean sheet') ||
+                          questionLower.includes('corner') ||
+                          questionLower.includes('card');
+    
+    // Skip Over/Under outcomes, Points, Rebounds, etc.
     // Use exact match or word boundary to avoid false positives (e.g., "thunder" contains "under")
-    const shouldSkip = labels.some(l => 
+    const hasNonMoneylineOutcomes = labels.some(l => 
       l === 'over' || l === 'under' || l === 'o/u' ||
       l.startsWith('over ') || l.startsWith('under ') ||
       l.endsWith(' over') || l.endsWith(' under') ||
       l.includes('points') || l.includes('rebounds') || l.includes('assists')
     );
+    
+    const shouldSkip = isSpreadMarket || isTotalsMarket || isPropsMarket || hasNonMoneylineOutcomes;
     
     // Debug logging for specific game
     if (game.id === '117348') {
@@ -470,75 +489,16 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       }
     }
     
-    // If we found both teams, return
+    // If we found both teams, return - this is the only valid moneyline match
     if (homeOutcome && awayOutcome) {
       return { home: homeOutcome, away: awayOutcome };
     }
     
-    // Fallback: if this looks like a team market (2 outcomes, both have team-like names)
-    // Use title or market question to determine order: "Away vs Home" or "Away @ Home"
-    if (outcomes.length === 2 && !labels.some(l => l.includes('yes') || l.includes('no'))) {
-      const o1 = outcomes[0];
-      const o2 = outcomes[1];
-      
-      // Use title or market question to determine order
-      const titleLower = (game.title || market.question || '').toLowerCase();
-      const o1Label = String(o1.label || '').toLowerCase();
-      const o2Label = String(o2.label || '').toLowerCase();
-      
-      // Try to find team names in title/question (more flexible matching)
-      let o1Pos = titleLower.indexOf(o1Label);
-      let o2Pos = titleLower.indexOf(o2Label);
-      
-      // If exact match fails, try matching key words (team name parts)
-      if (o1Pos === -1) {
-        const o1Words = o1Label.split(/\s+/).filter((w: string) => w.length > 3);
-        for (const word of o1Words) {
-          const pos = titleLower.indexOf(word);
-          if (pos !== -1) {
-            o1Pos = pos;
-            break;
-          }
-        }
-      }
-      
-      if (o2Pos === -1) {
-        const o2Words = o2Label.split(/\s+/).filter((w: string) => w.length > 3);
-        for (const word of o2Words) {
-          const pos = titleLower.indexOf(word);
-          if (pos !== -1) {
-            o2Pos = pos;
-            break;
-          }
-        }
-      }
-      
-      // If we found both teams in title, determine order
-      if (o1Pos !== -1 && o2Pos !== -1) {
-        if (o1Pos < o2Pos) {
-          // o1 is away (appears first), o2 is home (appears second)
-          awayOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice, sellPrice: o1.sellPrice };
-          homeOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice, sellPrice: o2.sellPrice };
-        } else {
-          // o2 is away (appears first), o1 is home (appears second)
-          awayOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice, sellPrice: o2.sellPrice };
-          homeOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice, sellPrice: o1.sellPrice };
-        }
-        return { home: homeOutcome, away: awayOutcome };
-      }
-      
-      // Last resort: if market question matches game title exactly, assume standard order
-      // Most markets follow "Away vs Home" format
-      if (market.question && game.title && 
-          market.question.toLowerCase() === game.title.toLowerCase()) {
-        // Standard format: first outcome is away, second is home
-        awayOutcome = { label: o1.label, price: parseFloat(String(o1.price || '50')), buyPrice: o1.buyPrice, sellPrice: o1.sellPrice };
-        homeOutcome = { label: o2.label, price: parseFloat(String(o2.price || '50')), buyPrice: o2.buyPrice, sellPrice: o2.sellPrice };
-        return { home: homeOutcome, away: awayOutcome };
-      }
-    }
+    // NO FALLBACKS - if we can't match both teams explicitly, this is not a moneyline market
+    // Continue to next market
   }
   
+  // No moneyline market found - return null (no fallbacks to spread/totals markets)
   return { home: null, away: null };
 }
 

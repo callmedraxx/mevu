@@ -416,10 +416,56 @@ async function fetchWNBAPlays(gameId: number): Promise<NormalizedPlay[]> {
 // ==================== Soccer Match Events ====================
 
 /**
- * Fetch match events for soccer game
- * Works for: EPL, La Liga, Serie A, Bundesliga, Ligue 1
+ * Fetch EPL goals using the /games/{id}/goals endpoint
+ * EPL uses a different API structure than other soccer leagues
  */
-async function fetchSoccerEvents(sport: string, matchId: number): Promise<NormalizedEvent[]> {
+async function fetchEPLGoals(matchId: number): Promise<NormalizedEvent[]> {
+  const apiKey = getApiKey();
+  
+  const response = await axios.get(`${BALLDONTLIE_BASE_URL}/epl/v1/games/${matchId}/goals`, {
+    headers: { Authorization: apiKey },
+  });
+
+  const goals = response.data?.data || [];
+  
+  return goals.map((goal: any, index: number) => {
+    const scorerName = goal.scorer 
+      ? `${goal.scorer.first_name || ''} ${goal.scorer.last_name || ''}`.trim()
+      : 'Unknown';
+    const assisterName = goal.assister
+      ? `${goal.assister.first_name || ''} ${goal.assister.last_name || ''}`.trim()
+      : undefined;
+    
+    // Determine period from phase (FirstHalf = 1, SecondHalf = 2)
+    const period = goal.phase === 'FirstHalf' ? 1 : 2;
+    
+    // Build description
+    const assistText = assisterName ? ` - Assist: ${assisterName}` : '';
+    const goalTypeText = goal.type === 'OwnGoal' ? ' (own goal)' : 
+                         goal.type === 'Penalty' ? ' (pen)' : '';
+    const description = `${goal.clock_display || goal.clock + "'"} ⚽ GOAL! ${scorerName}${goalTypeText}${assistText}`;
+    
+    return {
+      id: goal.game_id * 1000 + index, // Generate unique ID
+      eventType: goal.type?.toLowerCase() === 'owngoal' ? 'own_goal' : 
+                 goal.type?.toLowerCase() === 'penalty' ? 'penalty' : 'goal',
+      eventTime: goal.clock,
+      period,
+      teamId: undefined, // EPL goals don't include team_id directly
+      playerName: scorerName,
+      secondaryPlayerName: assisterName,
+      goalType: goal.type,
+      cardType: null,
+      description,
+    };
+  });
+}
+
+/**
+ * Fetch match events for other soccer leagues (La Liga, Serie A, Bundesliga, Ligue 1)
+ * Uses /match_events endpoint
+ */
+async function fetchOtherSoccerEvents(sport: string, matchId: number): Promise<NormalizedEvent[]> {
   const apiKey = getApiKey();
   const apiSport = normalizeSport(sport);
   
@@ -446,6 +492,23 @@ async function fetchSoccerEvents(sport: string, matchId: number): Promise<Normal
     cardType: event.card_type,
     description: formatSoccerEventDescription(event),
   }));
+}
+
+/**
+ * Fetch match events for soccer game
+ * Works for: EPL, La Liga, Serie A, Bundesliga, Ligue 1
+ * Note: EPL uses a different endpoint (/games/{id}/goals) than other leagues (/match_events)
+ */
+async function fetchSoccerEvents(sport: string, matchId: number): Promise<NormalizedEvent[]> {
+  const apiSport = normalizeSport(sport);
+  
+  // EPL uses a different API structure - only has /goals endpoint
+  if (apiSport === 'epl') {
+    return fetchEPLGoals(matchId);
+  }
+  
+  // Other soccer leagues use /match_events
+  return fetchOtherSoccerEvents(sport, matchId);
 }
 
 /**
