@@ -807,8 +807,11 @@ export async function transformToFrontendGame(
     }
   }
   
-  // Get endDate - use endDate if available, fall back to startDate
-  const endDateStr = game.endDate || game.startDate || '';
+  // Get the game date for display - prefer gameStartTime (actual game time) over endDate (market close time)
+  // This fixes the issue where games show the wrong date due to endDate being in UTC next day
+  // e.g., gameStartTime "2026-01-04 01:00:00+00" = 8PM EST Jan 3, but endDate "2026-01-04T05:00:00Z" shows as Jan 4
+  const gameStartTime = game.gameStartTime || (game.markets?.[0] as any)?.gameStartTime;
+  const endDateStr = gameStartTime || game.endDate || game.startDate || '';
   
   // Generate mock traders count (seeded by game id for consistency)
   const seedNum = game.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
@@ -878,9 +881,10 @@ export async function transformToFrontendGames(games: LiveGame[]): Promise<Front
         error: error instanceof Error ? error.message : String(error),
       });
       // Return a minimal valid game on error
+      const fallbackGameStart = game.gameStartTime || (game.markets?.[0] as any)?.gameStartTime;
       results.push({
         id: game.id,
-        endDate: game.endDate || game.startDate || '',
+        endDate: fallbackGameStart || game.endDate || game.startDate || '',
         time: 'TBD',
         volume: '$0',
         awayTeam: { abbr: 'AWY', name: 'Away', record: '0-0', probability: 50, buyPrice: 50, sellPrice: 50 },

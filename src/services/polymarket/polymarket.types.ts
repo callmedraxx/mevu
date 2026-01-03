@@ -13,6 +13,7 @@ export interface PolymarketMarket {
   resolutionSource?: string;
   endDate?: string;
   startDate?: string;
+  gameStartTime?: string; // Actual game start time from Polymarket (e.g., "2026-01-04 01:00:00+00")
   image?: string;
   icon?: string;
   description?: string;
@@ -218,6 +219,7 @@ export interface TransformedMarket {
   clobTokenIds?: string[]; // Token IDs for trading
   endDate?: string;
   startDate?: string;
+  gameStartTime?: string; // Actual game start time from Polymarket
   lastTradePrice?: number;
   bestBid?: number;
   bestAsk?: number;
@@ -262,6 +264,7 @@ export interface TransformedEvent {
   tags?: TransformedTag[];
   startDate?: string;
   endDate?: string;
+  gameStartTime?: string; // Actual game start time (from first market's gameStartTime)
   createdAt?: string;
   updatedAt?: string;
   hasGroupItems?: boolean; // Indicates if event has group items
