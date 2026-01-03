@@ -481,7 +481,11 @@ import {
 import {
   withdrawUsdc,
   getWithdrawalHistory,
+  createWithdrawalIntent,
+  executeWithdrawalWithAuth,
   WithdrawalRequest,
+  WithdrawalIntentRequest,
+  ExecuteWithdrawalRequest,
 } from '../services/polymarket/trading/withdrawal.service';
 
 /**
@@ -762,19 +766,20 @@ router.post('/redeem/all', async (req: Request, res: Response) => {
 
 /**
  * @swagger
- * /api/trading/withdraw:
+ * /api/trading/withdraw/intent:
  *   post:
- *     summary: Withdraw USDC.e from proxy wallet
+ *     summary: Create a withdrawal intent (Step 1)
  *     description: |
- *       Withdraw USDC.e from the user's proxy wallet to any wallet address on the Polygon POS network.
- *       Uses gasless transactions via RelayerClient - the transaction is signed by the user's Privy embedded wallet.
+ *       First step of the secure two-step withdrawal flow.
+ *       Creates a withdrawal intent and returns a nonce that must be used with JWT verification to execute the withdrawal.
+ *       
+ *       **Flow:**
+ *       1. Call this endpoint to create an intent and get a nonce
+ *       2. Call /api/trading/withdraw with the nonce and user JWT to execute
  *       
  *       **Important notes:**
- *       - The destination address must be a valid Ethereum/Polygon address
- *       - Amount is in USDC (e.g., "10.5" = 10.5 USDC)
- *       - USDC uses 6 decimals
- *       - The user must have sufficient USDC.e balance in their proxy wallet
- *       - Transaction is gasless (Polymarket relayer pays for gas)
+ *       - Intent expires after 5 minutes
+ *       - Nonce can only be used once
  *     tags: [Trading]
  *     requestBody:
  *       required: true
@@ -801,6 +806,139 @@ router.post('/redeem/all', async (req: Request, res: Response) => {
  *                 example: "10.5"
  *     responses:
  *       200:
+ *         description: Intent created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 nonce:
+ *                   type: string
+ *                   description: Unique nonce to use for executing the withdrawal
+ *                   example: "a1b2c3d4e5f6..."
+ *       400:
+ *         description: Invalid request
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 message:
+ *                   type: string
+ *                   example: "Invalid destination address format"
+ *       500:
+ *         description: Internal server error
+ */
+router.post('/withdraw/intent', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId, toAddress, amountUsdc } = req.body;
+
+    // Validate required fields
+    if (!privyUserId) {
+      return res.status(400).json({
+        success: false,
+        message: 'privyUserId is required',
+      });
+    }
+
+    if (!toAddress) {
+      return res.status(400).json({
+        success: false,
+        message: 'toAddress is required',
+      });
+    }
+
+    if (!amountUsdc) {
+      return res.status(400).json({
+        success: false,
+        message: 'amountUsdc is required',
+      });
+    }
+
+    logger.info({
+      message: 'Withdrawal intent request received',
+      privyUserId,
+      toAddress,
+      amountUsdc,
+    });
+
+    const request: WithdrawalIntentRequest = {
+      privyUserId: String(privyUserId),
+      toAddress: String(toAddress),
+      amountUsdc: String(amountUsdc),
+    };
+
+    const result = await createWithdrawalIntent(request);
+
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+
+    return res.status(200).json(result);
+  } catch (error) {
+    logger.error({
+      message: 'Error in withdrawal intent endpoint',
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: error instanceof Error ? error.message : 'Internal server error',
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/trading/withdraw:
+ *   post:
+ *     summary: Execute withdrawal with JWT authorization (Step 2)
+ *     description: |
+ *       Second step of the secure two-step withdrawal flow.
+ *       Executes the withdrawal after verifying the nonce and user JWT.
+ *       
+ *       **Flow:**
+ *       1. First call /api/trading/withdraw/intent to get a nonce
+ *       2. Then call this endpoint with the nonce and user JWT to execute
+ *       
+ *       **Important notes:**
+ *       - Requires a valid nonce from the intent endpoint
+ *       - Requires a valid Privy JWT token for authorization
+ *       - Nonce expires after 5 minutes and can only be used once
+ *       - Transaction is gasless (Polymarket relayer pays for gas)
+ *     tags: [Trading]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - privyUserId
+ *               - nonce
+ *               - userJwt
+ *             properties:
+ *               privyUserId:
+ *                 type: string
+ *                 description: User's Privy ID
+ *                 example: "did:privy:cmj921f4201dql40c3nubss93"
+ *               nonce:
+ *                 type: string
+ *                 description: Nonce from the withdrawal intent
+ *                 example: "a1b2c3d4e5f6..."
+ *               userJwt:
+ *                 type: string
+ *                 description: User's Privy JWT token for authorization
+ *                 example: "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9..."
+ *     responses:
+ *       200:
  *         description: Withdrawal successful
  *         content:
  *           application/json:
@@ -810,9 +948,13 @@ router.post('/redeem/all', async (req: Request, res: Response) => {
  *                 success:
  *                   type: boolean
  *                   example: true
- *                 transactionHash:
+ *                 txHash:
  *                   type: string
  *                   description: Transaction hash on Polygon
+ *                   example: "0x1234567890abcdef..."
+ *                 transactionHash:
+ *                   type: string
+ *                   description: Transaction hash on Polygon (alias)
  *                   example: "0x1234567890abcdef..."
  *                 fromAddress:
  *                   type: string
@@ -827,7 +969,7 @@ router.post('/redeem/all', async (req: Request, res: Response) => {
  *                   description: Amount withdrawn
  *                   example: "10.5"
  *       400:
- *         description: Invalid request (missing fields, invalid address, or insufficient balance)
+ *         description: Invalid request (missing fields, invalid nonce, or invalid JWT)
  *         content:
  *           application/json:
  *             schema:
@@ -836,83 +978,107 @@ router.post('/redeem/all', async (req: Request, res: Response) => {
  *                 success:
  *                   type: boolean
  *                   example: false
- *                 error:
+ *                 message:
  *                   type: string
- *                   example: "Invalid destination address format"
+ *                   example: "Invalid or expired withdrawal nonce"
+ *       401:
+ *         description: Unauthorized (invalid JWT)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 message:
+ *                   type: string
+ *                   example: "Invalid or expired authentication token"
  *       404:
  *         description: User not found or no proxy wallet
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: false
- *                 error:
- *                   type: string
- *                   example: "User not found"
  *       500:
  *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: false
- *                 error:
- *                   type: string
  */
 router.post('/withdraw', async (req: Request, res: Response) => {
   try {
-    const { privyUserId, toAddress, amountUsdc } = req.body;
+    const { privyUserId, nonce, userJwt, toAddress, amountUsdc } = req.body;
 
-    // Validate required fields
+    // Validate required field
     if (!privyUserId) {
       return res.status(400).json({
         success: false,
-        error: 'privyUserId is required',
+        message: 'privyUserId is required',
       });
     }
 
-    if (!toAddress) {
+    // Check if this is the new nonce+JWT flow or the legacy direct flow
+    if (nonce && userJwt) {
+      // New secure flow: nonce + JWT authorization
+      logger.info({
+        message: 'Withdrawal request received (nonce+JWT flow)',
+        privyUserId,
+        hasNonce: !!nonce,
+        hasJwt: !!userJwt,
+      });
+
+      const request: ExecuteWithdrawalRequest = {
+        privyUserId: String(privyUserId),
+        nonce: String(nonce),
+        userJwt: String(userJwt),
+      };
+
+      const result = await executeWithdrawalWithAuth(request);
+
+      if (!result.success) {
+        // Determine appropriate status code
+        let statusCode = 400;
+        if (result.message?.includes('not found')) {
+          statusCode = 404;
+        } else if (result.message?.includes('authentication') || result.message?.includes('Unauthorized')) {
+          statusCode = 401;
+        }
+        return res.status(statusCode).json(result);
+      }
+
+      return res.status(200).json(result);
+    } else if (toAddress && amountUsdc) {
+      // Legacy flow: direct withdrawal (for backward compatibility)
+      logger.info({
+        message: 'Withdrawal request received (legacy direct flow)',
+        privyUserId,
+        toAddress,
+        amountUsdc,
+      });
+
+      const request: WithdrawalRequest = {
+        privyUserId: String(privyUserId),
+        toAddress: String(toAddress),
+        amountUsdc: String(amountUsdc),
+      };
+
+      const result = await withdrawUsdc(request);
+
+      // Add txHash alias for consistency
+      if (result.success && result.transactionHash) {
+        (result as any).txHash = result.transactionHash;
+      }
+
+      if (!result.success) {
+        const statusCode = result.error?.includes('not found') ? 404 : 400;
+        return res.status(statusCode).json({
+          success: false,
+          message: result.error,
+        });
+      }
+
+      return res.status(200).json(result);
+    } else {
+      // Missing required fields
       return res.status(400).json({
         success: false,
-        error: 'toAddress is required',
+        message: 'Missing required fields. Use either (nonce + userJwt) for secure flow or (toAddress + amountUsdc) for legacy flow.',
       });
     }
-
-    if (!amountUsdc) {
-      return res.status(400).json({
-        success: false,
-        error: 'amountUsdc is required',
-      });
-    }
-
-    logger.info({
-      message: 'Withdrawal request received',
-      privyUserId,
-      toAddress,
-      amountUsdc,
-    });
-
-    const request: WithdrawalRequest = {
-      privyUserId: String(privyUserId),
-      toAddress: String(toAddress),
-      amountUsdc: String(amountUsdc),
-    };
-
-    const result = await withdrawUsdc(request);
-
-    if (!result.success) {
-      // Determine appropriate status code based on error
-      const statusCode = result.error?.includes('not found') ? 404 : 400;
-      return res.status(statusCode).json(result);
-    }
-
-    return res.status(200).json(result);
   } catch (error) {
     logger.error({
       message: 'Error in withdrawal endpoint',
@@ -922,7 +1088,7 @@ router.post('/withdraw', async (req: Request, res: Response) => {
 
     return res.status(500).json({
       success: false,
-      error: error instanceof Error ? error.message : 'Internal server error',
+      message: error instanceof Error ? error.message : 'Internal server error',
     });
   }
 });

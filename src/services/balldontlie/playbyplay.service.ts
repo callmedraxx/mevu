@@ -87,17 +87,29 @@ export function getPlayByPlayType(sport: string): 'plays' | 'events' | null {
 
 /**
  * Normalized play object for US sports
+ * Compatible with frontend PlayByPlayWidget expectations
  */
 export interface NormalizedPlay {
+  // Required by frontend
+  id: string;  // Unique identifier for tracking (frontend uses this for deduplication)
   order: number;
   type: string;
   text: string;
+  description?: string; // Alias for text (frontend checks description first)
   homeScore: number;
   awayScore: number;
   period: number;
   periodDisplay: string;
   clock: string;
+  time?: string; // Alias for clock (frontend checks time as fallback)
   scoringPlay: boolean;
+  // Team info - provide both formats for frontend compatibility
+  team?: {
+    id?: number;
+    name?: string;
+    abbreviation?: string;
+  };
+  // Also keep flat fields for backward compatibility
   teamId?: number;
   teamName?: string;
   teamAbbreviation?: string;
@@ -154,16 +166,27 @@ async function fetchNBAPlays(gameId: number): Promise<NormalizedPlay[]> {
 
   const plays = response.data?.data || [];
   
-  return plays.map((play: any) => ({
-    order: play.order,
+  return plays.map((play: any, index: number) => ({
+    // Generate unique ID for frontend tracking
+    id: `nba-${gameId}-${play.order || index}`,
+    order: play.order || index,
     type: play.type || 'Unknown',
     text: play.text || '',
+    description: play.text || '', // Alias for frontend
     homeScore: play.home_score || 0,
     awayScore: play.away_score || 0,
     period: play.period || 1,
     periodDisplay: play.period_display || `Q${play.period || 1}`,
     clock: play.clock || '',
+    time: play.clock || '', // Alias for frontend
     scoringPlay: play.scoring_play || false,
+    // Team object for frontend compatibility
+    team: play.team ? {
+      id: play.team.id,
+      name: play.team.full_name || play.team.name,
+      abbreviation: play.team.abbreviation,
+    } : undefined,
+    // Keep flat fields for backward compatibility
     teamId: play.team?.id,
     teamName: play.team?.full_name || play.team?.name,
     teamAbbreviation: play.team?.abbreviation,
@@ -199,15 +222,26 @@ async function fetchNFLPlays(gameId: number): Promise<NormalizedPlay[]> {
   } while (cursor);
 
   return allPlays.map((play: any, index: number) => ({
+    // Generate unique ID for frontend tracking
+    id: `nfl-${gameId}-${index}`,
     order: index + 1,
     type: play.type_abbreviation || play.type_slug || 'Unknown',
     text: play.description || play.text || '',
+    description: play.description || play.text || '', // Alias for frontend
     homeScore: play.home_score || 0,
     awayScore: play.away_score || 0,
     period: play.quarter || play.period || 1,
     periodDisplay: play.quarter ? `Q${play.quarter}` : 'Q1',
     clock: play.clock || '',
+    time: play.clock || '', // Alias for frontend
     scoringPlay: play.scoring_play || (play.score_value && play.score_value > 0),
+    // Team object for frontend compatibility
+    team: play.team ? {
+      id: play.team.id,
+      name: play.team.full_name || play.team.name,
+      abbreviation: play.team.abbreviation,
+    } : undefined,
+    // Keep flat fields for backward compatibility
     teamId: play.team?.id,
     teamName: play.team?.full_name || play.team?.name,
     teamAbbreviation: play.team?.abbreviation,
@@ -228,16 +262,27 @@ async function fetchNHLPlays(gameId: number): Promise<NormalizedPlay[]> {
 
   const plays = response.data?.data || [];
   
-  return plays.map((play: any) => ({
-    order: play.order || 0,
+  return plays.map((play: any, index: number) => ({
+    // Generate unique ID for frontend tracking
+    id: `nhl-${gameId}-${play.order || index}`,
+    order: play.order || index,
     type: play.type || 'Unknown',
     text: play.text || play.description || '',
+    description: play.text || play.description || '', // Alias for frontend
     homeScore: play.home_score || 0,
     awayScore: play.away_score || 0,
     period: play.period || 1,
     periodDisplay: play.period_display || `P${play.period || 1}`,
     clock: play.clock || '',
+    time: play.clock || '', // Alias for frontend
     scoringPlay: play.scoring_play || false,
+    // Team object for frontend compatibility
+    team: play.team ? {
+      id: play.team.id,
+      name: play.team.full_name || play.team.name,
+      abbreviation: play.team.abbreviation || play.team.tricode,
+    } : undefined,
+    // Keep flat fields for backward compatibility
     teamId: play.team?.id,
     teamName: play.team?.full_name || play.team?.name,
     teamAbbreviation: play.team?.abbreviation || play.team?.tricode,
@@ -259,15 +304,26 @@ async function fetchNCAAFPlays(gameId: number): Promise<NormalizedPlay[]> {
   const plays = response.data?.data || [];
   
   return plays.map((play: any, index: number) => ({
+    // Generate unique ID for frontend tracking
+    id: `ncaaf-${gameId}-${play.order || index}`,
     order: play.order || index + 1,
     type: play.type || 'Unknown',
     text: play.text || play.description || '',
+    description: play.text || play.description || '', // Alias for frontend
     homeScore: play.home_score || 0,
     awayScore: play.away_score || 0,
     period: play.period || play.quarter || 1,
     periodDisplay: play.period_display || `Q${play.period || play.quarter || 1}`,
     clock: play.clock || '',
+    time: play.clock || '', // Alias for frontend
     scoringPlay: play.scoring_play || false,
+    // Team object for frontend compatibility
+    team: play.team ? {
+      id: play.team.id,
+      name: play.team.full_name || play.team.name || play.team.school,
+      abbreviation: play.team.abbreviation,
+    } : undefined,
+    // Keep flat fields for backward compatibility
     teamId: play.team?.id,
     teamName: play.team?.full_name || play.team?.name || play.team?.school,
     teamAbbreviation: play.team?.abbreviation,
@@ -289,15 +345,26 @@ async function fetchNCAABPlays(gameId: number): Promise<NormalizedPlay[]> {
   const plays = response.data?.data || [];
   
   return plays.map((play: any, index: number) => ({
+    // Generate unique ID for frontend tracking
+    id: `ncaab-${gameId}-${play.order || index}`,
     order: play.order || index + 1,
     type: play.type || 'Unknown',
     text: play.text || play.description || '',
+    description: play.text || play.description || '', // Alias for frontend
     homeScore: play.home_score || 0,
     awayScore: play.away_score || 0,
     period: play.period || 1,
     periodDisplay: play.period_display || `H${play.period || 1}`,
     clock: play.clock || '',
+    time: play.clock || '', // Alias for frontend
     scoringPlay: play.scoring_play || false,
+    // Team object for frontend compatibility
+    team: play.team ? {
+      id: play.team.id,
+      name: play.team.full_name || play.team.name || play.team.school,
+      abbreviation: play.team.abbreviation,
+    } : undefined,
+    // Keep flat fields for backward compatibility
     teamId: play.team?.id,
     teamName: play.team?.full_name || play.team?.name || play.team?.school,
     teamAbbreviation: play.team?.abbreviation,
@@ -318,16 +385,27 @@ async function fetchWNBAPlays(gameId: number): Promise<NormalizedPlay[]> {
 
   const plays = response.data?.data || [];
   
-  return plays.map((play: any) => ({
-    order: play.order || 0,
+  return plays.map((play: any, index: number) => ({
+    // Generate unique ID for frontend tracking
+    id: `wnba-${gameId}-${play.order || index}`,
+    order: play.order || index,
     type: play.type || 'Unknown',
     text: play.text || '',
+    description: play.text || '', // Alias for frontend
     homeScore: play.home_score || 0,
     awayScore: play.away_score || 0,
     period: play.period || 1,
     periodDisplay: play.period_display || `Q${play.period || 1}`,
     clock: play.clock || '',
+    time: play.clock || '', // Alias for frontend
     scoringPlay: play.scoring_play || false,
+    // Team object for frontend compatibility
+    team: play.team ? {
+      id: play.team.id,
+      name: play.team.full_name || play.team.name,
+      abbreviation: play.team.abbreviation,
+    } : undefined,
+    // Keep flat fields for backward compatibility
     teamId: play.team?.id,
     teamName: play.team?.full_name || play.team?.name,
     teamAbbreviation: play.team?.abbreviation,

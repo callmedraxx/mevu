@@ -169,8 +169,37 @@ import {
   supportsPlayByPlay,
   getPlayByPlayType,
 } from '../services/balldontlie/playbyplay.service';
+import { getLiveGameById, getLiveGameBySlug } from '../services/polymarket/live-games.service';
+import { findAndMapBalldontlieGameId } from '../services/balldontlie/balldontlie.service';
 
 const router = Router();
+
+/**
+ * Helper function to get Ball Don't Lie game ID from game identifier
+ * Looks up the game by ID or slug, then gets/maps the Ball Don't Lie game ID
+ */
+async function getBalldontlieGameIdFromIdentifier(gameIdentifier: string): Promise<{ balldontlieGameId: number; game: any } | null> {
+  // Try to find game by ID first, then by slug
+  let game = await getLiveGameById(gameIdentifier);
+  if (!game) {
+    game = await getLiveGameBySlug(gameIdentifier);
+  }
+
+  if (!game) {
+    return null;
+  }
+
+  // Get Ball Don't Lie game ID (map if needed)
+  let balldontlieGameId = (game as any).balldontlie_game_id;
+  if (!balldontlieGameId) {
+    balldontlieGameId = await findAndMapBalldontlieGameId(game);
+    if (!balldontlieGameId) {
+      return null;
+    }
+  }
+
+  return { balldontlieGameId, game };
+}
 
 /**
  * @swagger
@@ -223,7 +252,7 @@ router.get('/sports', (req: Request, res: Response) => {
 
 /**
  * @swagger
- * /api/playbyplay/{sport}/{gameId}:
+ * /api/playbyplay/{sport}/{gameIdentifier}:
  *   get:
  *     summary: Get play-by-play data for a game
  *     description: |
@@ -239,6 +268,9 @@ router.get('/sports', (req: Request, res: Response) => {
  *       
  *       Data is fetched in real-time and not cached. For live games, call this endpoint
  *       periodically to get the latest plays.
+ *       
+ *       The endpoint accepts your internal game ID or slug, and automatically maps it to the
+ *       corresponding Ball Don't Lie game ID.
  *     tags: [PlayByPlay]
  *     parameters:
  *       - in: path
@@ -257,12 +289,12 @@ router.get('/sports', (req: Request, res: Response) => {
  *           - lig → ligue1
  *         example: nba
  *       - in: path
- *         name: gameId
+ *         name: gameIdentifier
  *         required: true
  *         schema:
- *           type: integer
- *         description: Ball Don't Lie game ID (for soccer, use match ID)
- *         example: 12345
+ *           type: string
+ *         description: Internal game ID or slug (will be mapped to Ball Don't Lie game ID)
+ *         example: "evt_abc123"
  *     responses:
  *       200:
  *         description: Play-by-play data retrieved successfully
@@ -344,18 +376,9 @@ router.get('/sports', (req: Request, res: Response) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/:sport/:gameId', async (req: Request, res: Response) => {
+router.get('/:sport/:gameIdentifier', async (req: Request, res: Response) => {
   try {
-    const { sport, gameId } = req.params;
-
-    // Validate gameId
-    const parsedGameId = parseInt(gameId, 10);
-    if (isNaN(parsedGameId) || parsedGameId <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid gameId. Must be a positive integer.',
-      });
-    }
+    const { sport, gameIdentifier } = req.params;
 
     // Check if sport is supported
     if (!supportsPlayByPlay(sport)) {
@@ -371,14 +394,38 @@ router.get('/:sport/:gameId', async (req: Request, res: Response) => {
       });
     }
 
+    // Get Ball Don't Lie game ID from game identifier
+    const mapping = await getBalldontlieGameIdFromIdentifier(gameIdentifier);
+    if (!mapping) {
+      return res.status(404).json({
+        success: false,
+        error: 'Game not found or could not map to Ball Don\'t Lie game ID',
+      });
+    }
+
+    const { balldontlieGameId, game } = mapping;
+
+    // Verify sport matches
+    const gameSport = game.sport?.toLowerCase();
+    if (gameSport && gameSport !== sport.toLowerCase()) {
+      logger.warn({
+        message: 'Sport mismatch in play-by-play request',
+        requestedSport: sport,
+        gameSport,
+        gameId: game.id,
+      });
+    }
+
     logger.info({
       message: 'Play-by-play request received',
       sport,
-      gameId: parsedGameId,
+      gameIdentifier,
+      internalGameId: game.id,
+      balldontlieGameId,
       dataType: getPlayByPlayType(sport),
     });
 
-    const result = await getPlayByPlay(sport, parsedGameId);
+    const result = await getPlayByPlay(sport, balldontlieGameId);
 
     if (!result.success) {
       return res.status(400).json(result);
@@ -401,13 +448,16 @@ router.get('/:sport/:gameId', async (req: Request, res: Response) => {
 
 /**
  * @swagger
- * /api/playbyplay/{sport}/{gameId}/scoring:
+ * /api/playbyplay/{sport}/{gameIdentifier}/scoring:
  *   get:
  *     summary: Get only scoring plays for a game
  *     description: |
  *       Returns only scoring plays/goal events for a game. Useful for showing key moments.
  *       For US sports, filters plays where scoringPlay=true.
  *       For soccer, filters events where eventType='goal'.
+ *       
+ *       The endpoint accepts your internal game ID or slug, and automatically maps it to the
+ *       corresponding Ball Don't Lie game ID.
  *     tags: [PlayByPlay]
  *     parameters:
  *       - in: path
@@ -418,12 +468,12 @@ router.get('/:sport/:gameId', async (req: Request, res: Response) => {
  *         description: Sport name
  *         example: nba
  *       - in: path
- *         name: gameId
+ *         name: gameIdentifier
  *         required: true
  *         schema:
- *           type: integer
- *         description: Ball Don't Lie game ID
- *         example: 12345
+ *           type: string
+ *         description: Internal game ID or slug (will be mapped to Ball Don't Lie game ID)
+ *         example: "evt_abc123"
  *     responses:
  *       200:
  *         description: Scoring plays retrieved successfully
@@ -436,17 +486,9 @@ router.get('/:sport/:gameId', async (req: Request, res: Response) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/:sport/:gameId/scoring', async (req: Request, res: Response) => {
+router.get('/:sport/:gameIdentifier/scoring', async (req: Request, res: Response) => {
   try {
-    const { sport, gameId } = req.params;
-
-    const parsedGameId = parseInt(gameId, 10);
-    if (isNaN(parsedGameId) || parsedGameId <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid gameId. Must be a positive integer.',
-      });
-    }
+    const { sport, gameIdentifier } = req.params;
 
     if (!supportsPlayByPlay(sport)) {
       return res.status(400).json({
@@ -455,7 +497,18 @@ router.get('/:sport/:gameId/scoring', async (req: Request, res: Response) => {
       });
     }
 
-    const result = await getPlayByPlay(sport, parsedGameId);
+    // Get Ball Don't Lie game ID from game identifier
+    const mapping = await getBalldontlieGameIdFromIdentifier(gameIdentifier);
+    if (!mapping) {
+      return res.status(404).json({
+        success: false,
+        error: 'Game not found or could not map to Ball Don\'t Lie game ID',
+      });
+    }
+
+    const { balldontlieGameId } = mapping;
+
+    const result = await getPlayByPlay(sport, balldontlieGameId);
 
     if (!result.success) {
       return res.status(400).json(result);
@@ -499,12 +552,15 @@ router.get('/:sport/:gameId/scoring', async (req: Request, res: Response) => {
 
 /**
  * @swagger
- * /api/playbyplay/{sport}/{gameId}/recent:
+ * /api/playbyplay/{sport}/{gameIdentifier}/recent:
  *   get:
  *     summary: Get most recent plays for a game
  *     description: |
  *       Returns the most recent N plays/events for a game. Useful for live updates.
  *       Default limit is 10, max is 50.
+ *       
+ *       The endpoint accepts your internal game ID or slug, and automatically maps it to the
+ *       corresponding Ball Don't Lie game ID.
  *     tags: [PlayByPlay]
  *     parameters:
  *       - in: path
@@ -515,12 +571,12 @@ router.get('/:sport/:gameId/scoring', async (req: Request, res: Response) => {
  *         description: Sport name
  *         example: nba
  *       - in: path
- *         name: gameId
+ *         name: gameIdentifier
  *         required: true
  *         schema:
- *           type: integer
- *         description: Ball Don't Lie game ID
- *         example: 12345
+ *           type: string
+ *         description: Internal game ID or slug (will be mapped to Ball Don't Lie game ID)
+ *         example: "evt_abc123"
  *       - in: query
  *         name: limit
  *         schema:
@@ -541,18 +597,10 @@ router.get('/:sport/:gameId/scoring', async (req: Request, res: Response) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/:sport/:gameId/recent', async (req: Request, res: Response) => {
+router.get('/:sport/:gameIdentifier/recent', async (req: Request, res: Response) => {
   try {
-    const { sport, gameId } = req.params;
+    const { sport, gameIdentifier } = req.params;
     const limit = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 10, 1), 50);
-
-    const parsedGameId = parseInt(gameId, 10);
-    if (isNaN(parsedGameId) || parsedGameId <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid gameId. Must be a positive integer.',
-      });
-    }
 
     if (!supportsPlayByPlay(sport)) {
       return res.status(400).json({
@@ -561,7 +609,18 @@ router.get('/:sport/:gameId/recent', async (req: Request, res: Response) => {
       });
     }
 
-    const result = await getPlayByPlay(sport, parsedGameId);
+    // Get Ball Don't Lie game ID from game identifier
+    const mapping = await getBalldontlieGameIdFromIdentifier(gameIdentifier);
+    if (!mapping) {
+      return res.status(404).json({
+        success: false,
+        error: 'Game not found or could not map to Ball Don\'t Lie game ID',
+      });
+    }
+
+    const { balldontlieGameId } = mapping;
+
+    const result = await getPlayByPlay(sport, balldontlieGameId);
 
     if (!result.success) {
       return res.status(400).json(result);

@@ -276,7 +276,12 @@ class AlchemyWebhookService extends EventEmitter {
     } catch (error: any) {
       logger.error({
         message: 'Failed to add addresses to Alchemy webhook',
-        error: error.response?.data || error.message,
+        error: error.name || 'Error',
+        errorMessage: error.message,
+        statusCode: error.response?.status,
+        responseData: error.response?.data,
+        errorCode: error.code, // Network errors have a code like ECONNREFUSED, ENOTFOUND
+        webhookId: this.webhookId,
         addresses: addresses.slice(0, 5), // Log first 5 for debugging
       });
     }
