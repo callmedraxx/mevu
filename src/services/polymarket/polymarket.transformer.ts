@@ -276,6 +276,7 @@ function transformMarket(market: PolymarketMarket): TransformedMarket {
       clobTokenIds: clobTokenIds,
       endDate: market.endDate || market.endDateIso,
       startDate: market.startDate || market.startDateIso,
+      gameStartTime: market.gameStartTime, // Actual game start time from Polymarket
       lastTradePrice: market.lastTradePrice,
       bestBid: market.bestBid,
       bestAsk: market.bestAsk,
@@ -556,6 +557,9 @@ function transformEvent(event: PolymarketEvent): TransformedEvent {
       // For non-binary single markets or grouped events, or if no winner detected, keep all outcomes
     }
 
+    // Extract gameStartTime from first market (sports games have this)
+    const gameStartTime = markets.find((m) => m.gameStartTime)?.gameStartTime;
+
     return {
       id: event.id,
       title: event.title || '',
@@ -581,6 +585,7 @@ function transformEvent(event: PolymarketEvent): TransformedEvent {
       tags: transformTags(event.tags),
       startDate: event.startDate || event.startTime,
       endDate: event.endDate,
+      gameStartTime: gameStartTime, // Actual game start time from first market
       createdAt: event.createdAt || event.creationDate,
       updatedAt: event.updatedAt,
       hasGroupItems: hasGroupItems,
