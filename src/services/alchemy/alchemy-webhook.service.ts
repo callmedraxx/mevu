@@ -13,7 +13,13 @@ import { EventEmitter } from 'events';
 // Alchemy API configuration
 const ALCHEMY_API_URL = 'https://dashboard.alchemy.com/api';
 const POLYGON_NETWORK = 'MATIC_MAINNET'; // Polygon mainnet network ID for Alchemy
-const USDC_CONTRACT_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e on Polygon
+
+// USDC Contract Addresses on Polygon
+const USDC_E_CONTRACT_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e (bridged)
+const USDC_NATIVE_CONTRACT_ADDRESS = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'; // Native USDC (MoonPay deposits here)
+
+// Keep backwards compatibility
+const USDC_CONTRACT_ADDRESS = USDC_E_CONTRACT_ADDRESS;
 
 // Environment variables
 const ALCHEMY_AUTH_TOKEN = process.env.ALCHEMY_AUTH_TOKEN; // Auth token from Alchemy dashboard
@@ -386,13 +392,17 @@ class AlchemyWebhookService extends EventEmitter {
     }
 
     for (const activity of event.activity) {
-      // Only process USDC.e transfers
-      if (
-        activity.rawContract?.address?.toLowerCase() !== USDC_CONTRACT_ADDRESS.toLowerCase()
-      ) {
+      const contractAddress = activity.rawContract?.address?.toLowerCase();
+      
+      // Process both USDC.e and Native USDC transfers
+      const isUsdcE = contractAddress === USDC_E_CONTRACT_ADDRESS.toLowerCase();
+      const isUsdcNative = contractAddress === USDC_NATIVE_CONTRACT_ADDRESS.toLowerCase();
+      
+      if (!isUsdcE && !isUsdcNative) {
         continue;
       }
 
+      const tokenType = isUsdcE ? 'USDC.e' : 'Native USDC';
       const fromAddress = activity.fromAddress?.toLowerCase();
       const toAddress = activity.toAddress?.toLowerCase();
       const rawValue = activity.rawContract?.rawValue || '0';
@@ -401,28 +411,34 @@ class AlchemyWebhookService extends EventEmitter {
       const blockNumber = parseInt(activity.blockNum, 16);
 
       logger.info({
-        message: 'Processing USDC.e transfer from webhook',
+        message: `[AUTO-TRANSFER-FLOW] Step 1: Alchemy webhook received ${tokenType} transfer`,
+        flowStep: 'WEBHOOK_RECEIVED',
+        tokenType,
         fromAddress,
         toAddress,
-        value,
+        valueRaw: value,
+        valueHuman: (value / 1e6).toFixed(6) + ' USDC',
         txHash,
         blockNumber,
+        contractAddress,
       });
 
       // Update balance for recipient (incoming transfer)
       if (toAddress) {
-        await this.updateBalanceForAddress(toAddress, 'in', value, txHash, blockNumber, fromAddress);
+        await this.updateBalanceForAddress(toAddress, 'in', value, txHash, blockNumber, fromAddress, tokenType);
       }
 
       // Update balance for sender (outgoing transfer)
       if (fromAddress) {
-        await this.updateBalanceForAddress(fromAddress, 'out', value, txHash, blockNumber, toAddress);
+        await this.updateBalanceForAddress(fromAddress, 'out', value, txHash, blockNumber, toAddress, tokenType);
       }
     }
   }
 
   /**
    * Update balance for an address after a transfer
+   * Handles both proxy wallets and embedded wallets
+   * Handles both USDC.e and Native USDC
    */
   private async updateBalanceForAddress(
     address: string,
@@ -430,14 +446,18 @@ class AlchemyWebhookService extends EventEmitter {
     amount: number,
     txHash: string,
     blockNumber: number,
-    counterparty: string
+    counterparty: string,
+    tokenType: string = 'USDC.e'
   ): Promise<void> {
     const client = await pool.connect();
     
     try {
-      // Check if this address belongs to one of our users
+      // Check if this address belongs to one of our users (proxy wallet OR embedded wallet)
       const userResult = await client.query(
-        `SELECT privy_user_id FROM users WHERE LOWER(proxy_wallet_address) = LOWER($1)`,
+        `SELECT privy_user_id, proxy_wallet_address, embedded_wallet_address 
+         FROM users 
+         WHERE LOWER(proxy_wallet_address) = LOWER($1) 
+            OR LOWER(embedded_wallet_address) = LOWER($1)`,
         [address]
       );
 
@@ -447,109 +467,184 @@ class AlchemyWebhookService extends EventEmitter {
       }
 
       const privyUserId = userResult.rows[0].privy_user_id;
+      const isProxyWallet = userResult.rows[0].proxy_wallet_address?.toLowerCase() === address.toLowerCase();
+      const isEmbeddedWallet = userResult.rows[0].embedded_wallet_address?.toLowerCase() === address.toLowerCase();
 
       // Get current balance using Alchemy's alchemy_getTokenBalances API
+      // Fetch BOTH USDC.e and Native USDC balances
       const { ethers } = await import('ethers');
-      const alchemyApiKey = process.env.ALCHEMY_API_KEY || 'A7Gkqi8mjyUVuXr4Xop_Q';
+      const alchemyApiKey = process.env.ALCHEMY_API_KEY;
       const alchemyUrl = `https://polygon-mainnet.g.alchemy.com/v2/${alchemyApiKey}`;
       
       const balanceResponse = await axios.post(alchemyUrl, {
         id: 1,
         jsonrpc: '2.0',
         method: 'alchemy_getTokenBalances',
-        params: [address, [USDC_CONTRACT_ADDRESS]],
+        params: [address, [USDC_E_CONTRACT_ADDRESS, USDC_NATIVE_CONTRACT_ADDRESS]],
       });
 
-      let balanceRaw = '0';
-      let balanceHuman = '0';
+      let usdceBalanceRaw = BigInt(0);
+      let nativeBalanceRaw = BigInt(0);
 
-      if (balanceResponse.data?.result?.tokenBalances?.[0]) {
-        const tokenBalance = balanceResponse.data.result.tokenBalances[0];
-        // tokenBalance.tokenBalance is hex string like "0x..."
-        if (tokenBalance.tokenBalance && tokenBalance.tokenBalance !== '0x') {
-          const balanceBigInt = BigInt(tokenBalance.tokenBalance);
-          balanceRaw = balanceBigInt.toString();
-          balanceHuman = ethers.utils.formatUnits(balanceBigInt.toString(), 6);
+      if (balanceResponse.data?.result?.tokenBalances) {
+        for (const tokenBalance of balanceResponse.data.result.tokenBalances) {
+          if (tokenBalance.tokenBalance && tokenBalance.tokenBalance !== '0x') {
+            const balance = BigInt(tokenBalance.tokenBalance);
+            if (tokenBalance.contractAddress?.toLowerCase() === USDC_E_CONTRACT_ADDRESS.toLowerCase()) {
+              usdceBalanceRaw = balance;
+            } else if (tokenBalance.contractAddress?.toLowerCase() === USDC_NATIVE_CONTRACT_ADDRESS.toLowerCase()) {
+              nativeBalanceRaw = balance;
+            }
+          }
         }
       }
 
+      // Total balance is sum of both USDC types
+      const totalBalanceRaw = usdceBalanceRaw + nativeBalanceRaw;
+      const totalBalanceHuman = ethers.utils.formatUnits(totalBalanceRaw.toString(), 6);
+
       logger.info({
-        message: 'Fetched USDC.e balance from Alchemy',
+        message: `[AUTO-TRANSFER-FLOW] Fetched USDC balances from Alchemy`,
+        flowStep: 'BALANCE_FETCHED',
         address,
-        balanceRaw,
-        balanceHuman,
+        walletType: isProxyWallet ? 'proxy' : 'embedded',
+        tokenType,
+        usdceBalance: ethers.utils.formatUnits(usdceBalanceRaw.toString(), 6),
+        nativeBalance: ethers.utils.formatUnits(nativeBalanceRaw.toString(), 6),
+        totalBalance: totalBalanceHuman,
       });
 
       await client.query('BEGIN');
 
-      // Update wallet_balances table
-      await client.query(
-        `INSERT INTO wallet_balances (proxy_wallet_address, privy_user_id, balance_raw, balance_human, last_updated_at)
-         VALUES ($1, $2, $3, $4, NOW())
-         ON CONFLICT (proxy_wallet_address) 
-         DO UPDATE SET 
-           balance_raw = $3,
-           balance_human = $4,
-           last_updated_at = NOW()`,
-        [address, privyUserId, balanceRaw, balanceHuman]
-      );
+      if (isProxyWallet) {
+        // Update wallet_balances table for proxy wallets
+        await client.query(
+          `INSERT INTO wallet_balances (proxy_wallet_address, privy_user_id, balance_raw, balance_human, last_updated_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (proxy_wallet_address) 
+           DO UPDATE SET 
+             balance_raw = $3,
+             balance_human = $4,
+             last_updated_at = NOW()`,
+          [address, privyUserId, totalBalanceRaw.toString(), totalBalanceHuman]
+        );
 
-      // Record the transfer
-      const humanAmount = ethers.utils.formatUnits(amount.toString(), 6);
-      await client.query(
-        `INSERT INTO wallet_usdc_transfers 
-         (proxy_wallet_address, privy_user_id, transfer_type, from_address, to_address, 
-          amount_raw, amount_human, transaction_hash, block_number)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (transaction_hash, proxy_wallet_address) DO NOTHING`,
-        [
-          address,
+        // Record the transfer
+        const humanAmount = ethers.utils.formatUnits(amount.toString(), 6);
+        await client.query(
+          `INSERT INTO wallet_usdc_transfers 
+           (proxy_wallet_address, privy_user_id, transfer_type, from_address, to_address, 
+            amount_raw, amount_human, transaction_hash, block_number)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (transaction_hash, proxy_wallet_address) DO NOTHING`,
+          [
+            address,
+            privyUserId,
+            transferType,
+            transferType === 'in' ? counterparty : address,
+            transferType === 'out' ? counterparty : address,
+            amount.toString(),
+            humanAmount,
+            txHash,
+            blockNumber,
+          ]
+        );
+
+        await client.query('COMMIT');
+
+        logger.info({
+          message: '[AUTO-TRANSFER-FLOW] Updated proxy wallet balance',
+          flowStep: 'PROXY_BALANCE_UPDATED',
           privyUserId,
+          proxyWalletAddress: address,
           transferType,
-          transferType === 'in' ? counterparty : address,
-          transferType === 'out' ? counterparty : address,
-          amount.toString(),
-          humanAmount,
+          tokenType,
+          amount: humanAmount,
+          newBalance: totalBalanceHuman,
+          txHash,
+        });
+
+        // Emit notification for proxy wallet balance changes
+        const notification: BalanceNotification = {
+          type: transferType === 'in' ? 'deposit' : 'withdrawal',
+          privyUserId,
+          proxyWalletAddress: address,
+          amount: ethers.utils.formatUnits(amount.toString(), 6),
+          amountRaw: amount.toString(),
+          fromAddress: transferType === 'in' ? counterparty : address,
+          toAddress: transferType === 'out' ? counterparty : address,
           txHash,
           blockNumber,
-        ]
-      );
+          timestamp: new Date().toISOString(),
+          newBalance: totalBalanceHuman,
+        };
 
-      await client.query('COMMIT');
+        this.notifyDeposit(notification);
+      } else if (isEmbeddedWallet) {
+        // Update embedded_wallet_balances table
+        await client.query(
+          `INSERT INTO embedded_wallet_balances (privy_user_id, embedded_wallet_address, balance_raw, balance_human, last_updated_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (privy_user_id) 
+           DO UPDATE SET 
+             balance_raw = $3,
+             balance_human = $4,
+             last_updated_at = NOW(),
+             embedded_wallet_address = $2`,
+          [privyUserId, address, totalBalanceRaw.toString(), totalBalanceHuman]
+        );
+
+        await client.query('COMMIT');
+
+        logger.info({
+          message: `[AUTO-TRANSFER-FLOW] Step 2: Embedded wallet balance updated - ${transferType === 'in' ? 'DEPOSIT DETECTED' : 'withdrawal'}`,
+          flowStep: transferType === 'in' ? 'DEPOSIT_DETECTED' : 'WITHDRAWAL_DETECTED',
+          privyUserId,
+          embeddedWalletAddress: address,
+          transferType,
+          tokenType,
+          amountHuman: ethers.utils.formatUnits(amount.toString(), 6) + ' USDC',
+          newBalanceHuman: totalBalanceHuman + ' USDC',
+          txHash,
+          willTriggerAutoTransfer: transferType === 'in',
+        });
+
+        // Emit embedded wallet balance change event for auto-transfer service
+        if (transferType === 'in') {
+          logger.info({
+            message: '[AUTO-TRANSFER-FLOW] Step 3: Emitting embeddedWalletBalanceChange event',
+            flowStep: 'EMITTING_BALANCE_CHANGE_EVENT',
+            privyUserId,
+            embeddedWalletAddress: address,
+            balanceIncrease: ethers.utils.formatUnits(amount.toString(), 6) + ' USDC',
+            tokenType,
+          });
+        }
+        
+        this.emit('embeddedWalletBalanceChange', {
+          privyUserId,
+          embeddedWalletAddress: address,
+          previousBalance: (totalBalanceRaw - BigInt(amount)).toString(),
+          newBalance: totalBalanceRaw.toString(),
+          previousHumanBalance: ethers.utils.formatUnits((totalBalanceRaw - BigInt(amount)).toString(), 6),
+          newHumanBalance: totalBalanceHuman,
+          balanceIncrease: transferType === 'in' ? amount.toString() : '0',
+          humanBalanceIncrease: transferType === 'in' ? ethers.utils.formatUnits(amount.toString(), 6) : '0',
+          timestamp: new Date(),
+          txHash,
+          blockNumber,
+          tokenType,
+        });
+      }
 
       logger.info({
-        message: 'Updated balance from Alchemy webhook',
+        message: `[AUTO-TRANSFER-FLOW] ${transferType === 'in' ? 'Deposit' : 'Withdrawal'} processed`,
+        flowStep: 'TRANSFER_PROCESSED',
         privyUserId,
-        proxyWalletAddress: address,
-        transferType,
-        amount: humanAmount,
-        newBalance: balanceHuman,
-        txHash,
-      });
-
-      // Emit notification for all balance changes (deposits and withdrawals)
-      const notification: BalanceNotification = {
-        type: transferType === 'in' ? 'deposit' : 'withdrawal',
-        privyUserId,
-        proxyWalletAddress: address,
-        amount: humanAmount,
-        amountRaw: amount.toString(),
-        fromAddress: transferType === 'in' ? counterparty : address,
-        toAddress: transferType === 'out' ? counterparty : address,
-        txHash,
-        blockNumber,
-        timestamp: new Date().toISOString(),
-        newBalance: balanceHuman,
-      };
-
-      this.notifyDeposit(notification);
-
-      logger.info({
-        message: `${transferType === 'in' ? 'Deposit' : 'Withdrawal'} notification sent`,
-        privyUserId,
-        type: notification.type,
-        amount: humanAmount,
-        newBalance: balanceHuman,
+        walletType: isProxyWallet ? 'proxy' : 'embedded',
+        tokenType,
+        amount: ethers.utils.formatUnits(amount.toString(), 6),
+        newBalance: totalBalanceHuman,
         txHash,
       });
     } catch (error) {
@@ -565,17 +660,32 @@ class AlchemyWebhookService extends EventEmitter {
   }
 
   /**
-   * Add a new user's address to the webhook
+   * Add a new user's proxy wallet address to the webhook
    * Call this when a new user deploys a proxy wallet
    */
   async addUserAddress(proxyWalletAddress: string, privyUserId: string): Promise<void> {
     logger.info({
-      message: 'Adding user address to Alchemy webhook',
+      message: 'Adding proxy wallet address to Alchemy webhook',
       privyUserId,
       proxyWalletAddress,
     });
 
     await this.addAddresses([proxyWalletAddress]);
+  }
+
+  /**
+   * Add a user's embedded wallet address to the webhook
+   * Call this when monitoring embedded wallets for MoonPay deposits
+   */
+  async addEmbeddedWalletAddress(embeddedWalletAddress: string, privyUserId: string): Promise<void> {
+    logger.info({
+      message: '[AUTO-TRANSFER-FLOW] Adding embedded wallet address to Alchemy webhook',
+      flowStep: 'ADDING_EMBEDDED_WALLET',
+      privyUserId,
+      embeddedWalletAddress,
+    });
+
+    await this.addAddresses([embeddedWalletAddress]);
   }
 
   /**

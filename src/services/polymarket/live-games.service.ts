@@ -172,6 +172,7 @@ export interface LiveGame extends Omit<TransformedEvent, 'createdAt' | 'updatedA
     away?: string;
   };
   rawData: LiveGameEvent;
+  dataSource?: string; // 'live_games' or 'sports_games'
 }
 
 interface LiveGamesApiResponse {
@@ -490,7 +491,7 @@ async function enrichEventsWithTeams(events: TransformedEvent[], sport: string):
   });
 }
 
-async function transformAndEnrichGames(events: LiveGameEvent[]): Promise<LiveGame[]> {
+export async function transformAndEnrichGames(events: LiveGameEvent[]): Promise<LiveGame[]> {
   const polymarketEvents = events.map(convertToPolymarketEvent);
   const transformedEvents = transformEvents(polymarketEvents);
   
@@ -884,8 +885,15 @@ function extractGameProbabilities(game: LiveGame): { homeProb: number; awayProb:
   return null;
 }
 
-export async function storeGames(games: LiveGame[]): Promise<void> {
+export async function storeGames(games: LiveGame[], dataSource?: string): Promise<void> {
   const isProduction = process.env.NODE_ENV === 'production';
+  
+  // If dataSource is provided, set it on all games
+  if (dataSource) {
+    for (const game of games) {
+      game.dataSource = dataSource;
+    }
+  }
   
   if (isProduction) {
     await storeGamesInDatabase(games);
