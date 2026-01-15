@@ -9,6 +9,7 @@ import crypto from 'crypto';
 import { pool } from '../../config/database';
 import { logger } from '../../config/logger';
 import { EventEmitter } from 'events';
+import { depositProgressService } from '../privy/deposit-progress.service';
 
 // Alchemy API configuration
 const ALCHEMY_API_URL = 'https://dashboard.alchemy.com/api';
@@ -611,13 +612,28 @@ class AlchemyWebhookService extends EventEmitter {
 
         // Emit embedded wallet balance change event for auto-transfer service
         if (transferType === 'in') {
+          const amountHuman = ethers.utils.formatUnits(amount.toString(), 6);
+          
           logger.info({
             message: '[AUTO-TRANSFER-FLOW] Step 3: Emitting embeddedWalletBalanceChange event',
             flowStep: 'EMITTING_BALANCE_CHANGE_EVENT',
             privyUserId,
             embeddedWalletAddress: address,
-            balanceIncrease: ethers.utils.formatUnits(amount.toString(), 6) + ' USDC',
+            balanceIncrease: amountHuman + ' USDC',
             tokenType,
+          });
+
+          // Start tracking deposit progress for frontend
+          depositProgressService.startDeposit(
+            privyUserId,
+            amountHuman,
+            txHash
+          ).catch((err) => {
+            logger.warn({
+              message: '[DEPOSIT-PROGRESS] Failed to start deposit tracking',
+              privyUserId,
+              error: err instanceof Error ? err.message : String(err),
+            });
           });
         }
         

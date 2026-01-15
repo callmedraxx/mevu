@@ -393,4 +393,193 @@ router.get('/:privyUserId/deposits', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/balances/{privyUserId}/deposit-history:
+ *   get:
+ *     summary: Get unified deposit history with source information
+ *     description: Returns all deposits (MoonPay and direct crypto) with source badges
+ *     tags: [Balances]
+ *     parameters:
+ *       - in: path
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User's Privy ID
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 50
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *     responses:
+ *       200:
+ *         description: Deposit history retrieved
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 deposits:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id:
+ *                         type: string
+ *                       source:
+ *                         type: string
+ *                         enum: [moonpay, crypto]
+ *                       amount:
+ *                         type: string
+ *                       amountOut:
+ *                         type: string
+ *                       fromAddress:
+ *                         type: string
+ *                       txHash:
+ *                         type: string
+ *                       swapTxHash:
+ *                         type: string
+ *                       transferTxHash:
+ *                         type: string
+ *                       status:
+ *                         type: string
+ *                       createdAt:
+ *                         type: string
+ *                 count:
+ *                   type: integer
+ *       404:
+ *         description: User not found
+ */
+router.get('/:privyUserId/deposit-history', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId } = req.params;
+    const limit = parseInt(req.query.limit as string) || 50;
+    const offset = parseInt(req.query.offset as string) || 0;
+    const user = await getUserByPrivyId(privyUserId);
+
+    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+    if (!user.proxyWalletAddress) return res.status(400).json({ success: false, error: 'No proxy wallet' });
+
+    // Get user's embedded wallet address to identify MoonPay deposits
+    const embeddedWalletAddress = user.embeddedWalletAddress?.toLowerCase();
+
+    // Query 1: Get MoonPay deposits from deposit_progress table (completed ones)
+    const moonpayResult = await pool.query(
+      `SELECT 
+        id,
+        'moonpay' as source,
+        amount_usdc as amount,
+        amount_out as amount_out,
+        deposit_tx_hash as tx_hash,
+        swap_tx_hash,
+        transfer_tx_hash,
+        status,
+        created_at
+       FROM deposit_progress 
+       WHERE privy_user_id = $1 
+       AND status IN ('complete', 'failed')
+       ORDER BY created_at DESC`,
+      [privyUserId]
+    );
+
+    // Query 2: Get direct crypto deposits from wallet_usdc_transfers
+    // These are deposits where from_address is NOT the user's embedded wallet (not auto-transferred)
+    // and NOT from the proxy wallet itself (not internal transfers)
+    let cryptoResult;
+    if (embeddedWalletAddress) {
+      cryptoResult = await pool.query(
+        `SELECT 
+          id::text as id,
+          'crypto' as source,
+          amount_human as amount,
+          NULL as amount_out,
+          from_address,
+          transaction_hash as tx_hash,
+          NULL as swap_tx_hash,
+          NULL as transfer_tx_hash,
+          'complete' as status,
+          created_at
+         FROM wallet_usdc_transfers 
+         WHERE LOWER(proxy_wallet_address) = LOWER($1) 
+         AND transfer_type = 'in'
+         AND LOWER(from_address) != LOWER($2)
+         ORDER BY created_at DESC`,
+        [user.proxyWalletAddress, embeddedWalletAddress]
+      );
+    } else {
+      // If no embedded wallet, all incoming transfers are crypto deposits
+      cryptoResult = await pool.query(
+        `SELECT 
+          id::text as id,
+          'crypto' as source,
+          amount_human as amount,
+          NULL as amount_out,
+          from_address,
+          transaction_hash as tx_hash,
+          NULL as swap_tx_hash,
+          NULL as transfer_tx_hash,
+          'complete' as status,
+          created_at
+         FROM wallet_usdc_transfers 
+         WHERE LOWER(proxy_wallet_address) = LOWER($1) 
+         AND transfer_type = 'in'
+         ORDER BY created_at DESC`,
+        [user.proxyWalletAddress]
+      );
+    }
+
+    // Merge and format deposits
+    const moonpayDeposits = moonpayResult.rows.map(row => ({
+      id: row.id,
+      source: 'moonpay' as const,
+      amount: row.amount?.toString() || '0',
+      amountOut: row.amount_out?.toString(),
+      fromAddress: null, // MoonPay deposits don't have a direct from address
+      txHash: row.tx_hash,
+      swapTxHash: row.swap_tx_hash,
+      transferTxHash: row.transfer_tx_hash,
+      status: row.status,
+      createdAt: row.created_at,
+    }));
+
+    const cryptoDeposits = cryptoResult.rows.map(row => ({
+      id: `crypto-${row.id}`,
+      source: 'crypto' as const,
+      amount: row.amount?.toString() || '0',
+      amountOut: null,
+      fromAddress: row.from_address,
+      txHash: row.tx_hash,
+      swapTxHash: null,
+      transferTxHash: null,
+      status: 'complete' as const,
+      createdAt: row.created_at,
+    }));
+
+    // Combine and sort by date (newest first)
+    const allDeposits = [...moonpayDeposits, ...cryptoDeposits]
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .slice(offset, offset + limit);
+
+    res.json({ 
+      success: true, 
+      deposits: allDeposits, 
+      count: allDeposits.length,
+      total: moonpayDeposits.length + cryptoDeposits.length,
+      limit, 
+      offset 
+    });
+  } catch (error) {
+    logger.error({ message: 'Error fetching deposit history', error: extractErrorMessage(error) });
+    res.status(500).json({ success: false, error: extractErrorMessage(error) });
+  }
+});
+
 export default router;

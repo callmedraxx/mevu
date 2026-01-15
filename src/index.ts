@@ -8,6 +8,7 @@ import { swaggerOptions } from './config/swagger';
 import apiRouter from './routes';
 import { logoMappingService } from './services/espn/logo-mapping.service';
 import { liveGamesService } from './services/polymarket/live-games.service';
+import { sportsGamesService } from './services/polymarket/sports-games.service';
 import { teamsService } from './services/polymarket/teams.service';
 import { privyService } from './services/privy/privy.service';
 import { initializeUsersTable } from './services/privy/user.service';
@@ -23,6 +24,9 @@ import { runMigrations } from './scripts/run-migrations';
 // DEPRECATED: polygonUsdcBalanceService - replaced by Alchemy webhooks
 // import { polygonUsdcBalanceService } from './services/polygon/polygon-usdc-balance.service';
 import { alchemyWebhookService } from './services/alchemy/alchemy-webhook.service';
+import { embeddedWalletBalanceService } from './services/privy/embedded-wallet-balance.service';
+import { autoTransferService } from './services/privy/auto-transfer.service';
+import { depositProgressService } from './services/privy/deposit-progress.service';
 
 // Load environment variables
 dotenv.config();
@@ -186,6 +190,15 @@ async function initializeServices() {
     // logger.info({ message: 'Starting live games service...' });
     liveGamesService.start();
     
+    // Additional delay before starting sports games service
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Start sports games polling service (fetches upcoming games from Polymarket series API)
+    // This service fetches games by series_id (e.g., NFL, NBA) which includes upcoming games
+    // that may not appear in the live games endpoint yet
+    logger.info({ message: 'Starting sports games service...' });
+    sportsGamesService.start();
+    
     // Additional delay before starting teams refresh service
     await new Promise(resolve => setTimeout(resolve, 500));
     
@@ -208,6 +221,42 @@ async function initializeServices() {
         error: alchemyError instanceof Error ? alchemyError.message : String(alchemyError),
       });
       // Don't fail startup if Alchemy webhook fails
+    }
+    
+    // Initialize embedded wallet balance service (listens to Alchemy webhook events)
+    try {
+      logger.info({ message: 'Initializing embedded wallet balance service...' });
+      await embeddedWalletBalanceService.initialize();
+      logger.info({ message: 'Embedded wallet balance service initialized' });
+    } catch (balanceServiceError) {
+      logger.error({
+        message: 'Failed to initialize embedded wallet balance service',
+        error: balanceServiceError instanceof Error ? balanceServiceError.message : String(balanceServiceError),
+      });
+    }
+    
+    // Initialize auto-transfer service (listens to embedded wallet balance events)
+    try {
+      logger.info({ message: 'Initializing auto-transfer service...' });
+      autoTransferService.initialize();
+      logger.info({ message: 'Auto-transfer service initialized' });
+    } catch (autoTransferError) {
+      logger.error({
+        message: 'Failed to initialize auto-transfer service',
+        error: autoTransferError instanceof Error ? autoTransferError.message : String(autoTransferError),
+      });
+    }
+    
+    // Load any pending deposits from database for progress tracking
+    try {
+      logger.info({ message: 'Loading pending deposits for progress tracking...' });
+      await depositProgressService.loadFromDatabase();
+      logger.info({ message: 'Deposit progress service ready' });
+    } catch (depositProgressError) {
+      logger.warn({
+        message: 'Could not load pending deposits (table may not exist yet)',
+        error: depositProgressError instanceof Error ? depositProgressError.message : String(depositProgressError),
+      });
     }
     
     // Start sports WebSocket for live game score updates

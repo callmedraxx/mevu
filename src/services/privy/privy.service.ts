@@ -1307,6 +1307,141 @@ class PrivyService {
     
     return creationPromise;
   }
+
+  /**
+   * Send a transaction from an embedded wallet with gas sponsorship
+   * Uses Privy SDK to execute transactions with gas sponsorship enabled
+   * 
+   * @param userId - The Privy user ID
+   * @param walletAddress - The embedded wallet address
+   * @param transaction - Transaction details (to, data, value)
+   * @param options - Options including gas sponsorship
+   * @returns Transaction hash
+   */
+  async sendTransaction(
+    userId: string,
+    walletAddress: string,
+    transaction: {
+      to: string;
+      data?: string;
+      value?: string;
+    },
+    options?: {
+      sponsor?: boolean; // Enable gas sponsorship (default: true)
+    }
+  ): Promise<{ hash: string }> {
+    if (!this.initialized) {
+      throw new Error('Privy service not initialized');
+    }
+
+    if (!this.privyClient) {
+      throw new Error('PrivyClient SDK not initialized');
+    }
+
+    // Get wallet ID from address
+    const walletId = await this.getWalletIdByAddress(userId, walletAddress);
+    if (!walletId) {
+      throw new Error(`Wallet not found for address ${walletAddress}`);
+    }
+
+    const authorizationContext = this.getAuthorizationContext();
+    if (!authorizationContext) {
+      throw new Error('Authorization private key not configured. Set PRIVY_AUTHORIZATION_PRIVATE_KEY.');
+    }
+
+    // Default to gas sponsorship enabled
+    const sponsorGas = options?.sponsor !== false;
+
+    logger.info({
+      message: '[AUTO-TRANSFER-FLOW] Sending transaction via Privy SDK',
+      flowStep: 'PRIVY_SEND_TX',
+      userId,
+      walletAddress,
+      walletId,
+      to: transaction.to,
+      hasData: !!transaction.data,
+      hasValue: !!transaction.value,
+      sponsorGas,
+    });
+
+    try {
+      const ethereumWallets = this.privyClient.wallets().ethereum();
+      
+      // Build transaction request
+      const txRequest: any = {
+        to: transaction.to,
+      };
+      
+      if (transaction.data) {
+        txRequest.data = transaction.data;
+      }
+      
+      if (transaction.value) {
+        // Convert to hex if not already
+        txRequest.value = transaction.value.startsWith('0x') 
+          ? transaction.value 
+          : '0x' + BigInt(transaction.value).toString(16);
+      }
+
+      // Send transaction with gas sponsorship
+      // caip2 format for Polygon mainnet: eip155:137
+      const response = await ethereumWallets.sendTransaction(
+        walletId,
+        {
+          params: {
+            transaction: txRequest,
+          },
+          caip2: 'eip155:137', // Polygon mainnet chain ID in CAIP-2 format
+          authorization_context: authorizationContext,
+          sponsor: sponsorGas, // Enable gas sponsorship
+        }
+      );
+
+      const txHash = (response as any)?.hash || (response as any)?.transactionHash;
+      
+      if (!txHash) {
+        logger.error({
+          message: '[AUTO-TRANSFER-FLOW] Transaction response missing hash',
+          flowStep: 'PRIVY_SEND_TX_NO_HASH',
+          userId,
+          walletId,
+          response,
+        });
+        throw new Error('Transaction response missing hash');
+      }
+
+      logger.info({
+        message: '[AUTO-TRANSFER-FLOW] Transaction sent successfully via Privy SDK',
+        flowStep: 'PRIVY_SEND_TX_SUCCESS',
+        userId,
+        walletId,
+        txHash,
+        sponsorGas,
+        polygonscanUrl: `https://polygonscan.com/tx/${txHash}`,
+      });
+
+      return { hash: txHash };
+    } catch (error: any) {
+      logger.error({
+        message: '[AUTO-TRANSFER-FLOW] ❌ Privy sendTransaction FAILED',
+        flowStep: 'PRIVY_SEND_TX_FAILED',
+        userId,
+        walletId,
+        error: error.message,
+        status: error?.response?.status,
+        responseData: error?.response?.data,
+        troubleshooting: [
+          'Check if gas sponsorship is enabled in Privy dashboard',
+          'Check if gas sponsorship has credits ($10 minimum)',
+          'Check if Polygon (eip155:137) is enabled for sponsorship',
+          'Check if TEE is enabled for wallets',
+          'Check if PRIVY_AUTHORIZATION_PRIVATE_KEY is correct',
+          'Verify the wallet exists and belongs to the user',
+        ],
+      });
+      throw error;
+    }
+  }
 }
 
 // Export singleton instance

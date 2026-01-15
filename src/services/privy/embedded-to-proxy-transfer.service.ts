@@ -12,6 +12,7 @@ import { getUserByPrivyId } from './user.service';
 import { embeddedWalletBalanceService } from './embedded-wallet-balance.service';
 import { swapNativeUsdcToUsdce, checkSwapNeeded } from './usdc-swap.service';
 import { privyService } from './privy.service';
+import { depositProgressService } from './deposit-progress.service';
 
 // Cache for RelayerClient instances per user (for embedded wallet transactions)
 const relayerClientCache = new Map<string, { relayerClient: any; wallet: any; builderConfig: any }>();
@@ -218,8 +219,17 @@ export async function transferFromEmbeddedToProxy(
       usdceBalance: swapCheck.eBalance + ' USDC',
     });
 
+    // Find active deposit for progress tracking (used throughout the function)
+    const activeDeposit = depositProgressService.getMostRecentActiveDeposit(privyUserId);
+    const depositId = activeDeposit?.depositId;
+
     // If user has Native USDC but not enough USDC.e, swap first
     if (swapCheck.needsSwap) {
+      // Update progress to swapping
+      if (depositId) {
+        await depositProgressService.updateToSwapping(depositId);
+      }
+
       logger.info({
         message: '[AUTO-TRANSFER-FLOW] Step 14: SWAP REQUIRED - Initiating Native USDC → USDC.e swap',
         flowStep: 'INITIATING_SWAP',
@@ -228,6 +238,11 @@ export async function transferFromEmbeddedToProxy(
         eBalance: swapCheck.eBalance + ' USDC',
         requestedAmount: requestedAmountForSwap + ' USDC',
       });
+
+      // Update progress to swapping
+      if (depositId) {
+        await depositProgressService.updateToSwapping(depositId);
+      }
 
       // Swap Native USDC to USDC.e
       const swapAmount = amountUsdc !== undefined && amountUsdc > 0
@@ -248,6 +263,12 @@ export async function transferFromEmbeddedToProxy(
           swapAmount: swapAmount + ' USDC',
           error: swapResult.error,
         });
+        
+        // Update progress to failed
+        if (depositId) {
+          await depositProgressService.failDeposit(depositId, `Swap failed: ${swapResult.error}`);
+        }
+        
         return {
           success: false,
           error: `Failed to swap Native USDC to USDC.e: ${swapResult.error}`,
@@ -263,6 +284,15 @@ export async function transferFromEmbeddedToProxy(
         amountSwapped: swapResult.amountInHuman,
         amountReceived: swapResult.amountOutHuman,
       });
+
+      // Update progress to swap complete
+      if (depositId && swapResult.transactionHash) {
+        await depositProgressService.updateSwapComplete(
+          depositId,
+          swapResult.transactionHash,
+          swapResult.amountOutHuman || swapAmount.toFixed(6)
+        );
+      }
 
       // Update balance after swap
       balance = await embeddedWalletBalanceService.getEmbeddedWalletBalance(
@@ -311,6 +341,11 @@ export async function transferFromEmbeddedToProxy(
       embeddedBalance: balanceHuman,
       tokenType: 'USDC.e',
     });
+
+    // Update progress to transferring
+    if (depositId) {
+      await depositProgressService.updateToTransferring(depositId);
+    }
 
     // Get RelayerClient for embedded wallet (EOA)
     const relayerClient = await getRelayerClientForEmbeddedTransfer(privyUserId);
@@ -450,6 +485,11 @@ export async function transferFromEmbeddedToProxy(
       txHash,
     });
 
+    // Update progress to complete
+    if (depositId) {
+      await depositProgressService.completeDeposit(depositId, txHash);
+    }
+
     // Update embedded wallet balance after transfer
     // The balance service polling will pick this up, but we can trigger a check immediately
     await embeddedWalletBalanceService
@@ -481,6 +521,12 @@ export async function transferFromEmbeddedToProxy(
       error: errorMessage,
       stack: error instanceof Error ? error.stack : undefined,
     });
+
+    // Update progress to failed
+    const activeDeposit = depositProgressService.getMostRecentActiveDeposit(privyUserId);
+    if (activeDeposit?.depositId) {
+      await depositProgressService.failDeposit(activeDeposit.depositId, errorMessage);
+    }
 
     return {
       success: false,
