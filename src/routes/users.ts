@@ -14,6 +14,7 @@ import {
   getUserByUsername,
   getUserWalletInfo,
   updateUserSessionSigner,
+  markOnboardingComplete,
   isUsernameAvailable,
   deployProxyWallet,
   updateUserProxyWallet,
@@ -534,11 +535,104 @@ router.get('/check-privy-config', async (req: Request, res: Response) => {
  *                   example: "cryptotrader"
  */
 router.get('/check-username/:username', async (req: Request, res: Response) => {
+  // #region agent log
+  const fs = require('fs');
+  try {
+    const logEntry = {
+      location: 'users.ts:536',
+      message: 'check-username endpoint called',
+      data: {
+        username: req.params.username,
+        method: req.method,
+        url: req.url,
+        headers: Object.keys(req.headers),
+        origin: req.headers.origin,
+      },
+      timestamp: Date.now(),
+      sessionId: 'debug-session',
+      runId: 'run1',
+      hypothesisId: 'A',
+    };
+    fs.appendFileSync('/root/mevu/.cursor/debug.log', JSON.stringify(logEntry) + '\n');
+  } catch (logErr) {
+    // Ignore logging errors
+  }
+  // #endregion
+  logger.info({ message: '[DEBUG] check-username endpoint called', username: req.params.username, origin: req.headers.origin });
+  
   try {
     const { username } = req.params;
+    // #region agent log
+    try {
+      const logEntry2 = {
+        location: 'users.ts:547',
+        message: 'calling isUsernameAvailable',
+        data: { username },
+        timestamp: Date.now(),
+        sessionId: 'debug-session',
+        runId: 'run1',
+        hypothesisId: 'A',
+      };
+      fs.appendFileSync('/root/mevu/.cursor/debug.log', JSON.stringify(logEntry2) + '\n');
+    } catch (logErr) {
+      // Ignore logging errors
+    }
+    // #endregion
     const available = await isUsernameAvailable(username);
+    // #region agent log
+    try {
+      const logEntry3 = {
+        location: 'users.ts:551',
+        message: 'isUsernameAvailable completed',
+        data: { username, available },
+        timestamp: Date.now(),
+        sessionId: 'debug-session',
+        runId: 'run1',
+        hypothesisId: 'A',
+      };
+      fs.appendFileSync('/root/mevu/.cursor/debug.log', JSON.stringify(logEntry3) + '\n');
+    } catch (logErr) {
+      // Ignore logging errors
+    }
+    // #endregion
+    // #region agent log
+    try {
+      const logEntry4 = {
+        location: 'users.ts:559',
+        message: 'sending response',
+        data: { username, available },
+        timestamp: Date.now(),
+        sessionId: 'debug-session',
+        runId: 'run1',
+        hypothesisId: 'A',
+      };
+      fs.appendFileSync('/root/mevu/.cursor/debug.log', JSON.stringify(logEntry4) + '\n');
+    } catch (logErr) {
+      // Ignore logging errors
+    }
+    // #endregion
     res.json({ available, username });
   } catch (error) {
+    // #region agent log
+    try {
+      const logEntry5 = {
+        location: 'users.ts:570',
+        message: 'error in check-username endpoint',
+        data: {
+          username: req.params.username,
+          error: error instanceof Error ? error.message : String(error),
+          errorType: error instanceof Error ? error.constructor.name : typeof error,
+        },
+        timestamp: Date.now(),
+        sessionId: 'debug-session',
+        runId: 'run1',
+        hypothesisId: 'A',
+      };
+      fs.appendFileSync('/root/mevu/.cursor/debug.log', JSON.stringify(logEntry5) + '\n');
+    } catch (logErr) {
+      // Ignore logging errors
+    }
+    // #endregion
     logger.error({
       message: 'Error checking username availability',
       error: error instanceof Error ? error.message : String(error),
@@ -910,17 +1004,34 @@ router.post('/add-session-signer', async (req: Request, res: Response) => {
  *         description: Failed to set up approvals
  */
 router.post('/approve-tokens', async (req: Request, res: Response) => {
+  // #region agent log
+  fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:912',message:'approve-tokens endpoint called',data:{body:req.body,headers:Object.keys(req.headers),method:req.method,url:req.url},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+  // #endregion
   try {
     const { privyUserId } = req.body;
 
+    // #region agent log
+    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:915',message:'extracted privyUserId from body',data:{privyUserId:privyUserId,hasPrivyUserId:!!privyUserId,bodyKeys:Object.keys(req.body)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
+
     if (!privyUserId) {
+      // #region agent log
+      fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:917',message:'missing privyUserId - returning 400',data:{body:req.body},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
       return res.status(400).json({
         success: false,
         error: 'Missing required field: privyUserId',
       });
     }
 
+    // #region agent log
+    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:923',message:'calling setupTokenApprovals',data:{privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     const result = await setupTokenApprovals(privyUserId);
+
+    // #region agent log
+    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:925',message:'setupTokenApprovals succeeded',data:{success:result.success,transactionHashes:result.transactionHashes},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
 
     res.json({
       success: true,
@@ -928,6 +1039,9 @@ router.post('/approve-tokens', async (req: Request, res: Response) => {
       transactionHashes: result.transactionHashes,
     });
   } catch (error) {
+    // #region agent log
+    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:930',message:'error in approve-tokens endpoint',data:{error:error instanceof Error ? error.message : String(error),errorType:error instanceof Error ? error.constructor.name : typeof error,hasMessage:error instanceof Error && 'message' in error},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     logger.error({
       message: 'Error setting up token approvals',
       error: error instanceof Error ? error.message : String(error),
@@ -935,9 +1049,15 @@ router.post('/approve-tokens', async (req: Request, res: Response) => {
 
     if (error instanceof Error) {
       if (error.message.includes('User not found')) {
+        // #region agent log
+        fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:937',message:'user not found error',data:{privyUserId:req.body.privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+        // #endregion
         return res.status(400).json({ success: false, error: 'User not found' });
       }
       if (error.message.includes('does not have a proxy wallet')) {
+        // #region agent log
+        fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:940',message:'no proxy wallet error',data:{privyUserId:req.body.privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+        // #endregion
         return res.status(400).json({
           success: false,
           error: 'User does not have a proxy wallet. Register first.',
@@ -945,7 +1065,176 @@ router.post('/approve-tokens', async (req: Request, res: Response) => {
       }
     }
 
+    // #region agent log
+    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:947',message:'returning generic 500 error',data:{error:error instanceof Error ? error.message : String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     res.status(500).json({ success: false, error: 'Failed to set up token approvals' });
+  }
+});
+
+/**
+ * @swagger
+ * /api/users/complete-onboarding:
+ *   post:
+ *     summary: Mark user onboarding as complete
+ *     description: Called when user clicks "Start Trading" after completing all onboarding steps. This persists the completion state server-side to prevent the onboarding modal from showing again.
+ *     tags: [Users]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - privyUserId
+ *             properties:
+ *               privyUserId:
+ *                 type: string
+ *                 description: The Privy user ID
+ *                 example: "did:privy:clx1234567890"
+ *     responses:
+ *       200:
+ *         description: Onboarding marked as complete
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Onboarding completed successfully"
+ *                 user:
+ *                   type: object
+ *                   description: Updated user profile
+ *       400:
+ *         description: Missing privyUserId or user not ready for completion
+ *       404:
+ *         description: User not found
+ */
+router.post('/complete-onboarding', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId } = req.body;
+
+    logger.info({
+      message: '[Onboarding] complete-onboarding endpoint called',
+      privyUserId,
+      body: req.body,
+    });
+
+    if (!privyUserId) {
+      logger.warn({
+        message: '[Onboarding] Missing privyUserId in complete-onboarding request',
+      });
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required field: privyUserId',
+      });
+    }
+
+    // Get user to verify they exist and check their current state
+    const user = await getUserByPrivyId(privyUserId);
+    
+    if (!user) {
+      logger.warn({
+        message: '[Onboarding] User not found for complete-onboarding',
+        privyUserId,
+      });
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    // Log current user state for debugging
+    logger.info({
+      message: '[Onboarding] User state before marking complete',
+      privyUserId,
+      username: user.username,
+      sessionSignerEnabled: user.sessionSignerEnabled,
+      usdcApprovalEnabled: user.usdcApprovalEnabled,
+      ctfApprovalEnabled: user.ctfApprovalEnabled,
+      proxyWalletAddress: user.proxyWalletAddress,
+      onboardingCompleted: user.onboardingCompleted,
+    });
+
+    // Verify user has completed all required steps
+    if (!user.sessionSignerEnabled) {
+      logger.warn({
+        message: '[Onboarding] User tried to complete onboarding without session signer',
+        privyUserId,
+      });
+      return res.status(400).json({
+        success: false,
+        error: 'Session signer not enabled. Please complete the authorization step first.',
+        currentStep: 'session_signer',
+      });
+    }
+
+    if (!user.proxyWalletAddress) {
+      logger.warn({
+        message: '[Onboarding] User tried to complete onboarding without proxy wallet',
+        privyUserId,
+      });
+      return res.status(400).json({
+        success: false,
+        error: 'Proxy wallet not deployed. Please complete the authorization step first.',
+        currentStep: 'session_signer',
+      });
+    }
+
+    if (!user.usdcApprovalEnabled || !user.ctfApprovalEnabled) {
+      logger.warn({
+        message: '[Onboarding] User tried to complete onboarding without token approvals',
+        privyUserId,
+        usdcApprovalEnabled: user.usdcApprovalEnabled,
+        ctfApprovalEnabled: user.ctfApprovalEnabled,
+      });
+      return res.status(400).json({
+        success: false,
+        error: 'Token approvals not complete. Please complete the approval step first.',
+        currentStep: 'token_approval',
+      });
+    }
+
+    // Mark onboarding as complete
+    const updatedUser = await markOnboardingComplete(privyUserId);
+
+    if (!updatedUser) {
+      logger.error({
+        message: '[Onboarding] Failed to mark onboarding as complete',
+        privyUserId,
+      });
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to mark onboarding as complete',
+      });
+    }
+
+    logger.info({
+      message: '[Onboarding] Successfully marked onboarding as complete',
+      privyUserId,
+      username: updatedUser.username,
+      onboardingCompleted: updatedUser.onboardingCompleted,
+    });
+
+    res.json({
+      success: true,
+      message: 'Onboarding completed successfully',
+      user: updatedUser,
+    });
+  } catch (error) {
+    logger.error({
+      message: '[Onboarding] Error in complete-onboarding endpoint',
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to complete onboarding',
+    });
   }
 });
 

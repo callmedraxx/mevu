@@ -1628,13 +1628,26 @@ export async function deployProxyWallet(
 export async function setupTokenApprovals(
   privyUserId: string
 ): Promise<{ success: boolean; transactionHashes: string[] }> {
+  // #region agent log
+  fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'wallet-deployment.service.ts:1628',message:'setupTokenApprovals called',data:{privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+  // #endregion
   const user = await getUserByPrivyId(privyUserId);
   
+  // #region agent log
+  fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'wallet-deployment.service.ts:1632',message:'user lookup result',data:{userFound:!!user,hasProxyWallet:!!user?.proxyWalletAddress,proxyWallet:user?.proxyWalletAddress},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+  // #endregion
+  
   if (!user) {
+    // #region agent log
+    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'wallet-deployment.service.ts:1634',message:'user not found - throwing error',data:{privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+    // #endregion
     throw new Error('User not found');
   }
   
   if (!user.proxyWalletAddress) {
+    // #region agent log
+    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'wallet-deployment.service.ts:1638',message:'no proxy wallet - throwing error',data:{privyUserId,embeddedWallet:user.embeddedWalletAddress},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+    // #endregion
     throw new Error('User does not have a proxy wallet');
   }
 
@@ -1719,8 +1732,14 @@ export async function setupTokenApprovals(
 
     // Update user profile to mark approvals as enabled
     try {
+      // #region agent log
+      fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'wallet-deployment.service.ts:1720',message:'updating database approval statuses',data:{privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
       const { updateUserTokenApprovals } = await import('./user.service');
       await updateUserTokenApprovals(privyUserId, true, true);
+      // #region agent log
+      fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'wallet-deployment.service.ts:1723',message:'database approval statuses updated successfully',data:{privyUserId,usdc:true,ctf:true},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
       logger.info({
         message: 'Updated user token approval statuses',
         privyUserId,
@@ -1728,6 +1747,9 @@ export async function setupTokenApprovals(
         ctfApprovalEnabled: true,
       });
     } catch (updateError) {
+      // #region agent log
+      fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'wallet-deployment.service.ts:1730',message:'failed to update database approval statuses',data:{privyUserId,error:updateError instanceof Error ? updateError.message : String(updateError)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
       // Log error but don't fail the approval - approvals are on-chain
       logger.error({
         message: 'Failed to update user token approval statuses (non-critical)',
@@ -1736,6 +1758,9 @@ export async function setupTokenApprovals(
       });
     }
 
+    // #region agent log
+    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'wallet-deployment.service.ts:1739',message:'setupTokenApprovals returning success',data:{success:true,transactionHash:result.transactionHash},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+    // #endregion
     return {
       success: true,
       transactionHashes: [result.transactionHash],

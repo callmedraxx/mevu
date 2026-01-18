@@ -238,12 +238,12 @@ function extractAbbrevsFromSlug(slug: string | undefined, gameSport?: string): {
   }
   
   if (teamAbbrevs.length > 0) {
-    logger.warn({
-      message: 'Insufficient team abbreviations extracted from slug',
-      slug,
-      gameSport,
-      extracted: teamAbbrevs,
-    });
+    // logger.warn({
+    //   message: 'Insufficient team abbreviations extracted from slug',
+    //   slug,
+    //   gameSport,
+    //   extracted: teamAbbrevs,
+    // });
   }
   
   return {};

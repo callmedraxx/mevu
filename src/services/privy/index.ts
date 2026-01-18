@@ -23,6 +23,7 @@ export {
   updateUserProxyWallet,
   updateUserEmbeddedWalletAddress,
   updateUserSessionSigner,
+  markOnboardingComplete,
   isUsernameAvailable,
   userExists,
   deleteAllUsers,

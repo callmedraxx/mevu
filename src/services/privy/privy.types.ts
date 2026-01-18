@@ -37,6 +37,7 @@ export interface SignTypedDataRequest {
 export interface SignMessageRequest {
   userId: string;
   message: string;
+  walletId?: string; // Optional: walletId to avoid lookup if already known
 }
 
 export interface EIP712TypedData {
@@ -68,6 +69,7 @@ export interface UserProfile {
   sessionSignerEnabled: boolean;
   usdcApprovalEnabled: boolean;
   ctfApprovalEnabled: boolean;
+  onboardingCompleted: boolean;
   createdAt: Date;
   updatedAt: Date;
 }

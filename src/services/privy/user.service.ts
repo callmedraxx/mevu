@@ -74,6 +74,7 @@ export async function createUser(request: CreateUserRequest): Promise<UserProfil
       sessionSignerEnabled: false,
       usdcApprovalEnabled: false,
       ctfApprovalEnabled: false,
+      onboardingCompleted: false,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -100,7 +101,7 @@ export async function createUser(request: CreateUserRequest): Promise<UserProfil
        VALUES ($1, $2, $3)
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
                  proxy_wallet_address, session_signer_enabled, usdc_approval_enabled, 
-                 ctf_approval_enabled, created_at, updated_at`,
+                 ctf_approval_enabled, onboarding_completed, created_at, updated_at`,
       [request.privyUserId, request.username, normalizedAddress]
     );
 
@@ -114,6 +115,7 @@ export async function createUser(request: CreateUserRequest): Promise<UserProfil
       sessionSignerEnabled: row.session_signer_enabled,
       usdcApprovalEnabled: row.usdc_approval_enabled,
       ctfApprovalEnabled: row.ctf_approval_enabled,
+      onboardingCompleted: row.onboarding_completed ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -152,7 +154,7 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
     const result = await client.query(
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
               proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
-              ctf_approval_enabled, created_at, updated_at
+              ctf_approval_enabled, onboarding_completed, created_at, updated_at
        FROM users WHERE privy_user_id = $1`,
       [privyUserId]
     );
@@ -169,6 +171,7 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
       sessionSignerEnabled: row.session_signer_enabled,
       usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
       ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      onboardingCompleted: row.onboarding_completed ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -193,7 +196,7 @@ export async function getUserByUsername(username: string): Promise<UserProfile |
     const result = await client.query(
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
               proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
-              ctf_approval_enabled, created_at, updated_at
+              ctf_approval_enabled, onboarding_completed, created_at, updated_at
        FROM users WHERE LOWER(username) = LOWER($1)`,
       [username]
     );
@@ -210,6 +213,7 @@ export async function getUserByUsername(username: string): Promise<UserProfile |
       sessionSignerEnabled: row.session_signer_enabled,
       usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
       ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      onboardingCompleted: row.onboarding_completed ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -235,7 +239,7 @@ export async function getUserByWalletAddress(walletAddress: string): Promise<Use
     const result = await client.query(
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
               proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
-              ctf_approval_enabled, created_at, updated_at
+              ctf_approval_enabled, onboarding_completed, created_at, updated_at
        FROM users WHERE LOWER(embedded_wallet_address) = $1`,
       [normalizedAddress]
     );
@@ -252,6 +256,7 @@ export async function getUserByWalletAddress(walletAddress: string): Promise<Use
       sessionSignerEnabled: row.session_signer_enabled,
       usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
       ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      onboardingCompleted: row.onboarding_completed ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -300,7 +305,7 @@ export async function updateUserProxyWallet(
        WHERE privy_user_id = $2
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
                  proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
-                 ctf_approval_enabled, created_at, updated_at`,
+                 ctf_approval_enabled, onboarding_completed, created_at, updated_at`,
       [normalizedProxyAddress, privyUserId]
     );
 
@@ -323,6 +328,7 @@ export async function updateUserProxyWallet(
       sessionSignerEnabled: row.session_signer_enabled,
       usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
       ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      onboardingCompleted: row.onboarding_completed ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -397,7 +403,7 @@ export async function updateUserEmbeddedWalletAddress(
        WHERE privy_user_id = $2
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
                  proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
-                 ctf_approval_enabled, created_at, updated_at`,
+                 ctf_approval_enabled, onboarding_completed, created_at, updated_at`,
       [normalizedAddress, privyUserId]
     );
 
@@ -413,6 +419,7 @@ export async function updateUserEmbeddedWalletAddress(
       sessionSignerEnabled: row.session_signer_enabled,
       usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
       ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      onboardingCompleted: row.onboarding_completed ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -452,7 +459,7 @@ export async function updateUserTokenApprovals(
        WHERE privy_user_id = $3
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
                  proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
-                 ctf_approval_enabled, created_at, updated_at`,
+                 ctf_approval_enabled, onboarding_completed, created_at, updated_at`,
       [usdcApprovalEnabled, ctfApprovalEnabled, privyUserId]
     );
 
@@ -468,6 +475,7 @@ export async function updateUserTokenApprovals(
       sessionSignerEnabled: row.session_signer_enabled,
       usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
       ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      onboardingCompleted: row.onboarding_completed ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
@@ -507,7 +515,7 @@ export async function updateUserSessionSigner(
        WHERE privy_user_id = $2
        RETURNING id, privy_user_id, username, embedded_wallet_address, 
                  proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
-                 ctf_approval_enabled, created_at, updated_at`,
+                 ctf_approval_enabled, onboarding_completed, created_at, updated_at`,
       [enabled, privyUserId]
     );
 
@@ -523,6 +531,67 @@ export async function updateUserSessionSigner(
       sessionSignerEnabled: row.session_signer_enabled,
       usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
       ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      onboardingCompleted: row.onboarding_completed ?? false,
+      createdAt: new Date(row.created_at),
+      updatedAt: new Date(row.updated_at),
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Mark user's onboarding as completed
+ */
+export async function markOnboardingComplete(
+  privyUserId: string
+): Promise<UserProfile | null> {
+  const dbConfig = getDatabaseConfig();
+  
+  if (dbConfig.type !== 'postgres') {
+    const user = memoryStore.get(`user:privy:${privyUserId}`);
+    if (!user) return null;
+    
+    user.onboardingCompleted = true;
+    user.updatedAt = new Date();
+    
+    memoryStore.set(`user:privy:${privyUserId}`, user);
+    return user;
+  }
+
+  const client = await pool.connect();
+  
+  try {
+    const result = await client.query(
+      `UPDATE users 
+       SET onboarding_completed = TRUE, updated_at = CURRENT_TIMESTAMP
+       WHERE privy_user_id = $1
+       RETURNING id, privy_user_id, username, embedded_wallet_address, 
+                 proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
+                 ctf_approval_enabled, onboarding_completed, created_at, updated_at`,
+      [privyUserId]
+    );
+
+    if (result.rows.length === 0) return null;
+
+    const row = result.rows[0];
+    
+    logger.info({
+      message: 'Marked onboarding as complete',
+      privyUserId,
+      username: row.username,
+    });
+    
+    return {
+      id: row.id,
+      privyUserId: row.privy_user_id,
+      username: row.username,
+      embeddedWalletAddress: row.embedded_wallet_address,
+      proxyWalletAddress: row.proxy_wallet_address,
+      sessionSignerEnabled: row.session_signer_enabled,
+      usdcApprovalEnabled: row.usdc_approval_enabled ?? false,
+      ctfApprovalEnabled: row.ctf_approval_enabled ?? false,
+      onboardingCompleted: row.onboarding_completed ?? false,
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };

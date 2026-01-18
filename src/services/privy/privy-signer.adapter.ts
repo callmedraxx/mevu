@@ -85,6 +85,7 @@ export class PrivySignerAdapter extends ethers.Signer {
       const signature = await privyService.signMessage({
         userId: this.userId,
         message: messageString,
+        walletId: this.walletId, // Pass walletId to avoid lookup
       });
 
       return signature;

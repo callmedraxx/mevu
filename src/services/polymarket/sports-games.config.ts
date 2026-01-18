@@ -50,10 +50,6 @@ const SPORTS_GAMES_CONFIG: SportsGamesConfig = {
     seriesId: '10193', // TODO: Add La Liga series ID when available
     label: 'La Liga',
   },
-  valorant: {
-    seriesId: 'valorant', // Esports - Valorant
-    label: 'Valorant',
-  },
   cbb: {
     seriesId: '10347', // College Basketball
     label: 'College Basketball',

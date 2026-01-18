@@ -367,7 +367,6 @@ function extractSportFromSlug(slug: string, configuredSports: Set<string>): stri
     ufc: ['ufc', 'mma'],
     epl: ['epl', 'premier league', 'premier-league'],
     lal: ['lal', 'la liga', 'la-liga', 'laliga'],
-    valorant: ['valorant', 'val', 'vct'],
     cbb: ['cbb', 'college basketball', 'ncaa basketball', 'ncaab'],
     cfb: ['cfb', 'college football', 'ncaa football', 'ncaaf'],
   };

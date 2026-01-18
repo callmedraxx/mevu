@@ -463,88 +463,101 @@ class PrivyService {
     try {
       // Try to use SDK if available
       if (this.privyClient) {
-        const embeddedWalletAddress = await this.getEmbeddedWalletAddress(request.userId);
-        if (embeddedWalletAddress) {
-          const walletId = await this.getWalletIdByAddress(request.userId, embeddedWalletAddress);
-          if (walletId) {
-            const authorizationContext = this.getAuthorizationContext();
-            const response = await this.privyClient.wallets().ethereum().signMessage(walletId, {
-              message: request.message,
-              authorization_context: authorizationContext,
-            });
-            
-            // Normalize signature format for downstream consumers (RelayerClient expects 0x-prefixed hex string)
-            const rawSignature = (response as any)?.signature;
-            
-            logger.info({
-              message: 'Received signature from Privy signMessage',
-              userId: request.userId,
-              walletId,
-              signatureType: typeof rawSignature,
-              isString: typeof rawSignature === 'string',
-              isObject: typeof rawSignature === 'object',
-              hasRaw: rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature,
-            });
-            
-            if (typeof rawSignature === 'string') {
-              // Already a hex string
-              return rawSignature;
-            }
-            
-            if (rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature) {
-              try {
-                // raw might be a Uint8Array or an object with numeric keys (JSON-serialized Uint8Array)
-                const rawValue = (rawSignature as any).raw;
-                let bytes: Uint8Array;
-                
-                if (rawValue instanceof Uint8Array) {
-                  bytes = rawValue;
-                } else if (typeof rawValue === 'object' && rawValue !== null) {
-                  // Convert object with numeric keys to Uint8Array
-                  const length = Object.keys(rawValue).length;
-                  bytes = new Uint8Array(length);
-                  for (let i = 0; i < length; i++) {
-                    bytes[i] = rawValue[i] || 0;
-                  }
-                } else {
-                  throw new Error(`Unexpected raw signature format: ${typeof rawValue}`);
-                }
-                
-                // Convert to 0x-prefixed hex string
-                const hexSignature = ethers.utils.hexlify(bytes);
-                
-                logger.info({
-                  message: 'Normalized Privy signature from raw format',
-                  userId: request.userId,
-                  walletId,
-                  signatureLength: bytes.length,
-                });
-                
-                return hexSignature;
-              } catch (convertError) {
-                logger.error({
-                  message: 'Failed to convert Privy signature to hex string',
-                  userId: request.userId,
-                  walletId,
-                  signatureType: typeof rawSignature,
-                  signatureKeys: Object.keys(rawSignature),
-                  rawValueType: typeof (rawSignature as any)?.raw,
-                  rawValueKeys: (rawSignature as any)?.raw ? Object.keys((rawSignature as any).raw) : [],
-                  convertError: convertError instanceof Error ? convertError.message : String(convertError),
-                });
-                // Fall through to generic handling below
-              }
-            }
-            
-            // Fallback: stringify whatever we got, but this is unexpected
-            logger.warn({
-              message: 'Privy signMessage returned unexpected signature format',
-              userId: request.userId,
-              walletId,
-              rawSignature,
-            });
-            return String(rawSignature);
+        // Use provided walletId if available, otherwise look it up
+        let walletId = request.walletId;
+        
+        if (!walletId) {
+          const embeddedWalletAddress = await this.getEmbeddedWalletAddress(request.userId);
+          if (embeddedWalletAddress) {
+            walletId = await this.getWalletIdByAddress(request.userId, embeddedWalletAddress) || undefined;
           }
+        }
+        
+        if (walletId) {
+          logger.info({
+            message: 'Signing message with walletId',
+            userId: request.userId,
+            walletId,
+            walletIdSource: request.walletId ? 'provided' : 'looked up',
+          });
+          
+          const authorizationContext = this.getAuthorizationContext();
+          const response = await this.privyClient.wallets().ethereum().signMessage(walletId, {
+            message: request.message,
+            authorization_context: authorizationContext,
+          });
+          
+          // Normalize signature format for downstream consumers (RelayerClient expects 0x-prefixed hex string)
+          const rawSignature = (response as any)?.signature;
+          
+          logger.info({
+            message: 'Received signature from Privy signMessage',
+            userId: request.userId,
+            walletId,
+            signatureType: typeof rawSignature,
+            isString: typeof rawSignature === 'string',
+            isObject: typeof rawSignature === 'object',
+            hasRaw: rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature,
+          });
+          
+          if (typeof rawSignature === 'string') {
+            // Already a hex string
+            return rawSignature;
+          }
+          
+          if (rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature) {
+            try {
+              // raw might be a Uint8Array or an object with numeric keys (JSON-serialized Uint8Array)
+              const rawValue = (rawSignature as any).raw;
+              let bytes: Uint8Array;
+              
+              if (rawValue instanceof Uint8Array) {
+                bytes = rawValue;
+              } else if (typeof rawValue === 'object' && rawValue !== null) {
+                // Convert object with numeric keys to Uint8Array
+                const length = Object.keys(rawValue).length;
+                bytes = new Uint8Array(length);
+                for (let i = 0; i < length; i++) {
+                  bytes[i] = rawValue[i] || 0;
+                }
+              } else {
+                throw new Error(`Unexpected raw signature format: ${typeof rawValue}`);
+              }
+              
+              // Convert to 0x-prefixed hex string
+              const hexSignature = ethers.utils.hexlify(bytes);
+              
+              logger.info({
+                message: 'Normalized Privy signature from raw format',
+                userId: request.userId,
+                walletId,
+                signatureLength: bytes.length,
+              });
+              
+              return hexSignature;
+            } catch (convertError) {
+              logger.error({
+                message: 'Failed to convert Privy signature to hex string',
+                userId: request.userId,
+                walletId,
+                signatureType: typeof rawSignature,
+                signatureKeys: Object.keys(rawSignature),
+                rawValueType: typeof (rawSignature as any)?.raw,
+                rawValueKeys: (rawSignature as any)?.raw ? Object.keys((rawSignature as any).raw) : [],
+                convertError: convertError instanceof Error ? convertError.message : String(convertError),
+              });
+              // Fall through to generic handling below
+            }
+          }
+          
+          // Fallback: stringify whatever we got, but this is unexpected
+          logger.warn({
+            message: 'Privy signMessage returned unexpected signature format',
+            userId: request.userId,
+            walletId,
+            rawSignature,
+          });
+          return String(rawSignature);
         }
       }
 

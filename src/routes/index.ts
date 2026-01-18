@@ -16,6 +16,8 @@ import webhooksRouter from './webhooks';
 import priceHistoryRouter from './price-history';
 import playByPlayRouter from './playbyplay';
 import whaleProfileRouter from './whale-profile';
+import referralRouter from './referral';
+import oceanRouter from './ocean';
 
 const router = Router();
 
@@ -93,5 +95,11 @@ router.use('/playbyplay', playByPlayRouter);
 
 // Whale profile routes (whale trading data from Polymarket)
 router.use('/whale-profile', whaleProfileRouter);
+
+// Referral routes (referral links, stats, earnings)
+router.use('/referral', referralRouter);
+
+// Ocean routes (whale trades aggregation)
+router.use('/ocean', oceanRouter);
 
 export default router;

@@ -216,7 +216,6 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
     ufc: ['ufc', 'mma'],
     epl: ['epl', 'premier league', 'premier-league'],
     lal: ['lal', 'la liga', 'la-liga', 'laliga'],
-    valorant: ['valorant', 'val', 'vct'],
     cbb: ['cbb', 'college basketball', 'ncaa basketball', 'ncaab'],
     cfb: ['cfb', 'college football', 'ncaa football', 'ncaaf'],
   };
@@ -247,7 +246,7 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
   return null;
 }
 
-const STANDARD_LEAGUES = new Set(['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'epl', 'lal', 'valorant', 'val', 'cbb', 'cfb']);
+const STANDARD_LEAGUES = new Set(['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'epl', 'lal', 'cbb', 'cfb']);
 
 function extractLeagueFromSlug(slug: string): string | null {
   if (!slug) return null;

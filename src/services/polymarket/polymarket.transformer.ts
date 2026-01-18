@@ -89,27 +89,46 @@ function parseOutcomePrices(prices: string[] | string | undefined): number[] {
 }
 
 /**
- * Parse outcomes from string array
+ * Parse outcomes from string array or JSON string
+ * Polymarket API returns outcomes as a JSON string like "[\"Team A\", \"Team B\"]"
  */
-function parseOutcomes(outcomes: string[] | undefined): string[] {
-  if (!outcomes || !Array.isArray(outcomes)) {
+function parseOutcomes(outcomes: string[] | string | undefined): string[] {
+  if (!outcomes) {
     return [];
   }
 
   try {
-    // Handle JSON string arrays
-    if (outcomes.length === 1 && typeof outcomes[0] === 'string') {
+    // Handle JSON string directly (e.g., "[\"Team A\", \"Team B\"]")
+    if (typeof outcomes === 'string') {
       try {
-        const parsed = JSON.parse(outcomes[0]);
+        const parsed = JSON.parse(outcomes);
         if (Array.isArray(parsed)) {
           return parsed.map((o) => String(o));
         }
       } catch {
-        // Not JSON, continue with normal parsing
+        // Not valid JSON, return empty
+        return [];
       }
     }
 
-    return outcomes.map((o) => String(o));
+    // Handle array of outcomes
+    if (Array.isArray(outcomes)) {
+      // Handle JSON string arrays (array with one JSON string element)
+      if (outcomes.length === 1 && typeof outcomes[0] === 'string') {
+        try {
+          const parsed = JSON.parse(outcomes[0]);
+          if (Array.isArray(parsed)) {
+            return parsed.map((o) => String(o));
+          }
+        } catch {
+          // Not JSON, continue with normal parsing
+        }
+      }
+
+      return outcomes.map((o) => String(o));
+    }
+
+    return [];
   } catch (error) {
     logger.warn({
       message: 'Error parsing outcomes',

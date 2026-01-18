@@ -1,0 +1,5 @@
+docker exec -i mevu-postgres-1 psql -U user -d mevu -c "
+DELETE FROM users 
+WHERE LOWER(embedded_wallet_address) = LOWER('0xccF2c8973eFB3FFa8B1dCB445d1468F3C273acBb')
+RETURNING id, privy_user_id, username, embedded_wallet_address;
+"

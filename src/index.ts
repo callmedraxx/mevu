@@ -40,49 +40,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // CORS configuration
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
-  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
-  : [
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'http://localhost:5173',
-      'http://localhost:5174',
-      'https://fa3795bc-6208-4282-97cc-8f1c26adec6c.lovableproject.com',
-      /^https:\/\/.*\.lovableproject\.com$/, // Allow all Lovable project subdomains
-      /^https:\/\/.*\.lovable\.app$/, // Allow all Lovable app subdomains (preview, etc.)
-      'https://app.mevu.com',
-      'https://mevu.com',
-      /^https:\/\/.*\.mevu\.com$/, // Allow all mevu subdomains
-    ];
-
+// Allow all origins for development
 app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps, Postman, curl)
-    if (!origin) {
-      return callback(null, true);
-    }
-
-    // Check if origin matches any allowed origin
-    const isAllowed = allowedOrigins.some(allowed => {
-      if (typeof allowed === 'string') {
-        return origin === allowed;
-      } else if (allowed instanceof RegExp) {
-        return allowed.test(origin);
-      }
-      return false;
-    });
-
-    if (isAllowed) {
-      callback(null, true);
-    } else {
-      logger.warn({
-        message: 'CORS blocked origin',
-        origin,
-        allowedOrigins: allowedOrigins.filter(o => typeof o === 'string'),
-      });
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: true,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
