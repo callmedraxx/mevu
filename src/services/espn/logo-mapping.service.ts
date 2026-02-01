@@ -73,16 +73,16 @@ async function loadLogoMapping(): Promise<void> {
   try {
     const data = await fs.readFile(LOGO_MAPPING_FILE, 'utf-8');
     logoMapping = JSON.parse(data);
-    logger.info({
-      message: 'Logo mapping loaded',
-      count: Object.keys(logoMapping).length,
-    });
+    // logger.info({
+    //   message: 'Logo mapping loaded',
+    //   count: Object.keys(logoMapping).length,
+    // });
   } catch (error) {
     // File doesn't exist yet, start with empty mapping
     logoMapping = {};
-    logger.info({
-      message: 'Logo mapping file not found, starting with empty mapping',
-    });
+    // logger.info({
+    //   message: 'Logo mapping file not found, starting with empty mapping',
+    // });
   }
 }
 
@@ -93,10 +93,10 @@ async function saveLogoMapping(): Promise<void> {
   try {
     await ensureDirectories();
     await fs.writeFile(LOGO_MAPPING_FILE, JSON.stringify(logoMapping, null, 2));
-    logger.info({
-      message: 'Logo mapping saved',
-      count: Object.keys(logoMapping).length,
-    });
+    // logger.info({
+    //   message: 'Logo mapping saved',
+    //   count: Object.keys(logoMapping).length,
+    // });
   } catch (error) {
     logger.error({
       message: 'Error saving logo mapping',

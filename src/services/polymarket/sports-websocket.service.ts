@@ -140,11 +140,11 @@ export class SportsWebSocketService {
     this.reconnectAttempts++;
     const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1); // Exponential backoff
 
-    logger.info({
-      message: 'Scheduling Sports WebSocket reconnect',
-      attempt: this.reconnectAttempts,
-      delayMs: delay,
-    });
+    // logger.info({
+    //   message: 'Scheduling Sports WebSocket reconnect',
+    //   attempt: this.reconnectAttempts,
+    //   delayMs: delay,
+    // });
 
     setTimeout(() => {
       this.ws = null;
@@ -237,11 +237,10 @@ export class SportsWebSocketService {
         this.messageHistory.shift();
       }
 
-      // Update live games database using gameId
-      // The gameId from WebSocket should match the gameId stored in live_games table
+      // Update cache + broadcast immediately; DB flush every 1s (batched)
       try {
-        const { updateGameByGameId } = await import('./live-games.service');
-        await updateGameByGameId(gameUpdate.gameId, {
+        const { applySportsGameUpdate } = await import('./live-games.service');
+        applySportsGameUpdate(gameUpdate.gameId, {
           score: gameUpdate.score,
           period: gameUpdate.period,
           elapsed: gameUpdate.elapsed,
@@ -250,12 +249,8 @@ export class SportsWebSocketService {
           active: gameUpdate.live && !gameUpdate.ended,
           closed: gameUpdate.ended,
         });
-      } catch (error) {
-        // logger.warn({
-        //   message: 'Error updating live game from WebSocket',
-        //   error: error instanceof Error ? error.message : String(error),
-        //   gameId: gameUpdate.gameId,
-        // });
+      } catch {
+        // ignore
       }
 
       return;

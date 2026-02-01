@@ -68,12 +68,12 @@ export class PolymarketClient {
       (config) => {
         this.requestCount++;
         this.lastRequestTime = Date.now();
-        logger.info({
-          message: 'Polymarket API request',
-          method: config.method?.toUpperCase(),
-          url: config.url,
-          params: config.params,
-        });
+        // logger.info({
+        //   message: 'Polymarket API request',
+        //   method: config.method?.toUpperCase(),
+        //   url: config.url,
+        //   params: config.params,
+        // });
         return config;
       },
       (error) => {
@@ -88,12 +88,12 @@ export class PolymarketClient {
     // Response interceptor for logging
     this.client.interceptors.response.use(
       (response) => {
-        logger.info({
-          message: 'Polymarket API response',
-          status: response.status,
-          url: response.config.url,
-          dataLength: Array.isArray(response.data?.data) ? response.data.data.length : 0,
-        });
+        // logger.info({
+        //   message: 'Polymarket API response',
+        //   status: response.status,
+        //   url: response.config.url,
+        //   dataLength: Array.isArray(response.data?.data) ? response.data.data.length : 0,
+        // });
         return response;
       },
       (error: AxiosError) => {
@@ -110,12 +110,12 @@ export class PolymarketClient {
     // CLOB client request interceptor for logging
     this.clobClient.interceptors.request.use(
       (config) => {
-        logger.info({
-          message: 'Polymarket CLOB API request',
-          method: config.method?.toUpperCase(),
-          url: config.url,
-          params: config.params,
-        });
+        // logger.info({
+        //   message: 'Polymarket CLOB API request',
+        //   method: config.method?.toUpperCase(),
+        //   url: config.url,
+        //   params: config.params,
+        // });
         return config;
       },
       (error) => {
@@ -130,12 +130,12 @@ export class PolymarketClient {
     // CLOB client response interceptor for logging
     this.clobClient.interceptors.response.use(
       (response) => {
-        logger.info({
-          message: 'Polymarket CLOB API response',
-          status: response.status,
-          url: response.config.url,
-          historyLength: Array.isArray(response.data?.history) ? response.data.history.length : 0,
-        });
+        // logger.info({
+        //   message: 'Polymarket CLOB API response',
+        //   status: response.status,
+        //   url: response.config.url,
+        //   historyLength: Array.isArray(response.data?.history) ? response.data.history.length : 0,
+        // });
         return response;
       },
       (error: AxiosError) => {
@@ -414,11 +414,11 @@ export class PolymarketClient {
 
         const response = await this.clobClient.request<OrderBookResponse[]>(config);
 
-        logger.info({
-          message: 'Orderbooks fetched successfully',
-          tokenCount: tokenIds.length,
-          orderbookCount: response.data?.length || 0,
-        });
+        // logger.info({
+        //   message: 'Orderbooks fetched successfully',
+        //   tokenCount: tokenIds.length,
+        //   orderbookCount: response.data?.length || 0,
+        // });
 
         return response.data;
       } catch (error) {

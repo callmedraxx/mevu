@@ -311,11 +311,11 @@ router.get('/portfolio/:privyUserId/stream', async (req: Request, res: Response)
   }
   portfolioSSEClients.get(privyUserId)!.add(res);
 
-  logger.info({
-    message: 'Portfolio SSE client connected',
-    privyUserId,
-    totalClients: portfolioSSEClients.get(privyUserId)!.size,
-  });
+  // logger.info({
+  //   message: 'Portfolio SSE client connected',
+  //   privyUserId,
+  //   totalClients: portfolioSSEClients.get(privyUserId)!.size,
+  // });
 
   // Send initial portfolio value
   try {

@@ -594,12 +594,12 @@ export async function getPlayByPlay(sport: string, gameId: number): Promise<Play
   }
 
   try {
-    logger.info({
-      message: 'Fetching play-by-play data',
-      sport: normalizedSport,
-      gameId,
-      dataType,
-    });
+    // logger.info({
+    //   message: 'Fetching play-by-play data',
+    //   sport: normalizedSport,
+    //   gameId,
+    //   dataType,
+    // });
 
     let data: NormalizedPlay[] | NormalizedEvent[];
 
@@ -632,13 +632,13 @@ export async function getPlayByPlay(sport: string, gameId: number): Promise<Play
       data = await fetchSoccerEvents(normalizedSport, gameId);
     }
 
-    logger.info({
-      message: 'Play-by-play data fetched successfully',
-      sport: normalizedSport,
-      gameId,
-      dataType,
-      count: data.length,
-    });
+    // logger.info({
+    //   message: 'Play-by-play data fetched successfully',
+    //   sport: normalizedSport,
+    //   gameId,
+    //   dataType,
+    //   count: data.length,
+    // });
 
     return {
       success: true,

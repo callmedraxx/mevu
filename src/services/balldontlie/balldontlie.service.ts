@@ -10,6 +10,7 @@
 import { BalldontlieAPI } from '@balldontlie/sdk';
 import { logger } from '../../config/logger';
 import { pool } from '../../config/database';
+import { gamesCache } from '../polymarket/live-games.service';
 import { teamsService } from '../polymarket/teams.service';
 import { getLeagueForSport } from '../polymarket/teams.config';
 
@@ -86,13 +87,13 @@ function convertToApiTimezone(utcDate: Date, sport: string): string {
   const [month, day, year] = localeDateStr.split('/');
   const apiDateStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
   
-  logger.debug({
-    message: 'Converted UTC date to API timezone',
-    utcDate: utcDate.toISOString(),
-    sport,
-    timezone,
-    apiDateStr,
-  });
+  // logger.debug({
+  //   message: 'Converted UTC date to API timezone',
+  //   utcDate: utcDate.toISOString(),
+  //   sport,
+  //   timezone,
+  //   apiDateStr,
+  // });
   
   return apiDateStr;
 }
@@ -314,13 +315,13 @@ class BallDontLieClient {
         let stats = response.data.data || [];
         
         if (stats.length > 0) {
-          logger.info({
-            message: `${sport.toUpperCase()} player stats found`,
-            endpoint,
-            statsCount: stats.length,
-            sampleStat: stats[0],
-            sampleStatKeys: Object.keys(stats[0]),
-          });
+          // logger.info({
+          //   message: `${sport.toUpperCase()} player stats found`,
+          //   endpoint,
+          //   statsCount: stats.length,
+          //   sampleStat: stats[0],
+          //   sampleStatKeys: Object.keys(stats[0]),
+          // });
           
           // Stats only have player_id and team_id - need to enrich with names
           if (stats[0].player_id && !stats[0].player) {
@@ -331,11 +332,11 @@ class BallDontLieClient {
         }
         
         // If no stats but request succeeded, return empty array
-        logger.info({
-          message: `${sport.toUpperCase()} player stats endpoint responded but no data`,
-          endpoint,
-          gameIds: validGameIds,
-        });
+        // logger.info({
+        //   message: `${sport.toUpperCase()} player stats endpoint responded but no data`,
+        //   endpoint,
+        //   gameIds: validGameIds,
+        // });
         return [];
         
     } catch (error: any) {
@@ -412,10 +413,10 @@ class BallDontLieClient {
         });
       });
       
-      logger.info({
-        message: 'EPL teams fetched for enrichment',
-        teamCount: teams.length,
-      });
+      // logger.info({
+      //   message: 'EPL teams fetched for enrichment',
+      //   teamCount: teams.length,
+      // });
     } catch (error: any) {
       logger.warn({
         message: 'Failed to fetch EPL teams',
@@ -425,11 +426,11 @@ class BallDontLieClient {
     
     for (const gameId of gameIds) {
       try {
-        logger.info({
-          message: 'Fetching EPL player stats',
-          gameId,
-          endpoint: `/epl/v1/games/${gameId}/player_stats`,
-        });
+        // logger.info({
+        //   message: 'Fetching EPL player stats',
+        //   gameId,
+        //   endpoint: `/epl/v1/games/${gameId}/player_stats`,
+        // });
         
         // Fetch player stats for this game
         const statsResponse = await axios.get(
@@ -440,10 +441,10 @@ class BallDontLieClient {
         const playerStats = statsResponse.data?.data?.players || [];
         
         if (playerStats.length === 0) {
-          logger.info({
-            message: 'EPL game has no player stats yet',
-            gameId,
-          });
+          // logger.info({
+          //   message: 'EPL game has no player stats yet',
+          //   gameId,
+          // });
           continue;
         }
         
@@ -470,12 +471,12 @@ class BallDontLieClient {
           }
         });
         
-        logger.info({
-          message: 'EPL lineups fetched for player enrichment',
-          gameId,
-          lineupsCount: lineups.length,
-          playerInfoMapSize: playerInfoMap.size,
-        });
+        // logger.info({
+        //   message: 'EPL lineups fetched for player enrichment',
+        //   gameId,
+        //   lineupsCount: lineups.length,
+        //   playerInfoMapSize: playerInfoMap.size,
+        // });
         
         // Transform EPL stats format to normalized format
         // EPL returns: { player_id, team_id, stats: [{name, value}] }
@@ -526,17 +527,17 @@ class BallDontLieClient {
           });
         }
         
-        logger.info({
-          message: 'EPL player stats processed',
-          gameId,
-          statsCount: playerStats.length,
-          samplePlayer: allStats.length > 0 ? {
-            player_id: allStats[allStats.length - 1].player_id,
-            player_name: `${allStats[allStats.length - 1].player?.first_name} ${allStats[allStats.length - 1].player?.last_name}`,
-            team_name: allStats[allStats.length - 1].team?.name,
-            goals: allStats[allStats.length - 1].goals,
-          } : null,
-        });
+        // logger.info({
+        //   message: 'EPL player stats processed',
+        //   gameId,
+        //   statsCount: playerStats.length,
+        //   samplePlayer: allStats.length > 0 ? {
+        //     player_id: allStats[allStats.length - 1].player_id,
+        //     player_name: `${allStats[allStats.length - 1].player?.first_name} ${allStats[allStats.length - 1].player?.last_name}`,
+        //     team_name: allStats[allStats.length - 1].team?.name,
+        //     goals: allStats[allStats.length - 1].goals,
+        //   } : null,
+        // });
         
       } catch (error: any) {
         logger.error({
@@ -563,11 +564,11 @@ class BallDontLieClient {
     const playerIds = new Set(stats.map(s => s.player_id).filter(Boolean));
     const teamIds = [...new Set(stats.map(s => s.team_id).filter(Boolean))];
     
-    logger.info({
-      message: `Enriching ${sport.toUpperCase()} stats with player/team data`,
-      playerCount: playerIds.size,
-      teamCount: teamIds.length,
-    });
+    // logger.info({
+    //   message: `Enriching ${sport.toUpperCase()} stats with player/team data`,
+    //   playerCount: playerIds.size,
+    //   teamCount: teamIds.length,
+    // });
     
     // Fetch teams first
     const teamsMap = new Map<number, any>();
@@ -592,10 +593,10 @@ class BallDontLieClient {
         });
       });
       
-      logger.info({
-        message: `Fetched ${sport.toUpperCase()} teams`,
-        teamCount: teams.length,
-      });
+      // logger.info({
+      //   message: `Fetched ${sport.toUpperCase()} teams`,
+      //   teamCount: teams.length,
+      // });
     } catch (error: any) {
       logger.warn({
         message: `Failed to fetch ${sport.toUpperCase()} team data`,
@@ -656,11 +657,11 @@ class BallDontLieClient {
           
         } while (cursor && pageCount < maxPages);
         
-        logger.debug({
-          message: `Fetched ${sport.toUpperCase()} roster for team`,
-          teamId,
-          playersFound: playersMap.size,
-        });
+        // logger.debug({
+        //   message: `Fetched ${sport.toUpperCase()} roster for team`,
+        //   teamId,
+        //   playersFound: playersMap.size,
+        // });
         
       } catch (error: any) {
         logger.warn({
@@ -695,18 +696,18 @@ class BallDontLieClient {
       };
     });
     
-    logger.info({
-      message: `Enriched ${sport.toUpperCase()} stats`,
-      totalStats: enrichedStats.length,
-      playersNeeded: playerIds.size,
-      playersFound: playersMap.size,
-      teamsFound: teamsMap.size,
-      sampleEnriched: enrichedStats[0] ? {
-        player_id: enrichedStats[0].player?.id,
-        player_name: `${enrichedStats[0].player?.first_name} ${enrichedStats[0].player?.last_name}`,
-        team_name: enrichedStats[0].team?.name,
-      } : null,
-    });
+    // logger.info({
+    //   message: `Enriched ${sport.toUpperCase()} stats`,
+    //   totalStats: enrichedStats.length,
+    //   playersNeeded: playerIds.size,
+    //   playersFound: playersMap.size,
+    //   teamsFound: teamsMap.size,
+    //   sampleEnriched: enrichedStats[0] ? {
+    //     player_id: enrichedStats[0].player?.id,
+    //     player_name: `${enrichedStats[0].player?.first_name} ${enrichedStats[0].player?.last_name}`,
+    //     team_name: enrichedStats[0].team?.name,
+    //   } : null,
+    // });
     
     return enrichedStats;
   }
@@ -878,13 +879,13 @@ class BallDontLieClient {
     const endpoint = `https://api.balldontlie.io/${sport}/v1/${endpointType}`;
 
     try {
-      logger.info({
-        message: `Fetching ${sport.toUpperCase()} games for date`,
-        endpoint,
-        endpointType,
-        date,
-        season,
-      });
+      // logger.info({
+      //   message: `Fetching ${sport.toUpperCase()} games for date`,
+      //   endpoint,
+      //   endpointType,
+      //   date,
+      //   season,
+      // });
 
       // For non-EPL soccer leagues, use dates[] parameter directly (more efficient)
       // For EPL, use season + pagination and filter by kickoff date
@@ -912,12 +913,12 @@ class BallDontLieClient {
 
       const games = response.data.data || [];
       
-        logger.info({
-          message: `${sport.toUpperCase()} matches found`,
-          date,
-          gamesCount: games.length,
-          sampleGame: games[0] ? { id: games[0].id, name: games[0].name, date: games[0].date } : null,
-        });
+        // logger.info({
+        //   message: `${sport.toUpperCase()} matches found`,
+        //   date,
+        //   gamesCount: games.length,
+        //   sampleGame: games[0] ? { id: games[0].id, name: games[0].name, date: games[0].date } : null,
+        // });
       
       return games;
       }
@@ -955,27 +956,27 @@ class BallDontLieClient {
         });
         
         if (targetGames.length > 0) {
-        logger.info({
-            message: `Found ${sport.toUpperCase()} games for target date`,
-          date,
-            season,
-            targetGamesCount: targetGames.length,
-            sampleGame: targetGames[0],
-          });
+        // logger.info({
+        //     message: `Found ${sport.toUpperCase()} games for target date`,
+        //   date,
+        //     season,
+        //     targetGamesCount: targetGames.length,
+        //     sampleGame: targetGames[0],
+        //   });
           return targetGames; // Return only games for the target date
         }
         
         cursor = response.data.meta?.next_cursor || null;
         pageCount++;
         
-        // Log progress
-        logger.debug({
-          message: `${sport.toUpperCase()} games pagination`,
-          page: pageCount,
-          gamesInPage: games.length,
-          totalGames: allGames.length,
-          cursor,
-        });
+        // // Log progress
+        // logger.debug({
+        //   message: `${sport.toUpperCase()} games pagination`,
+        //   page: pageCount,
+        //   gamesInPage: games.length,
+        //   totalGames: allGames.length,
+        //   cursor,
+        // });
         
       } while (cursor && pageCount < maxPages);
       
@@ -985,21 +986,21 @@ class BallDontLieClient {
         return kickoffDate === date;
       });
       
-      if (matchingGames.length > 0) {
-        logger.info({
-          message: `${sport.toUpperCase()} games found after pagination`,
-          date,
-          matchingGamesCount: matchingGames.length,
-          sampleMatch: matchingGames[0],
-        });
-      } else {
-        logger.warn({
-          message: `No ${sport.toUpperCase()} games found for date after ${pageCount} pages`,
-          date,
-          season,
-          totalGamesChecked: allGames.length,
-        });
-      }
+      // if (matchingGames.length > 0) {
+      //   logger.info({
+      //     message: `${sport.toUpperCase()} games found after pagination`,
+      //     date,
+      //     matchingGamesCount: matchingGames.length,
+      //     sampleMatch: matchingGames[0],
+      //   });
+      // } else {
+      //   logger.warn({
+      //     message: `No ${sport.toUpperCase()} games found for date after ${pageCount} pages`,
+      //     date,
+      //     season,
+      //     totalGamesChecked: allGames.length,
+      //   });
+      // }
       
       return matchingGames;
     } catch (error: any) {
@@ -1046,11 +1047,11 @@ class BallDontLieClient {
         });
       }
       
-      logger.info({
-        message: `Fetched ${sport.toUpperCase()} teams`,
-        season,
-        teamCount: teamsMap.size,
-      });
+      // logger.info({
+      //   message: `Fetched ${sport.toUpperCase()} teams`,
+      //   season,
+      //   teamCount: teamsMap.size,
+      // });
       
       return teamsMap;
     } catch (error: any) {
@@ -1155,6 +1156,7 @@ export const ballDontLieClient = new BallDontLieClient();
 
 /**
  * Store player stats in database (supports multiple sports)
+ * Uses gamesCache when available; only connects to pool when writing.
  * @param gameId - Polymarket game ID (live_games.id)
  * @param sport - Sport name (nba, nfl, mlb, nhl, epl)
  * @param balldontlieGameId - Ball Don't Lie game ID
@@ -1166,217 +1168,154 @@ export async function storePlayerStats(
   balldontlieGameId: number,
   stats: BallDontLiePlayerStat[]
 ): Promise<void> {
-  const client = await pool.connect();
+  // 1. Get game data from cache or DB (pool.query auto-releases, no connection held)
+  let game: Record<string, any>;
+  let gameSlug: string;
 
-  try {
-    await client.query('BEGIN');
-
-    // Get game data to determine home/away teams
-    const gameResult = await client.query(
-      'SELECT transformed_data, sport FROM live_games WHERE id = $1',
+  const cachedGame = gamesCache.get(gameId);
+  if (cachedGame) {
+    game = cachedGame as unknown as Record<string, any>;
+    gameSlug = cachedGame.slug || '';
+  } else {
+    const result = await pool.query(
+      'SELECT transformed_data, slug FROM live_games WHERE id = $1',
       [gameId]
     );
-
-    if (gameResult.rows.length === 0) {
+    if (result.rows.length === 0) {
       throw new Error(`Game not found: ${gameId}`);
     }
+    const row = result.rows[0];
+    const transformedData = row.transformed_data;
+    game = typeof transformedData === 'string' ? JSON.parse(transformedData) : transformedData;
+    gameSlug = row.slug || '';
+  }
 
-    // Extract team info from transformed_data JSONB
-    const transformedData = gameResult.rows[0].transformed_data;
-    const game = typeof transformedData === 'string' 
-      ? JSON.parse(transformedData) 
-      : transformedData;
-    
-    // Get the game slug to extract team abbreviations as fallback
-    const gameSlugResult = await client.query(
-      'SELECT slug FROM live_games WHERE id = $1',
-      [gameId]
-    );
-    const gameSlug = gameSlugResult.rows[0]?.slug || '';
-    
-    // Extract team abbreviations from slug (format: sport-away-home-date)
-    // This is needed for CFB/CBB and other games without homeTeam/awayTeam in transformed_data
-    const slugAbbrevs = extractAbbrevsFromSlug(gameSlug);
-    
-    // Determine home/away by matching team abbreviations
-    // Priority: transformed_data > slug parsing > empty
-    const homeTeamAbbr = (game.homeTeam?.abbreviation || 
-                         game.teamIdentifiers?.home ||
-                         slugAbbrevs.home || '').toLowerCase();
-    const awayTeamAbbr = (game.awayTeam?.abbreviation || 
-                         game.teamIdentifiers?.away ||
-                         slugAbbrevs.away || '').toLowerCase();
-    
-    // Extract team names from title for CFB/CBB games (format: "Away vs. Home" or "Away vs Home")
-    const title = game.title || '';
-    const titleMatch = title.match(/^(.+?)\s+vs\.?\s+(.+?)$/i);
-    const awayTeamNameFromTitle = titleMatch ? titleMatch[1].toLowerCase().trim() : '';
-    const homeTeamNameFromTitle = titleMatch ? titleMatch[2].toLowerCase().trim() : '';
-    
-    logger.debug({
-      message: 'Team abbreviations for isHome matching',
-      gameId,
-      gameSlug,
-      slugAbbrevs,
-      homeTeamAbbr,
-      awayTeamAbbr,
-      homeTeamNameFromTitle,
-      awayTeamNameFromTitle,
-    });
+  // 2. All prep work before acquiring a connection
+  const slugAbbrevs = extractAbbrevsFromSlug(gameSlug);
+  const homeTeamAbbr = (game.homeTeam?.abbreviation || game.teamIdentifiers?.home || slugAbbrevs.home || '').toLowerCase();
+  const awayTeamAbbr = (game.awayTeam?.abbreviation || game.teamIdentifiers?.away || slugAbbrevs.away || '').toLowerCase();
+  const title = game.title || '';
+  const titleMatch = title.match(/^(.+?)\s+vs\.?\s+(.+?)$/i);
+  const awayTeamNameFromTitle = titleMatch ? titleMatch[1].toLowerCase().trim() : '';
+  const homeTeamNameFromTitle = titleMatch ? titleMatch[2].toLowerCase().trim() : '';
+  const isNba = sport.toLowerCase() === 'nba';
 
-    // Insert/update player stats
-    for (const stat of stats) {
-      
-      // NHL uses tricode, other sports use abbreviation
-      // European soccer leagues (La Liga, Bundesliga, etc.) may only have team_id without team object
-      const statTeamAbbr = (stat.team?.tricode || stat.team?.abbreviation || '').toLowerCase();
-      const statTeamName = (stat.team?.full_name || stat.team?.name || '').toLowerCase();
-      
-      // Normalize abbreviations for matching (remove special chars like & in "TA&M")
-      const normalizeAbbr = (abbr: string) => abbr.replace(/[^a-z0-9]/gi, '').toLowerCase();
-      const normalizedStatAbbr = normalizeAbbr(statTeamAbbr);
-      const normalizedHomeAbbr = normalizeAbbr(homeTeamAbbr);
-      const normalizedAwayAbbr = normalizeAbbr(awayTeamAbbr);
-      
-      // Match by abbreviation/tricode first, then by name
-      // Ensure boolean result (not empty string from short-circuit evaluation)
-      // For European soccer leagues without team info in stats, set isHome to null
-      let isHome: boolean | null = null;
-      if (normalizedStatAbbr || statTeamName) {
-        // Check if stat team matches home team
-        // Use multiple matching strategies:
-        // 1. Exact abbreviation match
-        // 2. Abbreviation substring match
-        // 3. Team name contains home/away name from title
-        const matchesHome = 
-          normalizedStatAbbr === normalizedHomeAbbr ||
-          (normalizedHomeAbbr && normalizedStatAbbr.includes(normalizedHomeAbbr)) ||
-          (normalizedHomeAbbr && normalizedHomeAbbr.includes(normalizedStatAbbr)) ||
-          (homeTeamNameFromTitle && statTeamName.includes(homeTeamNameFromTitle)) ||
-          (homeTeamNameFromTitle && homeTeamNameFromTitle.split(' ').some((word: string) => word.length > 2 && statTeamName.includes(word)));
-        
-        // Check if stat team matches away team
-        const matchesAway = 
-          normalizedStatAbbr === normalizedAwayAbbr ||
-          (normalizedAwayAbbr && normalizedStatAbbr.includes(normalizedAwayAbbr)) ||
-          (normalizedAwayAbbr && normalizedAwayAbbr.includes(normalizedStatAbbr)) ||
-          (awayTeamNameFromTitle && statTeamName.includes(awayTeamNameFromTitle)) ||
-          (awayTeamNameFromTitle && awayTeamNameFromTitle.split(' ').some((word: string) => word.length > 2 && statTeamName.includes(word)));
-        
-        if (matchesHome) {
-          isHome = true;
-        } else if (matchesAway) {
-          isHome = false;
-        }
-      }
+  const normalizeAbbr = (abbr: string) => abbr.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const normalizedHomeAbbr = normalizeAbbr(homeTeamAbbr);
+  const normalizedAwayAbbr = normalizeAbbr(awayTeamAbbr);
 
-      // Different sports have different stat fields
-      // Store all stats in JSONB column for flexibility, plus common fields
-      const sportStats = extractSportStats(sport, stat);
-      
-      
-      // Only populate NBA-specific columns when sport is NBA
-      // For other sports, these will be null in the database
-      const isNba = sport.toLowerCase() === 'nba';
+  // Build all rows to insert (no DB connection)
+  const rows: unknown[] = [];
+  for (const stat of stats) {
+    const statTeamAbbr = (stat.team?.tricode || stat.team?.abbreviation || '').toLowerCase();
+    const statTeamName = (stat.team?.full_name || stat.team?.name || '').toLowerCase();
+    const normalizedStatAbbr = normalizeAbbr(statTeamAbbr);
 
-      await client.query(`
-        INSERT INTO game_player_stats (
-          game_id, balldontlie_game_id, player_id, player_first_name, player_last_name,
-          player_position, team_id, team_abbreviation, team_name, is_home,
-          min, fgm, fga, fg_pct, fg3m, fg3a, fg3_pct, ftm, fta, ft_pct,
-          oreb, dreb, reb, ast, stl, blk, turnover, pf, pts,
-          sport, sport_stats,
-          stats_updated_at
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-          $21, $22, $23, $24, $25, $26, $27, $28, $29,
-          $30, $31,
-          CURRENT_TIMESTAMP
-        )
-        ON CONFLICT (game_id, player_id, sport) 
-        DO UPDATE SET
-          balldontlie_game_id = EXCLUDED.balldontlie_game_id,
-          player_first_name = EXCLUDED.player_first_name,
-          player_last_name = EXCLUDED.player_last_name,
-          player_position = EXCLUDED.player_position,
-          team_id = EXCLUDED.team_id,
-          team_abbreviation = EXCLUDED.team_abbreviation,
-          team_name = EXCLUDED.team_name,
-          is_home = EXCLUDED.is_home,
-          min = EXCLUDED.min,
-          fgm = EXCLUDED.fgm,
-          fga = EXCLUDED.fga,
-          fg_pct = EXCLUDED.fg_pct,
-          fg3m = EXCLUDED.fg3m,
-          fg3a = EXCLUDED.fg3a,
-          fg3_pct = EXCLUDED.fg3_pct,
-          ftm = EXCLUDED.ftm,
-          fta = EXCLUDED.fta,
-          ft_pct = EXCLUDED.ft_pct,
-          oreb = EXCLUDED.oreb,
-          dreb = EXCLUDED.dreb,
-          reb = EXCLUDED.reb,
-          ast = EXCLUDED.ast,
-          stl = EXCLUDED.stl,
-          blk = EXCLUDED.blk,
-          turnover = EXCLUDED.turnover,
-          pf = EXCLUDED.pf,
-          pts = EXCLUDED.pts,
-          sport = EXCLUDED.sport,
-          sport_stats = EXCLUDED.sport_stats,
-          stats_updated_at = CURRENT_TIMESTAMP
-      `, [
-        gameId,
-        balldontlieGameId,
-        // Handle both nested (NBA/NFL) and flat (La Liga/Bundesliga) formats
-        stat.player?.id || stat.player_id,
-        stat.player?.first_name || null, // La Liga stats don't include player names
-        stat.player?.last_name || null,
-        // Truncate position to 50 chars (database limit) to prevent errors
-        (stat.player?.position || stat.position)?.substring(0, 50) || null,
-        stat.team?.id || stat.team_id, // Handle flat format
-        // Truncate team abbreviation to 50 chars (database limit) to prevent errors
-        (stat.team?.tricode || stat.team?.abbreviation)?.substring(0, 50) || null,
-        stat.team?.full_name || stat.team?.name || null,
-        isHome,
-        // Only populate NBA columns for NBA games
-        // Use ?? (nullish coalescing) to preserve 0 values (not falsy ||)
-        isNba ? (stat.min ?? null) : null,
-        isNba ? (stat.fgm ?? null) : null,
-        isNba ? (stat.fga ?? null) : null,
-        isNba ? (stat.fg_pct ?? null) : null,
-        isNba ? (stat.fg3m ?? null) : null,
-        isNba ? (stat.fg3a ?? null) : null,
-        isNba ? (stat.fg3_pct ?? null) : null,
-        isNba ? (stat.ftm ?? null) : null,
-        isNba ? (stat.fta ?? null) : null,
-        isNba ? (stat.ft_pct ?? null) : null,
-        isNba ? (stat.oreb ?? null) : null,
-        isNba ? (stat.dreb ?? null) : null,
-        isNba ? (stat.reb ?? null) : null,
-        isNba ? (stat.ast ?? null) : null,
-        isNba ? (stat.stl ?? null) : null,
-        isNba ? (stat.blk ?? null) : null,
-        isNba ? (stat.turnover ?? null) : null,
-        isNba ? (stat.pf ?? null) : null,
-        // Points might exist in multiple sports, so check if it exists
-        stat.pts !== undefined ? stat.pts : null,
-        sport,
-        JSON.stringify(sportStats),
-      ]);
-      
+    let isHome: boolean | null = null;
+    if (normalizedStatAbbr || statTeamName) {
+      const matchesHome =
+        normalizedStatAbbr === normalizedHomeAbbr ||
+        (normalizedHomeAbbr && normalizedStatAbbr.includes(normalizedHomeAbbr)) ||
+        (normalizedHomeAbbr && normalizedHomeAbbr.includes(normalizedStatAbbr)) ||
+        (homeTeamNameFromTitle && statTeamName.includes(homeTeamNameFromTitle)) ||
+        (homeTeamNameFromTitle && homeTeamNameFromTitle.split(' ').some((word: string) => word.length > 2 && statTeamName.includes(word)));
+      const matchesAway =
+        normalizedStatAbbr === normalizedAwayAbbr ||
+        (normalizedAwayAbbr && normalizedStatAbbr.includes(normalizedAwayAbbr)) ||
+        (normalizedAwayAbbr && normalizedAwayAbbr.includes(normalizedStatAbbr)) ||
+        (awayTeamNameFromTitle && statTeamName.includes(awayTeamNameFromTitle)) ||
+        (awayTeamNameFromTitle && awayTeamNameFromTitle.split(' ').some((word: string) => word.length > 2 && statTeamName.includes(word)));
+      if (matchesHome) isHome = true;
+      else if (matchesAway) isHome = false;
     }
 
-    await client.query('COMMIT');
-    
-    logger.info({
-      message: 'Player stats stored successfully',
+    const sportStats = extractSportStats(sport, stat);
+    rows.push([
       gameId,
-      sport,
       balldontlieGameId,
-      statsCount: stats.length,
-    });
+      stat.player?.id || stat.player_id,
+      stat.player?.first_name || null,
+      stat.player?.last_name || null,
+      (stat.player?.position || stat.position)?.substring(0, 50) || null,
+      stat.team?.id || stat.team_id,
+      (stat.team?.tricode || stat.team?.abbreviation)?.substring(0, 50) || null,
+      stat.team?.full_name || stat.team?.name || null,
+      isHome,
+      isNba ? (stat.min ?? null) : null,
+      isNba ? (stat.fgm ?? null) : null,
+      isNba ? (stat.fga ?? null) : null,
+      isNba ? (stat.fg_pct ?? null) : null,
+      isNba ? (stat.fg3m ?? null) : null,
+      isNba ? (stat.fg3a ?? null) : null,
+      isNba ? (stat.fg3_pct ?? null) : null,
+      isNba ? (stat.ftm ?? null) : null,
+      isNba ? (stat.fta ?? null) : null,
+      isNba ? (stat.ft_pct ?? null) : null,
+      isNba ? (stat.oreb ?? null) : null,
+      isNba ? (stat.dreb ?? null) : null,
+      isNba ? (stat.reb ?? null) : null,
+      isNba ? (stat.ast ?? null) : null,
+      isNba ? (stat.stl ?? null) : null,
+      isNba ? (stat.blk ?? null) : null,
+      isNba ? (stat.turnover ?? null) : null,
+      isNba ? (stat.pf ?? null) : null,
+      stat.pts !== undefined ? stat.pts : null,
+      sport,
+      JSON.stringify(sportStats),
+    ]);
+  }
+
+  if (rows.length === 0) return;
+
+  // 3. Connect only when ready to write
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const insertSql = `
+      INSERT INTO game_player_stats (
+        game_id, balldontlie_game_id, player_id, player_first_name, player_last_name,
+        player_position, team_id, team_abbreviation, team_name, is_home,
+        min, fgm, fga, fg_pct, fg3m, fg3a, fg3_pct, ftm, fta, ft_pct,
+        oreb, dreb, reb, ast, stl, blk, turnover, pf, pts,
+        sport, sport_stats,
+        stats_updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+        $21, $22, $23, $24, $25, $26, $27, $28, $29,
+        $30, $31,
+        CURRENT_TIMESTAMP
+      )
+      ON CONFLICT (game_id, player_id, sport)
+      DO UPDATE SET
+        balldontlie_game_id = EXCLUDED.balldontlie_game_id,
+        player_first_name = EXCLUDED.player_first_name,
+        player_last_name = EXCLUDED.player_last_name,
+        player_position = EXCLUDED.player_position,
+        team_id = EXCLUDED.team_id,
+        team_abbreviation = EXCLUDED.team_abbreviation,
+        team_name = EXCLUDED.team_name,
+        is_home = EXCLUDED.is_home,
+        min = EXCLUDED.min, fgm = EXCLUDED.fgm, fga = EXCLUDED.fga, fg_pct = EXCLUDED.fg_pct,
+        fg3m = EXCLUDED.fg3m, fg3a = EXCLUDED.fg3a, fg3_pct = EXCLUDED.fg3_pct,
+        ftm = EXCLUDED.ftm, fta = EXCLUDED.fta, ft_pct = EXCLUDED.ft_pct,
+        oreb = EXCLUDED.oreb, dreb = EXCLUDED.dreb, reb = EXCLUDED.reb,
+        ast = EXCLUDED.ast, stl = EXCLUDED.stl, blk = EXCLUDED.blk,
+        turnover = EXCLUDED.turnover, pf = EXCLUDED.pf, pts = EXCLUDED.pts,
+        sport = EXCLUDED.sport, sport_stats = EXCLUDED.sport_stats,
+        stats_updated_at = CURRENT_TIMESTAMP
+    `;
+    for (const r of rows as unknown[][]) {
+      await client.query(insertSql, r);
+    }
+    await client.query('COMMIT');
+    // logger.info({
+    //   message: 'Player stats stored successfully',
+    //   gameId,
+    //   sport,
+    //   balldontlieGameId,
+    //   statsCount: stats.length,
+    // });
   } catch (error) {
     await client.query('ROLLBACK');
     logger.error({
@@ -1821,11 +1760,11 @@ export async function fetchPeriodScores(game: any): Promise<PeriodScores | null>
   // Supported sports for period scores
   const supportedSports = ['nba', 'nfl', 'ncaab', 'epl', 'laliga', 'bundesliga', 'seriea', 'ligue1'];
   if (!bdSport || !supportedSports.includes(bdSport)) {
-    logger.debug({
-      message: 'Period scores not available for sport',
-      sport,
-      note: 'Period scores supported for: NBA, NFL, NCAAB, EPL, La Liga, Bundesliga, Serie A, Ligue 1',
-    });
+    // logger.debug({
+    //   message: 'Period scores not available for sport',
+    //   sport,
+    //   note: 'Period scores supported for: NBA, NFL, NCAAB, EPL, La Liga, Bundesliga, Serie A, Ligue 1',
+    // });
     return null;
   }
   
@@ -1859,13 +1798,13 @@ export async function fetchPeriodScores(game: any): Promise<PeriodScores | null>
       endpoint = `https://api.balldontlie.io/nfl/v1/games/${balldontlieGameId}`;
     }
     
-    logger.info({
-      message: 'Fetching period scores from Ball Don\'t Lie',
-      gameId: game.id,
-      balldontlieGameId,
-      sport: bdSport,
-      endpoint,
-    });
+    // logger.info({
+    //   message: 'Fetching period scores from Ball Don\'t Lie',
+    //   gameId: game.id,
+    //   balldontlieGameId,
+    //   sport: bdSport,
+    //   endpoint,
+    // });
     
     const response = await axios.get(endpoint, {
       headers: { 'Authorization': apiKey },
@@ -1983,12 +1922,12 @@ export async function fetchPeriodScores(game: any): Promise<PeriodScores | null>
       }
     });
     
-    logger.info({
-      message: 'Period scores fetched successfully',
-      gameId: game.id,
-      sport: bdSport,
-      periodScores,
-    });
+    // logger.info({
+    //   message: 'Period scores fetched successfully',
+    //   gameId: game.id,
+    //   sport: bdSport,
+    //   periodScores,
+    // });
     
     return periodScores;
     
@@ -2146,18 +2085,18 @@ async function fetchSoccerPeriodScores(
         }
       }
       
-      logger.info({
-        message: 'Fetched EPL goals for period scores',
-        gameId: game.id,
-        balldontlieGameId,
-        goalsCount: goals.length,
-        homeTeamId,
-        awayTeamId,
-        homeAbbr,
-        awayAbbr,
-        teamIdsFromLineups,
-        playerTeamMapSize: playerTeamMap.size,
-      });
+      // logger.info({
+      //   message: 'Fetched EPL goals for period scores',
+      //   gameId: game.id,
+      //   balldontlieGameId,
+      //   goalsCount: goals.length,
+      //   homeTeamId,
+      //   awayTeamId,
+      //   homeAbbr,
+      //   awayAbbr,
+      //   teamIdsFromLineups,
+      //   playerTeamMapSize: playerTeamMap.size,
+      // });
       
     } else {
       // Other soccer leagues (La Liga, Bundesliga, Serie A, Ligue 1) use /match_events
@@ -2187,14 +2126,14 @@ async function fetchSoccerPeriodScores(
         awayScore = matchData.away_score;
       }
       
-      logger.info({
-        message: `Fetched ${bdSport.toUpperCase()} goals for period scores`,
-        gameId: game.id,
-        balldontlieGameId,
-        goalsCount: goals.length,
-        homeTeamId,
-        awayTeamId,
-      });
+      // logger.info({
+      //   message: `Fetched ${bdSport.toUpperCase()} goals for period scores`,
+      //   gameId: game.id,
+      //   balldontlieGameId,
+      //   goalsCount: goals.length,
+      //   homeTeamId,
+      //   awayTeamId,
+      // });
     }
     
     // Calculate 1H and 2H scores from goals
@@ -2237,12 +2176,12 @@ async function fetchSoccerPeriodScores(
       vft: { home: homeScore ?? (home1H + home2H), away: awayScore ?? (away1H + away2H) },
     };
     
-    logger.info({
-      message: 'Soccer period scores calculated',
-      gameId: game.id,
-      sport: bdSport,
-      periodScores,
-    });
+    // logger.info({
+    //   message: 'Soccer period scores calculated',
+    //   gameId: game.id,
+    //   sport: bdSport,
+    //   periodScores,
+    // });
     
     return periodScores;
     
@@ -2394,29 +2333,29 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
       return null;
     }
 
-    logger.info({
-      message: 'Extracted date for game mapping (converted to API timezone)',
-      gameId: game.id,
-      dateStr,
-      slug: game.slug,
-      startDate: game.startDate,
-      endDate: game.endDate,
-      sport: game.sport,
-    });
+    // logger.info({
+    //   message: 'Extracted date for game mapping (converted to API timezone)',
+    //   gameId: game.id,
+    //   dateStr,
+    //   slug: game.slug,
+    //   startDate: game.startDate,
+    //   endDate: game.endDate,
+    //   sport: game.sport,
+    // });
 
     // Get games/matches for that date
     const bdSport = getBalldontlieSport(game.sport);
     let balldontlieGames = await ballDontLieClient.getGamesByDate(game.sport, dateStr);
     
-    // If no games found, this might be a timezone edge case or the game isn't scheduled yet
-    if (balldontlieGames.length === 0) {
-      logger.info({
-        message: 'No games found for converted date',
-        gameId: game.id,
-        dateStr,
-        sport: game.sport,
-      });
-    }
+    // // If no games found, this might be a timezone edge case or the game isn't scheduled yet
+    // if (balldontlieGames.length === 0) {
+    //   logger.info({
+    //     message: 'No games found for converted date',
+    //     gameId: game.id,
+    //     dateStr,
+    //     sport: game.sport,
+    //   });
+    // }
     
     // Soccer leagues return matches with kickoff timestamp - filter by exact date if needed
     if (isSoccerSport(bdSport) && dateStr && balldontlieGames.length > 0) {
@@ -2429,48 +2368,48 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
       });
       
       if (filteredGames.length !== balldontlieGames.length) {
-        logger.info({
-          message: `Filtered ${bdSport?.toUpperCase()} matches by exact date`,
-          originalCount: balldontlieGames.length,
-          filteredCount: filteredGames.length,
-          dateStr,
-        });
+        // logger.info({
+        //   message: `Filtered ${bdSport?.toUpperCase()} matches by exact date`,
+        //   originalCount: balldontlieGames.length,
+        //   filteredCount: filteredGames.length,
+        //   dateStr,
+        // });
         balldontlieGames = filteredGames;
       }
     }
 
     // Log game/match structure for first result to understand API response format
-    if (balldontlieGames.length > 0) {
-      logger.info({
-        message: `${bdSport?.toUpperCase()} API response structure (sample)`,
-        gameId: game.id,
-        sampleGame: balldontlieGames[0],
-        sampleGameKeys: Object.keys(balldontlieGames[0]),
-      });
-    }
+    // if (balldontlieGames.length > 0) {
+    //   logger.info({
+    //     message: `${bdSport?.toUpperCase()} API response structure (sample)`,
+    //     gameId: game.id,
+    //     sampleGame: balldontlieGames[0],
+    //     sampleGameKeys: Object.keys(balldontlieGames[0]),
+    //   });
+    // }
     
-    logger.info({
-      message: 'Found Ball Don\'t Lie games/matches for date',
-      gameId: game.id,
-      sport: bdSport,
-      dateStr,
-      gamesCount: balldontlieGames.length,
-      availableGames: balldontlieGames.slice(0, 5).map((g: any) => {
-        // NCAAB/NCAAF use visitor_team instead of away_team
-        const awayTeam = g.away_team || g.visitor_team;
-        return {
-        id: g.id,
-          // Soccer matches have home_team/away_team objects with name/short_name
-          home: g.home_team?.short_name || g.home_team?.abbreviation || g.home_team?.name || g.home_team?.full_name,
-          away: awayTeam?.short_name || awayTeam?.abbreviation || awayTeam?.name || awayTeam?.full_name,
-          homeTeamId: g.home_team?.id || g.home_team_id,
-          awayTeamId: awayTeam?.id || g.away_team_id,
-          date: g.date || g.kickoff,
-        season: g.season,
-        };
-      }),
-      note: isSoccerSport(bdSport) ? 'Soccer matches use home_team/away_team objects with name/short_name' : 'Other sports use team objects',
-    });
+    // logger.info({
+    //   message: 'Found Ball Don\'t Lie games/matches for date',
+    //   gameId: game.id,
+    //   sport: bdSport,
+    //   dateStr,
+    //   gamesCount: balldontlieGames.length,
+    //   availableGames: balldontlieGames.slice(0, 5).map((g: any) => {
+    //     // NCAAB/NCAAF use visitor_team instead of away_team
+    //     const awayTeam = g.away_team || g.visitor_team;
+    //     return {
+    //     id: g.id,
+    //       // Soccer matches have home_team/away_team objects with name/short_name
+    //       home: g.home_team?.short_name || g.home_team?.abbreviation || g.home_team?.name || g.home_team?.full_name,
+    //       away: awayTeam?.short_name || awayTeam?.abbreviation || awayTeam?.name || awayTeam?.full_name,
+    //       homeTeamId: g.home_team?.id || g.home_team_id,
+    //       awayTeamId: awayTeam?.id || g.away_team_id,
+    //       date: g.date || g.kickoff,
+    //     season: g.season,
+    //     };
+    //   }),
+    //   note: isSoccerSport(bdSport) ? 'Soccer matches use home_team/away_team objects with name/short_name' : 'Other sports use team objects',
+    // });
 
     // Match by team identifiers - try multiple sources
     const homeTeamAbbr = game.homeTeam?.abbreviation?.toLowerCase() || 
@@ -2484,16 +2423,16 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
     const homeTeamName = game.homeTeam?.name?.toLowerCase() || '';
     const awayTeamName = game.awayTeam?.name?.toLowerCase() || '';
     
-    logger.info({
-      message: 'Team identifiers for matching',
-      gameId: game.id,
-      sport: bdSport,
-      homeTeamAbbr,
-      awayTeamAbbr,
-      homeTeamName,
-      awayTeamName,
-      slug: game.slug,
-    });
+    // logger.info({
+    //   message: 'Team identifiers for matching',
+    //   gameId: game.id,
+    //   sport: bdSport,
+    //   homeTeamAbbr,
+    //   awayTeamAbbr,
+    //   homeTeamName,
+    //   awayTeamName,
+    //   slug: game.slug,
+    // });
 
     // Validate that we found games
     if (balldontlieGames.length === 0) {
@@ -2519,12 +2458,12 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
       
       soccerTeamsMap = await ballDontLieClient.getSoccerTeams(bdSport, season);
       
-      logger.info({
-        message: 'Fetched soccer teams for matching',
-        sport: bdSport,
-        season,
-        teamCount: soccerTeamsMap.size,
-      });
+      // logger.info({
+      //   message: 'Fetched soccer teams for matching',
+      //   sport: bdSport,
+      //   season,
+      //   teamCount: soccerTeamsMap.size,
+      // });
     }
 
     // Find matching game/match
@@ -2549,12 +2488,12 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
         
         // Skip matches without team data
         if (!bdHomeShort && !bdHomeName && !bdHomeAbbr && !bdAwayShort && !bdAwayName && !bdAwayAbbr) {
-          logger.debug({
-            message: 'Skipping game - no team info available',
-            gameId: bdGame.id,
-            homeTeamId,
-            awayTeamId,
-          });
+          // logger.debug({
+          //   message: 'Skipping game - no team info available',
+          //   gameId: bdGame.id,
+          //   homeTeamId,
+          //   awayTeamId,
+          // });
           return false;
         }
         
@@ -2795,22 +2734,22 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
       const awayMatch = abbrMatches(awayTeamAbbr, bdAwayAbbr, bdAwayName, bdAwayCollege) ||
                         abbrMatches(awayTeamAbbr, bdHomeAbbr, bdHomeName, bdHomeCollege); // Sometimes teams are swapped
 
-      // Log for debugging when there's a potential match
-      if ((homeMatch || awayMatch) && homeTeamAbbr && awayTeamAbbr) {
-        logger.info({
-          message: 'Potential game match found',
-          bdGameId: bdGame.id,
-          bdHomeAbbr,
-          bdAwayAbbr,
-          bdHomeName: bdGame.home_team?.full_name || bdGame.home_team?.name,
-          bdAwayName: awayTeamObj?.full_name || awayTeamObj?.name,
-          homeTeamAbbr,
-          awayTeamAbbr,
-          homeMatch,
-          awayMatch,
-          fullMatch: homeMatch && awayMatch,
-        });
-      }
+      // // Log for debugging when there's a potential match
+      // if ((homeMatch || awayMatch) && homeTeamAbbr && awayTeamAbbr) {
+      //   logger.info({
+      //     message: 'Potential game match found',
+      //     bdGameId: bdGame.id,
+      //     bdHomeAbbr,
+      //     bdAwayAbbr,
+      //     bdHomeName: bdGame.home_team?.full_name || bdGame.home_team?.name,
+      //     bdAwayName: awayTeamObj?.full_name || awayTeamObj?.name,
+      //     homeTeamAbbr,
+      //     awayTeamAbbr,
+      //     homeMatch,
+      //     awayMatch,
+      //     fullMatch: homeMatch && awayMatch,
+      //   });
+      // }
 
       return homeMatch && awayMatch;
     });
@@ -2836,12 +2775,12 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
           [matchedGame.id, game.id]
         );
         
-        logger.info({
-          message: 'Mapped Ball Don\'t Lie game ID',
-          polymarketGameId: game.id,
-          balldontlieGameId: matchedGame.id,
-          sport: game.sport,
-        });
+        // logger.info({
+        //   message: 'Mapped Ball Don\'t Lie game ID',
+        //   polymarketGameId: game.id,
+        //   balldontlieGameId: matchedGame.id,
+        //   sport: game.sport,
+        // });
         
         return matchedGame.id;
       } finally {
@@ -2884,12 +2823,12 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
  * @returns Array of player stats (from database, not API)
  */
 export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
-  logger.info({
-    message: 'fetchAndStorePlayerStats called',
-    gameId: game.id,
-    sport: game.sport,
-    startDate: game.startDate,
-  });
+  // logger.info({
+  //   message: 'fetchAndStorePlayerStats called',
+  //   gameId: game.id,
+  //   sport: game.sport,
+  //   startDate: game.startDate,
+  // });
 
   // Check if sport is supported
   if (!isSportSupported(game.sport)) {
@@ -2904,11 +2843,11 @@ export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
 
   try {
     // Find or map Ball Don't Lie game ID
-    logger.info({
-      message: 'Finding/mapping Ball Don\'t Lie game ID',
-      gameId: game.id,
-      sport: game.sport,
-    });
+    // logger.info({
+    //   message: 'Finding/mapping Ball Don\'t Lie game ID',
+    //   gameId: game.id,
+    //   sport: game.sport,
+    // });
     
     const balldontlieGameId = await findAndMapBalldontlieGameId(game);
     
@@ -2921,11 +2860,11 @@ export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
       return [];
     }
 
-    logger.info({
-      message: 'Mapped to Ball Don\'t Lie game ID',
-      gameId: game.id,
-      balldontlieGameId,
-    });
+    // logger.info({
+    //   message: 'Mapped to Ball Don\'t Lie game ID',
+    //   gameId: game.id,
+    //   balldontlieGameId,
+    // });
 
     // Check if stats were recently fetched (within last 5 minutes)
     const client = await pool.connect();
@@ -2937,17 +2876,17 @@ export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
       );
 
       if (parseInt(recentStats.rows[0].count) > 0) {
-        // Stats were recently fetched, return from database
-        logger.info({
-          message: 'Using cached player stats',
-          gameId: game.id,
-        });
+        // // Stats were recently fetched, return from database
+        // logger.info({
+        //   message: 'Using cached player stats',
+        //   gameId: game.id,
+        // });
         const cachedStats = await getPlayerStats(game.id);
-        logger.info({
-          message: 'Returning cached stats',
-          gameId: game.id,
-          statsCount: cachedStats.length,
-        });
+        // logger.info({
+        //   message: 'Returning cached stats',
+        //   gameId: game.id,
+        //   statsCount: cachedStats.length,
+        // });
         return cachedStats;
       }
     } finally {
@@ -2955,21 +2894,21 @@ export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
     }
 
     // Fetch stats from API
-    logger.info({
-      message: 'Fetching player stats from Ball Don\'t Lie API',
-      gameId: game.id,
-      sport: game.sport,
-      balldontlieGameId,
-    });
+    // logger.info({
+    //   message: 'Fetching player stats from Ball Don\'t Lie API',
+    //   gameId: game.id,
+    //   sport: game.sport,
+    //   balldontlieGameId,
+    // });
 
     const stats = await ballDontLieClient.getPlayerStats(game.sport, [balldontlieGameId]);
 
 
-    logger.info({
-      message: 'Received stats from API',
-      gameId: game.id,
-      statsCount: stats.length,
-    });
+    // logger.info({
+    //   message: 'Received stats from API',
+    //   gameId: game.id,
+    //   statsCount: stats.length,
+    // });
 
     if (stats.length === 0) {
       logger.warn({
@@ -2980,22 +2919,22 @@ export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
       return [];
     }
 
-    // Store stats in database
-    logger.info({
-      message: 'Storing player stats in database',
-      gameId: game.id,
-      statsCount: stats.length,
-    });
+    // // Store stats in database
+    // logger.info({
+    //   message: 'Storing player stats in database',
+    //   gameId: game.id,
+    //   statsCount: stats.length,
+    // });
     
     await storePlayerStats(game.id, game.sport, balldontlieGameId, stats);
 
     // Return stats from database (ensures consistent format)
     const dbStats = await getPlayerStats(game.id);
-    logger.info({
-      message: 'Returning stats from database',
-      gameId: game.id,
-      statsCount: dbStats.length,
-    });
+    // logger.info({
+    //   message: 'Returning stats from database',
+    //   gameId: game.id,
+    //   statsCount: dbStats.length,
+    // });
     
     return dbStats;
   } catch (error) {

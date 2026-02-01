@@ -10,6 +10,12 @@ import { pool } from '../../config/database';
 import { logger } from '../../config/logger';
 import { EventEmitter } from 'events';
 import { depositProgressService } from '../privy/deposit-progress.service';
+import {
+  initRedisClusterBroadcast,
+  publishDepositsBalance,
+  subscribeToDepositsBalance,
+  isRedisClusterBroadcastReady,
+} from '../redis-cluster-broadcast.service';
 
 // Alchemy API configuration
 const ALCHEMY_API_URL = 'https://dashboard.alchemy.com/api';
@@ -117,11 +123,11 @@ class AlchemyWebhookService extends EventEmitter {
     }
     this.depositListeners.get(privyUserId)!.add(listener);
 
-    logger.info({
-      message: 'User subscribed to deposit notifications',
-      privyUserId,
-      listenerCount: this.depositListeners.get(privyUserId)!.size,
-    });
+    // logger.info({
+    //   message: 'User subscribed to deposit notifications',
+    //   privyUserId,
+    //   listenerCount: this.depositListeners.get(privyUserId)!.size,
+    // });
 
     // Return unsubscribe function
     return () => {
@@ -132,24 +138,32 @@ class AlchemyWebhookService extends EventEmitter {
           this.depositListeners.delete(privyUserId);
         }
       }
-      logger.info({
-        message: 'User unsubscribed from deposit notifications',
-        privyUserId,
-      });
+      // logger.info({
+      //   message: 'User unsubscribed from deposit notifications',
+      //   privyUserId,
+      // });
     };
   }
 
   /**
-   * Notify listeners about a deposit
+   * Notify listeners about a deposit (or publish to Redis for cluster-wide delivery)
    */
   private notifyDeposit(notification: DepositNotification): void {
-    // Emit global event
-    this.emit('deposit', notification);
+    if (isRedisClusterBroadcastReady()) {
+      publishDepositsBalance(notification);
+      return;
+    }
+    this.notifyDepositLocally(notification);
+  }
 
-    // Notify specific user listeners
+  /**
+   * Notify local listeners only (used when receiving from Redis or when Redis unavailable)
+   */
+  private notifyDepositLocally(notification: DepositNotification): void {
+    this.emit('deposit', notification);
     const listeners = this.depositListeners.get(notification.privyUserId);
     if (listeners) {
-      listeners.forEach(listener => {
+      listeners.forEach((listener) => {
         try {
           listener(notification);
         } catch (error) {
@@ -178,10 +192,10 @@ class AlchemyWebhookService extends EventEmitter {
       // Check if we have an existing webhook
       if (ALCHEMY_WEBHOOK_ID) {
         this.webhookId = ALCHEMY_WEBHOOK_ID;
-        logger.info({
-          message: 'Using existing Alchemy webhook',
-          webhookId: this.webhookId,
-        });
+        // logger.info({
+        //   message: 'Using existing Alchemy webhook',
+        //   webhookId: this.webhookId,
+        // });
       } else if (WEBHOOK_URL) {
         // Create a new webhook
         await this.createWebhook();
@@ -196,10 +210,10 @@ class AlchemyWebhookService extends EventEmitter {
       await this.syncAllAddresses();
       
       this.isInitialized = true;
-      logger.info({
-        message: 'Alchemy webhook service initialized',
-        webhookId: this.webhookId,
-      });
+      // logger.info({
+      //   message: 'Alchemy webhook service initialized',
+      //   webhookId: this.webhookId,
+      // });
     } catch (error) {
       logger.error({
         message: 'Failed to initialize Alchemy webhook service',
@@ -230,11 +244,11 @@ class AlchemyWebhookService extends EventEmitter {
       );
 
       this.webhookId = response.data.data.id;
-      logger.info({
-        message: 'Created Alchemy webhook',
-        webhookId: this.webhookId,
-        webhookUrl: WEBHOOK_URL,
-      });
+      // logger.info({
+      //   message: 'Created Alchemy webhook',
+      //   webhookId: this.webhookId,
+      //   webhookUrl: WEBHOOK_URL,
+      // });
     } catch (error: any) {
       logger.error({
         message: 'Failed to create Alchemy webhook',
@@ -244,8 +258,11 @@ class AlchemyWebhookService extends EventEmitter {
     }
   }
 
+  /** Max addresses per Alchemy API batch to avoid timeouts/limits */
+  private static readonly ADDRESS_BATCH_SIZE = 500;
+
   /**
-   * Add addresses to the webhook
+   * Add addresses to the webhook (batches in 500s)
    */
   async addAddresses(addresses: string[]): Promise<void> {
     if (!this.webhookId || !ALCHEMY_AUTH_TOKEN) {
@@ -258,39 +275,41 @@ class AlchemyWebhookService extends EventEmitter {
 
     if (addresses.length === 0) return;
 
-    try {
-      // Alchemy API allows batch updates
-      await axios.patch(
-        `${ALCHEMY_API_URL}/update-webhook-addresses`,
-        {
-          webhook_id: this.webhookId,
-          addresses_to_add: addresses.map(a => a.toLowerCase()),
-          addresses_to_remove: [],
-        },
-        {
-          headers: {
-            'X-Alchemy-Token': ALCHEMY_AUTH_TOKEN,
-            'Content-Type': 'application/json',
-          },
-        }
-      );
+    const normalized = addresses.map((a) => a.toLowerCase());
+    const size = AlchemyWebhookService.ADDRESS_BATCH_SIZE;
 
-      logger.info({
-        message: 'Added addresses to Alchemy webhook',
-        webhookId: this.webhookId,
-        addressCount: addresses.length,
-      });
-    } catch (error: any) {
-      logger.error({
-        message: 'Failed to add addresses to Alchemy webhook',
-        error: error.name || 'Error',
-        errorMessage: error.message,
-        statusCode: error.response?.status,
-        responseData: error.response?.data,
-        errorCode: error.code, // Network errors have a code like ECONNREFUSED, ENOTFOUND
-        webhookId: this.webhookId,
-        addresses: addresses.slice(0, 5), // Log first 5 for debugging
-      });
+    for (let i = 0; i < normalized.length; i += size) {
+      const batch = normalized.slice(i, i + size);
+      try {
+        await axios.patch(
+          `${ALCHEMY_API_URL}/update-webhook-addresses`,
+          {
+            webhook_id: this.webhookId,
+            addresses_to_add: batch,
+            addresses_to_remove: [],
+          },
+          {
+            headers: {
+              'X-Alchemy-Token': ALCHEMY_AUTH_TOKEN,
+              'Content-Type': 'application/json',
+            },
+          }
+        );
+      } catch (error: any) {
+        logger.error({
+          message: 'Failed to add addresses to Alchemy webhook',
+          error: error.name || 'Error',
+          errorMessage: error.message,
+          statusCode: error.response?.status,
+          responseData: error.response?.data,
+          errorCode: error.code,
+          webhookId: this.webhookId,
+          batchIndex: Math.floor(i / size) + 1,
+          batchSize: batch.length,
+          addresses: batch.slice(0, 5),
+        });
+        throw error; // Re-throw so caller can avoid marking failed batch
+      }
     }
   }
 
@@ -317,11 +336,11 @@ class AlchemyWebhookService extends EventEmitter {
         }
       );
 
-      logger.info({
-        message: 'Removed addresses from Alchemy webhook',
-        webhookId: this.webhookId,
-        addressCount: addresses.length,
-      });
+      // logger.info({
+      //   message: 'Removed addresses from Alchemy webhook',
+      //   webhookId: this.webhookId,
+      //   addressCount: addresses.length,
+      // });
     } catch (error: any) {
       logger.error({
         message: 'Failed to remove addresses from Alchemy webhook',
@@ -331,26 +350,57 @@ class AlchemyWebhookService extends EventEmitter {
   }
 
   /**
-   * Sync all existing user proxy wallet addresses to the webhook
+   * Mark proxy addresses as synced to Alchemy webhook
    */
-  async syncAllAddresses(): Promise<void> {
+  private async markAddressesSynced(addresses: string[]): Promise<void> {
+    if (addresses.length === 0) return;
+    try {
+      await pool.query(
+        `UPDATE users 
+         SET alchemy_webhook_synced_at = NOW() 
+         WHERE LOWER(proxy_wallet_address) = ANY($1::text[])`,
+        [addresses.map((a) => a.toLowerCase())]
+      );
+    } catch (error) {
+      logger.error({
+        message: 'Failed to mark addresses as Alchemy-synced',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Sync user proxy wallet addresses to the webhook.
+   * By default only syncs addresses not yet marked; use force=true to re-add all.
+   */
+  async syncAllAddresses(force?: boolean): Promise<void> {
     if (!this.webhookId) return;
 
     try {
-      const result = await pool.query(`
-        SELECT proxy_wallet_address 
-        FROM users 
-        WHERE proxy_wallet_address IS NOT NULL
-      `);
+      const result = await pool.query(
+        `SELECT proxy_wallet_address 
+         FROM users 
+         WHERE proxy_wallet_address IS NOT NULL
+         ${force ? '' : 'AND alchemy_webhook_synced_at IS NULL'}`.trim()
+      );
 
-      const addresses = result.rows.map(row => row.proxy_wallet_address);
-      
-      if (addresses.length > 0) {
-        await this.addAddresses(addresses);
-        logger.info({
-          message: 'Synced all user addresses to Alchemy webhook',
-          addressCount: addresses.length,
-        });
+      const addresses = result.rows.map((row) => row.proxy_wallet_address);
+      if (addresses.length === 0) return;
+
+      const size = AlchemyWebhookService.ADDRESS_BATCH_SIZE;
+      for (let i = 0; i < addresses.length; i += size) {
+        const batch = addresses.slice(i, i + size);
+        try {
+          await this.addAddresses(batch);
+          await this.markAddressesSynced(batch);
+        } catch (error) {
+          logger.error({
+            message: 'Failed to sync address batch to Alchemy webhook',
+            batchIndex: Math.floor(i / size) + 1,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          // Continue with next batch; failed batch will be retried on next sync
+        }
       }
     } catch (error) {
       logger.error({
@@ -411,18 +461,18 @@ class AlchemyWebhookService extends EventEmitter {
       const txHash = activity.hash;
       const blockNumber = parseInt(activity.blockNum, 16);
 
-      logger.info({
-        message: `[AUTO-TRANSFER-FLOW] Step 1: Alchemy webhook received ${tokenType} transfer`,
-        flowStep: 'WEBHOOK_RECEIVED',
-        tokenType,
-        fromAddress,
-        toAddress,
-        valueRaw: value,
-        valueHuman: (value / 1e6).toFixed(6) + ' USDC',
-        txHash,
-        blockNumber,
-        contractAddress,
-      });
+      // logger.info({
+      //   message: `[AUTO-TRANSFER-FLOW] Step 1: Alchemy webhook received ${tokenType} transfer`,
+      //   flowStep: 'WEBHOOK_RECEIVED',
+      //   tokenType,
+      //   fromAddress,
+      //   toAddress,
+      //   valueRaw: value,
+      //   valueHuman: (value / 1e6).toFixed(6) + ' USDC',
+      //   txHash,
+      //   blockNumber,
+      //   contractAddress,
+      // });
 
       // Update balance for recipient (incoming transfer)
       if (toAddress) {
@@ -504,16 +554,16 @@ class AlchemyWebhookService extends EventEmitter {
       const totalBalanceRaw = usdceBalanceRaw + nativeBalanceRaw;
       const totalBalanceHuman = ethers.utils.formatUnits(totalBalanceRaw.toString(), 6);
 
-      logger.info({
-        message: `[AUTO-TRANSFER-FLOW] Fetched USDC balances from Alchemy`,
-        flowStep: 'BALANCE_FETCHED',
-        address,
-        walletType: isProxyWallet ? 'proxy' : 'embedded',
-        tokenType,
-        usdceBalance: ethers.utils.formatUnits(usdceBalanceRaw.toString(), 6),
-        nativeBalance: ethers.utils.formatUnits(nativeBalanceRaw.toString(), 6),
-        totalBalance: totalBalanceHuman,
-      });
+      // logger.info({
+      //   message: `[AUTO-TRANSFER-FLOW] Fetched USDC balances from Alchemy`,
+      //   flowStep: 'BALANCE_FETCHED',
+      //   address,
+      //   walletType: isProxyWallet ? 'proxy' : 'embedded',
+      //   tokenType,
+      //   usdceBalance: ethers.utils.formatUnits(usdceBalanceRaw.toString(), 6),
+      //   nativeBalance: ethers.utils.formatUnits(nativeBalanceRaw.toString(), 6),
+      //   totalBalance: totalBalanceHuman,
+      // });
 
       await client.query('BEGIN');
 
@@ -553,17 +603,17 @@ class AlchemyWebhookService extends EventEmitter {
 
         await client.query('COMMIT');
 
-        logger.info({
-          message: '[AUTO-TRANSFER-FLOW] Updated proxy wallet balance',
-          flowStep: 'PROXY_BALANCE_UPDATED',
-          privyUserId,
-          proxyWalletAddress: address,
-          transferType,
-          tokenType,
-          amount: humanAmount,
-          newBalance: totalBalanceHuman,
-          txHash,
-        });
+        // logger.info({
+        //   message: '[AUTO-TRANSFER-FLOW] Updated proxy wallet balance',
+        //   flowStep: 'PROXY_BALANCE_UPDATED',
+        //   privyUserId,
+        //   proxyWalletAddress: address,
+        //   transferType,
+        //   tokenType,
+        //   amount: humanAmount,
+        //   newBalance: totalBalanceHuman,
+        //   txHash,
+        // });
 
         // Emit notification for proxy wallet balance changes
         const notification: BalanceNotification = {
@@ -597,31 +647,31 @@ class AlchemyWebhookService extends EventEmitter {
 
         await client.query('COMMIT');
 
-        logger.info({
-          message: `[AUTO-TRANSFER-FLOW] Step 2: Embedded wallet balance updated - ${transferType === 'in' ? 'DEPOSIT DETECTED' : 'withdrawal'}`,
-          flowStep: transferType === 'in' ? 'DEPOSIT_DETECTED' : 'WITHDRAWAL_DETECTED',
-          privyUserId,
-          embeddedWalletAddress: address,
-          transferType,
-          tokenType,
-          amountHuman: ethers.utils.formatUnits(amount.toString(), 6) + ' USDC',
-          newBalanceHuman: totalBalanceHuman + ' USDC',
-          txHash,
-          willTriggerAutoTransfer: transferType === 'in',
-        });
+        // logger.info({
+        //   message: `[AUTO-TRANSFER-FLOW] Step 2: Embedded wallet balance updated - ${transferType === 'in' ? 'DEPOSIT DETECTED' : 'withdrawal'}`,
+        //   flowStep: transferType === 'in' ? 'DEPOSIT_DETECTED' : 'WITHDRAWAL_DETECTED',
+        //   privyUserId,
+        //   embeddedWalletAddress: address,
+        //   transferType,
+        //   tokenType,
+        //   amountHuman: ethers.utils.formatUnits(amount.toString(), 6) + ' USDC',
+        //   newBalanceHuman: totalBalanceHuman + ' USDC',
+        //   txHash,
+        //   willTriggerAutoTransfer: transferType === 'in',
+        // });
 
         // Emit embedded wallet balance change event for auto-transfer service
         if (transferType === 'in') {
           const amountHuman = ethers.utils.formatUnits(amount.toString(), 6);
           
-          logger.info({
-            message: '[AUTO-TRANSFER-FLOW] Step 3: Emitting embeddedWalletBalanceChange event',
-            flowStep: 'EMITTING_BALANCE_CHANGE_EVENT',
-            privyUserId,
-            embeddedWalletAddress: address,
-            balanceIncrease: amountHuman + ' USDC',
-            tokenType,
-          });
+          // logger.info({
+          //   message: '[AUTO-TRANSFER-FLOW] Step 3: Emitting embeddedWalletBalanceChange event',
+          //   flowStep: 'EMITTING_BALANCE_CHANGE_EVENT',
+          //   privyUserId,
+          //   embeddedWalletAddress: address,
+          //   balanceIncrease: amountHuman + ' USDC',
+          //   tokenType,
+          // });
 
           // Start tracking deposit progress for frontend
           depositProgressService.startDeposit(
@@ -653,16 +703,16 @@ class AlchemyWebhookService extends EventEmitter {
         });
       }
 
-      logger.info({
-        message: `[AUTO-TRANSFER-FLOW] ${transferType === 'in' ? 'Deposit' : 'Withdrawal'} processed`,
-        flowStep: 'TRANSFER_PROCESSED',
-        privyUserId,
-        walletType: isProxyWallet ? 'proxy' : 'embedded',
-        tokenType,
-        amount: ethers.utils.formatUnits(amount.toString(), 6),
-        newBalance: totalBalanceHuman,
-        txHash,
-      });
+      // logger.info({
+      //   message: `[AUTO-TRANSFER-FLOW] ${transferType === 'in' ? 'Deposit' : 'Withdrawal'} processed`,
+      //   flowStep: 'TRANSFER_PROCESSED',
+      //   privyUserId,
+      //   walletType: isProxyWallet ? 'proxy' : 'embedded',
+      //   tokenType,
+      //   amount: ethers.utils.formatUnits(amount.toString(), 6),
+      //   newBalance: totalBalanceHuman,
+      //   txHash,
+      // });
     } catch (error) {
       await client.query('ROLLBACK');
       logger.error({
@@ -680,13 +730,18 @@ class AlchemyWebhookService extends EventEmitter {
    * Call this when a new user deploys a proxy wallet
    */
   async addUserAddress(proxyWalletAddress: string, privyUserId: string): Promise<void> {
-    logger.info({
-      message: 'Adding proxy wallet address to Alchemy webhook',
-      privyUserId,
-      proxyWalletAddress,
-    });
-
-    await this.addAddresses([proxyWalletAddress]);
+    try {
+      await this.addAddresses([proxyWalletAddress]);
+      await this.markAddressesSynced([proxyWalletAddress]);
+    } catch (error) {
+      logger.error({
+        message: 'Failed to add user address to Alchemy webhook',
+        privyUserId,
+        proxyWalletAddress,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   /**
@@ -694,12 +749,12 @@ class AlchemyWebhookService extends EventEmitter {
    * Call this when monitoring embedded wallets for MoonPay deposits
    */
   async addEmbeddedWalletAddress(embeddedWalletAddress: string, privyUserId: string): Promise<void> {
-    logger.info({
-      message: '[AUTO-TRANSFER-FLOW] Adding embedded wallet address to Alchemy webhook',
-      flowStep: 'ADDING_EMBEDDED_WALLET',
-      privyUserId,
-      embeddedWalletAddress,
-    });
+    // logger.info({
+    //   message: '[AUTO-TRANSFER-FLOW] Adding embedded wallet address to Alchemy webhook',
+    //   flowStep: 'ADDING_EMBEDDED_WALLET',
+    //   privyUserId,
+    //   embeddedWalletAddress,
+    // });
 
     await this.addAddresses([embeddedWalletAddress]);
   }

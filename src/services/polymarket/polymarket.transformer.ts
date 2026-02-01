@@ -540,12 +540,12 @@ function transformEvent(event: PolymarketEvent): TransformedEvent {
               }).sort((a, b) => b.probability - a.probability);
               
               if (groupedOutcomes.length > 0) {
-                logger.info({
-                  message: 'Created fallback outcomes from raw market data',
-                  eventId: event.id,
-                  marketId: market.id,
-                  outcomeCount: groupedOutcomes.length,
-                });
+                // logger.info({
+                //   message: 'Created fallback outcomes from raw market data',
+                //   eventId: event.id,
+                //   marketId: market.id,
+                //   outcomeCount: groupedOutcomes.length,
+                // });
                 break;
               }
             }
@@ -713,12 +713,12 @@ export function transformEvents(events: PolymarketEvent[]): TransformedEvent[] {
     // Sort by volume24Hr descending
     transformed.sort((a, b) => (b.volume24Hr || 0) - (a.volume24Hr || 0));
 
-    logger.info({
-      message: 'Events transformed successfully',
-      inputCount: events.length,
-      groupedCount: groupedEvents.length,
-      outputCount: transformed.length,
-    });
+    // logger.info({
+    //   message: 'Events transformed successfully',
+    //   inputCount: events.length,
+    //   groupedCount: groupedEvents.length,
+    //   outputCount: transformed.length,
+    // });
 
     return transformed;
   } catch (error) {
@@ -789,12 +789,12 @@ export function mergePollingData(
   // Re-sort by volume24Hr descending
   merged.sort((a, b) => (b.volume24Hr || 0) - (a.volume24Hr || 0));
 
-  logger.info({
-    message: 'Polling data merged',
-    mainCount: mainEvents.length,
-    pollingCount: pollingEvents.length,
-    mergedCount: merged.length,
-  });
+  // logger.info({
+  //   message: 'Polling data merged',
+  //   mainCount: mainEvents.length,
+  //   pollingCount: pollingEvents.length,
+  //   mergedCount: merged.length,
+  // });
 
   return merged;
 }

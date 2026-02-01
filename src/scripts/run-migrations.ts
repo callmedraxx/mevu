@@ -74,11 +74,11 @@ async function recordMigration(version: number, filename: string): Promise<void>
 async function runMigration(migration: Migration): Promise<void> {
   const client = await pool.connect();
   try {
-    logger.info({
-      message: 'Running migration',
-      filename: migration.filename,
-      version: migration.number,
-    });
+    // logger.info({
+    //   message: 'Running migration',
+    //   filename: migration.filename,
+    //   version: migration.number,
+    // });
 
     // Run the migration SQL
     await client.query(migration.sql);
@@ -86,11 +86,11 @@ async function runMigration(migration: Migration): Promise<void> {
     // Record that this migration was applied
     await recordMigration(migration.number, migration.filename);
 
-    logger.info({
-      message: 'Migration completed',
-      filename: migration.filename,
-      version: migration.number,
-    });
+    // logger.info({
+    //   message: 'Migration completed',
+    //   filename: migration.filename,
+    //   version: migration.number,
+    // });
   } catch (error) {
     logger.error({
       message: 'Migration failed',
@@ -116,7 +116,7 @@ async function runMigrations(): Promise<void> {
   }
 
   try {
-    logger.info({ message: 'Starting database migrations' });
+    //logger.info({ message: 'Starting database migrations' });
 
     // Create migrations tracking table
     await createMigrationsTable();
@@ -125,22 +125,16 @@ async function runMigrations(): Promise<void> {
     const migrations = await getMigrations();
     const applied = await getAppliedMigrations();
 
-    logger.info({
-      message: 'Migration status',
-      totalMigrations: migrations.length,
-      appliedMigrations: applied.length,
-    });
+    // logger.info({
+    //   message: 'Migration status',
+    //   totalMigrations: migrations.length,
+    //   appliedMigrations: applied.length,
+    // });
 
     // Run pending migrations
     for (const migration of migrations) {
       if (!applied.includes(migration.number)) {
         await runMigration(migration);
-      } else {
-        logger.info({
-          message: 'Migration already applied, skipping',
-          filename: migration.filename,
-          version: migration.number,
-        });
       }
     }
 
@@ -169,7 +163,7 @@ async function runMigrations(): Promise<void> {
 if (require.main === module) {
   runMigrations()
     .then(() => {
-      logger.info({ message: 'Migration script completed successfully' });
+      //logger.info({ message: 'Migration script completed successfully' });
       process.exit(0);
     })
     .catch((error) => {

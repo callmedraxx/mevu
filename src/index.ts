@@ -4,11 +4,13 @@ import dotenv from 'dotenv';
 import http from 'http';
 import swaggerUi from 'swagger-ui-express';
 import swaggerJsdoc from 'swagger-jsdoc';
+import cluster from 'cluster';
 import { swaggerOptions } from './config/swagger';
 import apiRouter from './routes';
 import { logoMappingService } from './services/espn/logo-mapping.service';
 import { liveGamesService } from './services/polymarket/live-games.service';
 import { sportsGamesService } from './services/polymarket/sports-games.service';
+import { seriesIdSyncService } from './services/polymarket/series-id-sync.service';
 import { teamsService } from './services/polymarket/teams.service';
 import { privyService } from './services/privy/privy.service';
 import { initializeUsersTable } from './services/privy/user.service';
@@ -18,6 +20,7 @@ import { gamesWebSocketService } from './services/polymarket/games-websocket.ser
 import { activityWatcherWebSocketService } from './services/polymarket/activity-watcher-websocket.service';
 import { clobPriceUpdateService } from './services/polymarket/clob-price-update.service';
 import { positionsWebSocketService } from './services/positions/positions-websocket.service';
+import { shutdownRedisGamesBroadcast } from './services/redis-games-broadcast.service';
 import { initializeProbabilityHistoryTable, cleanupOldProbabilityHistory } from './services/polymarket/probability-history.service';
 import { logger } from './config/logger';
 import { runMigrations } from './scripts/run-migrations';
@@ -126,10 +129,8 @@ async function initializeServices() {
       logger.info({ message: 'Database migrations completed' });
     }
     
-    // Initialize Privy service (no DB connection needed)
-    logger.info({ message: 'Initializing Privy service...' });
-    privyService.initialize();
-    
+    // Privy is initialized in startHttpServer() (all workers) before listen.
+
     // Stagger database-dependent service initialization to prevent connection pool exhaustion
     // Initialize users table
     logger.info({ message: 'Initializing users table...' });
@@ -145,6 +146,10 @@ async function initializeServices() {
     // Longer delay before starting services that make immediate DB connections
     // This prevents connection pool exhaustion
     await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // Sync series IDs from Gamma so we don't have to hardcode seasonal series_id changes
+    // (especially important for CBB/CFB). Also refreshes daily.
+    await seriesIdSyncService.start();
     
     // Start live games polling service (delayed initial refresh built into service)
     // logger.info({ message: 'Starting live games service...' });
@@ -276,51 +281,112 @@ async function initializeServices() {
   }
 }
 
-// Create HTTP server (needed for WebSocket)
-const server = http.createServer(app);
+let server: http.Server | null = null;
 
-// Initialize WebSocket services BEFORE server starts listening
-// These services handle their own upgrade requests with noServer mode
-gamesWebSocketService.initialize(server, '/ws/games');
-activityWatcherWebSocketService.initialize(server, '/ws/activity');
-positionsWebSocketService.initialize(server);
+function startHttpServer() {
+  // Initialize Privy in this process before accepting any requests.
+  // Required in cluster mode: only the leader runs initializeServices(), but every
+  // worker handles API traffic (including redemption/signing). Each worker must
+  // have Privy initialized or "Privy service not initialized" occurs on sign.
+  privyService.initialize();
 
-// Start server
-server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-  console.log(`Swagger documentation available at http://localhost:${PORT}/api-docs`);
-  console.log(`WebSocket endpoints:`);
-  console.log(`  - Games updates: ws://localhost:${PORT}/ws/games`);
-  console.log(`  - Activity watcher: ws://localhost:${PORT}/ws/activity`);
+  // Create HTTP server (needed for WebSocket)
+  server = http.createServer(app);
 
-  // Initialize other services after server starts
-  initializeServices();
-});
+  // Initialize WebSocket services BEFORE server starts listening
+  // These services handle their own upgrade requests with noServer mode
+  gamesWebSocketService.initialize(server, '/ws/games');
+  activityWatcherWebSocketService.initialize(server, '/ws/activity');
+  positionsWebSocketService.initialize(server);
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  logger.info({ message: 'SIGTERM received, shutting down gracefully' });
-  gamesWebSocketService.shutdown();
-  activityWatcherWebSocketService.shutdown();
-  positionsWebSocketService.shutdown();
-  clobPriceUpdateService.shutdown();
-  server.close(() => {
-    logger.info({ message: 'HTTP server closed' });
-    process.exit(0);
+  // Start server
+  server.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT} (pid=${process.pid})`);
+    console.log(`Swagger documentation available at http://localhost:${PORT}/api-docs`);
+    console.log(`WebSocket endpoints:`);
+    console.log(`  - Games updates: ws://localhost:${PORT}/ws/games`);
+    console.log(`  - Activity watcher: ws://localhost:${PORT}/ws/activity`);
+
+    // Initialize other services after server starts
+    const nodeEnv = process.env.NODE_ENV || 'development';
+    const isClusterWorker = cluster.isWorker && nodeEnv === 'production';
+    const isLeaderWorker = isClusterWorker ? cluster.worker?.id === 1 : true;
+
+    if (isLeaderWorker) {
+      initializeServices();
+    } else {
+      logger.info({
+        message: 'HTTP worker started without background services',
+        pid: process.pid,
+        workerId: cluster.isWorker ? cluster.worker?.id : null,
+      });
+    }
   });
-});
 
-process.on('SIGINT', () => {
-  logger.info({ message: 'SIGINT received, shutting down gracefully' });
-  gamesWebSocketService.shutdown();
-  activityWatcherWebSocketService.shutdown();
-  positionsWebSocketService.shutdown();
-  clobPriceUpdateService.shutdown();
-  server.close(() => {
-    logger.info({ message: 'HTTP server closed' });
-    process.exit(0);
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    logger.info({ message: 'SIGTERM received, shutting down gracefully' });
+    gamesWebSocketService.shutdown();
+    activityWatcherWebSocketService.shutdown();
+    positionsWebSocketService.shutdown();
+    clobPriceUpdateService.shutdown();
+    shutdownRedisGamesBroadcast().catch(() => {});
+    if (server) {
+      server.close(() => {
+        logger.info({ message: 'HTTP server closed' });
+        process.exit(0);
+      });
+    } else {
+      process.exit(0);
+    }
   });
-});
+
+  process.on('SIGINT', () => {
+    logger.info({ message: 'SIGINT received, shutting down gracefully' });
+    gamesWebSocketService.shutdown();
+    activityWatcherWebSocketService.shutdown();
+    positionsWebSocketService.shutdown();
+    clobPriceUpdateService.shutdown();
+    shutdownRedisGamesBroadcast().catch(() => {});
+    if (server) {
+      server.close(() => {
+        logger.info({ message: 'HTTP server closed' });
+        process.exit(0);
+      });
+    } else {
+      process.exit(0);
+    }
+  });
+}
+
+const nodeEnv = process.env.NODE_ENV || 'development';
+
+if (nodeEnv === 'production' && cluster.isPrimary) {
+  const numWorkers = Number(process.env.WORKER_COUNT) || 4;
+  logger.info({
+    message: 'Starting cluster master',
+    pid: process.pid,
+    workers: numWorkers,
+  });
+
+  for (let i = 0; i < numWorkers; i++) {
+    cluster.fork();
+  }
+
+  cluster.on('exit', (worker, code, signal) => {
+    logger.error({
+      message: 'Worker exited, forking a new one',
+      workerId: worker.id,
+      pid: worker.process.pid,
+      code,
+      signal,
+    });
+    cluster.fork();
+  });
+} else {
+  // Single-process (development) or cluster worker (production)
+  startHttpServer();
+}
 
 export default app;
 export { server };

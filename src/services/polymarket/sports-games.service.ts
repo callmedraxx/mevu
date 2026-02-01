@@ -12,7 +12,11 @@ import {
   LiveGame,
   transformAndEnrichGames,
   filterGamesBySports,
-  storeGames
+  storeGames,
+  isMoreMarketsSlug,
+  notifyGamesRefreshed,
+  notifyGamesRefreshStarting,
+  notifyGamesRefreshEnded,
 } from './live-games.service';
 
 const API_BASE_URL = 'https://gamma-api.polymarket.com';
@@ -201,50 +205,183 @@ function processSportsGamesResponse(response: SportsGamesApiResponse): LiveGameE
   // Transform all events (no filtering here - we'll filter by sport and upcoming status later)
   const transformedEvents = events.map(transformSportsGameToLiveGameEvent);
   
-  logger.debug({
-    message: 'Processed sports games API response',
-    totalFetched: events.length,
-    transformedCount: transformedEvents.length,
-  });
+  // logger.debug({
+  //   message: 'Processed sports games API response',
+  //   totalFetched: events.length,
+  //   transformedCount: transformedEvents.length,
+  // });
   
   return transformedEvents;
 }
 
 /**
- * Fetch games for a specific sport by series ID (matches sportgamecode.ts approach)
- * Uses series_id, closed=false, and active=true parameters
+ * Extract raw events array from Gamma response
+ */
+function extractSportsEventsArray(response: SportsGamesApiResponse): any[] {
+  if (Array.isArray(response)) return response;
+  if (response && typeof response === 'object') {
+    if ('data' in response && Array.isArray((response as any).data)) return (response as any).data;
+    if ('events' in response && Array.isArray((response as any).events)) return (response as any).events;
+  }
+  return [];
+}
+
+/**
+ * Fetch games for a specific sport by series ID.
+ *
+ * IMPORTANT for CBB: There can be >200 games in a short time window, so we must paginate
+ * (offset) or we will miss games like `cbb-toledo-umass-2026-01-20`.
+ *
+ * We do NOT force `closed=false` here because Polymarket can mark upcoming games as closed
+ * even before tipoff (markets closed for trading). We rely on endDate windowing instead.
+ *
+ * For tennis: Some games have series_id=null, so we also fetch games matching slug patterns
+ * (atp-*, wta-*) that don't have a series_id, ensuring we capture all tennis games.
  */
 async function fetchSportsGamesForSport(sport: string, seriesId: string): Promise<LiveGameEvent[]> {
   try {
-    // Match sportgamecode.ts approach: use series_id, closed=false, active=true
-    const url = `${API_BASE_URL}/events?` +
-      `series_id=${seriesId}&` +
-      `limit=200&` +
-      `order=startTime&` +
-      `ascending=true&` +
-      `include_chat=false&` +
-      `closed=false&` +
-      `active=true`;
-    
-    logger.debug({
-      message: 'Fetching sports games for sport',
-      sport,
-      seriesId,
-      url,
-    });
-    
-    const response = await fetchWithTimeout(url);
-    const events = processSportsGamesResponse(response);
-    
-    logger.info({
-      message: 'Sports games fetched for sport',
-      sport,
-      seriesId,
-      totalFetched: Array.isArray(response) ? response.length : (response as any)?.data?.length || (response as any)?.events?.length || 0,
-      upcomingCount: events.length,
-    });
-    
-    return events;
+    const limit = 200;
+    const maxPages = sport === 'cbb' ? 25 : sport === 'ufc' ? 20 : 5; // CBB and UFC need more pages
+    const now = Date.now();
+    const gracePeriod = 3 * 60 * 60 * 1000; // 3 hours
+    const recentWindow = 7 * 24 * 60 * 60 * 1000; // 7 days
+    const oldestAllowed = now - recentWindow - gracePeriod;
+
+    const collected: LiveGameEvent[] = [];
+    const collectedSlugs = new Set<string>();
+
+    // Fetch games with the series_id (skip if seriesId is empty, e.g., tennis without series_id)
+    // UFC uses series_id=38 (Polymarket series slug "ufc"); 10500 returns NFLX
+    if (seriesId && seriesId !== '') {
+      for (let page = 0; page < maxPages; page++) {
+        const offset = page * limit;
+        const url =
+          `${API_BASE_URL}/events?` +
+          `series_id=${seriesId}&` +
+          `limit=${limit}&` +
+          `offset=${offset}&` +
+          `order=endDate&` +
+          `ascending=false&` +
+          `include_chat=false&` +
+          `active=true`;
+
+        const response = await fetchWithTimeout(url);
+        const rawEvents = extractSportsEventsArray(response);
+
+        // Filter raw events to keep payload small and focused on relevant time window
+        const filteredRaw = rawEvents.filter((e) => {
+          if (!isUpcomingGame(e)) return false;
+          const end = e?.endDate || e?.end_date;
+          if (!end) return true; // keep if missing endDate
+          const t = new Date(end).getTime();
+          if (Number.isNaN(t)) return true;
+          return t >= oldestAllowed;
+        });
+
+        const pageEvents = filteredRaw.map(transformSportsGameToLiveGameEvent);
+        collected.push(...pageEvents);
+        pageEvents.forEach(e => {
+          if (e.slug) collectedSlugs.add(e.slug);
+        });
+
+        // Determine if we can stop paginating (we're past the recent window)
+        const pageEndDates = rawEvents
+          .map((e) => e?.endDate || e?.end_date)
+          .filter(Boolean)
+          .map((d) => new Date(d).getTime())
+          .filter((t) => !Number.isNaN(t));
+
+        const oldestInPage = pageEndDates.length ? Math.min(...pageEndDates) : Infinity;
+
+        // logger.info({
+        //   message: 'Sports games fetched page',
+        //   sport,
+        //   seriesId,
+        //   page,
+        //   offset,
+        //   fetched: rawEvents.length,
+        //   kept: pageEvents.length,
+        //   oldestEndDateMs: oldestInPage === Infinity ? null : oldestInPage,
+        // });
+
+        // Stop conditions:
+        // - fewer than limit returned (no more pages)
+        // - oldest endDate in this page is older than our retention window
+        if (rawEvents.length < limit) break;
+        if (oldestInPage !== Infinity && oldestInPage < oldestAllowed) break;
+      }
+    }
+
+    // For tennis, also fetch WTA games (series_id=10366) since we use ATP series_id (10365) as primary
+    // Polymarket has separate series for ATP and WTA, but we normalize both to "tennis" sport
+    if (sport === 'tennis') {
+      try {
+        // Fetch WTA games using WTA series ID (10366) with pagination
+        const wtaSeriesId = '10366';
+        const wtaMaxPages = 5; // Same as other sports
+        
+        for (let page = 0; page < wtaMaxPages; page++) {
+          const offset = page * limit;
+          const wtaUrl =
+            `${API_BASE_URL}/events?` +
+            `series_id=${wtaSeriesId}&` +
+            `limit=${limit}&` +
+            `offset=${offset}&` +
+            `order=endDate&` +
+            `ascending=false&` +
+            `include_chat=false&` +
+            `active=true`;
+
+          const wtaResponse = await fetchWithTimeout(wtaUrl);
+          const wtaRawEvents = extractSportsEventsArray(wtaResponse);
+
+          // Filter WTA events
+          const filteredWta = wtaRawEvents.filter((e) => {
+            const slug = e?.slug?.toLowerCase() || '';
+            if (!slug.startsWith('wta-')) return false;
+            
+            // Check if already collected
+            if (e?.slug && collectedSlugs.has(e.slug)) return false;
+            
+            if (!isUpcomingGame(e)) return false;
+            const end = e?.endDate || e?.end_date;
+            if (!end) return true;
+            const t = new Date(end).getTime();
+            if (Number.isNaN(t)) return true;
+            return t >= oldestAllowed;
+          });
+
+          const wtaEvents = filteredWta.map(transformSportsGameToLiveGameEvent);
+          collected.push(...wtaEvents);
+          
+          // Track collected slugs to avoid duplicates
+          wtaEvents.forEach(e => {
+            if (e.slug) collectedSlugs.add(e.slug);
+          });
+
+          // logger.info({
+          //   message: 'Fetched WTA games page for tennis',
+          //   sport,
+          //   wtaSeriesId,
+          //   page,
+          //   offset,
+          //   fetched: wtaRawEvents.length,
+          //   kept: filteredWta.length,
+          // });
+
+          // Stop if we got fewer than limit (no more pages)
+          if (wtaRawEvents.length < limit) break;
+        }
+      } catch (error) {
+        logger.warn({
+          message: 'Error fetching WTA games for tennis',
+          sport,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return collected;
   } catch (error) {
     logger.error({
       message: 'Error fetching sports games for sport',
@@ -269,9 +406,11 @@ export async function fetchSportsGames(): Promise<LiveGameEvent[]> {
   const results = await Promise.allSettled(
     sports.map(async (sport) => {
       const config = sportsConfig[sport];
-      
-      // Skip if no series ID configured
-      if (!config.seriesId || config.seriesId === '') {
+      const effectiveSeriesId = getSeriesIdForSport(sport);
+
+      // For tennis and UFC, we still fetch even without series_id (games with null series_id or wrong series_id)
+      // For other sports, skip if no series ID
+      if ((!effectiveSeriesId || effectiveSeriesId === '') && sport !== 'tennis' && sport !== 'ufc') {
         logger.warn({
           message: 'Skipping sport with no series ID',
           sport,
@@ -280,17 +419,21 @@ export async function fetchSportsGames(): Promise<LiveGameEvent[]> {
         return {
           sport,
           sportLabel: config.label,
-          seriesId: config.seriesId,
+          seriesId: effectiveSeriesId || config.seriesId,
           events: [],
         };
       }
       
-      const events = await fetchSportsGamesForSport(sport, config.seriesId);
+      // For tennis and UFC without series_id, use empty string (fetchSportsGamesForSport handles this)
+      // For other sports, we already checked they have a series_id above
+      const seriesIdToUse = effectiveSeriesId || (sport === 'tennis' || sport === 'ufc' ? '' : '');
+      
+      const events = await fetchSportsGamesForSport(sport, seriesIdToUse);
       
       return {
         sport,
         sportLabel: config.label,
-        seriesId: config.seriesId,
+        seriesId: effectiveSeriesId || seriesIdToUse,
         events,
       };
     })
@@ -330,14 +473,14 @@ export async function fetchSportsGames(): Promise<LiveGameEvent[]> {
   
   const latencyMs = Date.now() - startTime;
   
-  logger.info({
-    message: 'Sports games fetched',
-    totalEvents: allEvents.length,
-    sportsProcessed,
-    sportsFailed,
-    sportCounts,
-    latencyMs,
-  });
+  // logger.info({
+  //   message: 'Sports games fetched',
+  //   totalEvents: allEvents.length,
+  //   sportsProcessed,
+  //   sportsFailed,
+  //   sportCounts,
+  //   latencyMs,
+  // });
   
   return allEvents;
 }
@@ -352,6 +495,25 @@ function extractSportFromSlug(slug: string, configuredSports: Set<string>): stri
   if (parts.length === 0) return null;
   
   const firstPart = parts[0].toLowerCase();
+  
+  // Blacklist: Known non-sports slugs that should never be classified as sports
+  // These are financial/stock market games or other non-sports markets
+  const NON_SPORTS_BLACKLIST = new Set([
+    'nflx', // Netflix stock, not NFL
+    'tsla', // Tesla stock
+    'aapl', // Apple stock
+    'spy',  // S&P 500 ETF
+    'qqq',  // NASDAQ ETF
+    'dow',  // Dow Jones
+    'crypto', // Cryptocurrency markets
+    'btc',  // Bitcoin
+    'eth',  // Ethereum
+  ]);
+  
+  // If first slug part is in blacklist, reject immediately
+  if (NON_SPORTS_BLACKLIST.has(firstPart)) {
+    return null;
+  }
   
   // Check if first part matches a configured sport
   if (configuredSports.has(firstPart)) {
@@ -386,46 +548,57 @@ function extractSportFromSlug(slug: string, configuredSports: Set<string>): stri
 
 /**
  * Refresh sports games: fetch, transform, enrich, and store with data_source='sports_games'
- * Matches sportgamecode.ts approach: fetch and store per sport in parallel
+ * Runs per-sport sequentially to reduce live_games lock contention and deadlocks
  */
 export async function refreshSportsGames(): Promise<number> {
+  notifyGamesRefreshStarting();
   try {
-    logger.info({ message: 'Refreshing sports games' });
-    
+    // logger.info({ message: 'Refreshing sports games' });
+
     const sportsConfig = getAllSportsGamesConfig();
     const sports = Object.keys(sportsConfig);
-    
-    // Fetch, transform, enrich, and store per sport in parallel (like sportgamecode.ts)
-    const results = await Promise.allSettled(
-      sports.map(async (sport) => {
-        const config = sportsConfig[sport];
-        
-        // Skip if no series ID configured
-        if (!config.seriesId || config.seriesId === '') {
-          return { sport, count: 0 };
+
+    // Fetch, transform, enrich, and store per sport sequentially
+    const results: PromiseSettledResult<{ sport: string; count: number }>[] = [];
+    for (const sport of sports) {
+      try {
+        const effectiveSeriesId = getSeriesIdForSport(sport);
+
+        // For tennis and UFC, we still fetch even without series_id (games with null series_id or wrong series_id)
+        // For other sports, skip if no series ID
+        if ((!effectiveSeriesId || effectiveSeriesId === '') && sport !== 'tennis' && sport !== 'ufc') {
+          results.push({ status: 'fulfilled', value: { sport, count: 0 } });
+          continue;
         }
-        
+
+        // For tennis and UFC without series_id, use empty string (fetchSportsGamesForSport handles this)
+        const seriesIdToUse = effectiveSeriesId || (sport === 'tennis' || sport === 'ufc' ? '' : '');
+
         // Fetch games for this sport
-        const events = await fetchSportsGamesForSport(sport, config.seriesId);
-        
+        const events = await fetchSportsGamesForSport(sport, seriesIdToUse);
+
         if (events.length === 0) {
-          return { sport, count: 0 };
+          results.push({ status: 'fulfilled', value: { sport, count: 0 } });
+          continue;
         }
-        
+
         // Transform and enrich games
         const liveGames = await transformAndEnrichGames(events);
-        
-        // Set dataSource for all games
-        for (const game of liveGames) {
-          game.dataSource = 'sports_games';
-        }
-        
+
+        // Exclude -more-markets games (duplicate/placeholder entries)
+        const toStore = liveGames.filter((g) => !isMoreMarketsSlug(g.slug));
+
         // Store games with data_source='sports_games'
-        await storeGames(liveGames, 'sports_games');
-        
-        return { sport, count: liveGames.length };
-      })
-    );
+        await storeGames(toStore, 'sports_games');
+
+        results.push({ status: 'fulfilled', value: { sport, count: toStore.length } });
+      } catch (error) {
+        results.push({
+          status: 'rejected',
+          reason: error instanceof Error ? error : new Error(String(error)),
+        });
+      }
+    }
     
     // Aggregate results
     let totalStored = 0;
@@ -452,14 +625,16 @@ export async function refreshSportsGames(): Promise<number> {
       }
     });
     
-    logger.info({
-      message: 'Sports games refreshed',
-      totalStored,
-      sportsProcessed,
-      sportsFailed,
-      sportCounts,
-    });
-    
+    // logger.info({
+    //   message: 'Sports games refreshed',
+    //   totalStored,
+    //   sportsProcessed,
+    //   sportsFailed,
+    //   sportCounts,
+    // });
+
+    notifyGamesRefreshed();
+
     return totalStored;
   } catch (error) {
     logger.error({
@@ -467,6 +642,8 @@ export async function refreshSportsGames(): Promise<number> {
       error: error instanceof Error ? error.message : String(error),
     });
     return 0;
+  } finally {
+    notifyGamesRefreshEnded();
   }
 }
 
@@ -507,10 +684,10 @@ export class SportsGamesService {
       });
     }, POLLING_INTERVAL);
 
-    logger.info({ 
-      message: 'Sports games polling started', 
-      intervalMinutes: POLLING_INTERVAL / 60000 
-    });
+    // logger.info({ 
+    //   message: 'Sports games polling started', 
+    //   intervalMinutes: POLLING_INTERVAL / 60000 
+    // });
   }
 
   stop(): void {
@@ -525,7 +702,7 @@ export class SportsGamesService {
       this.pollingInterval = null;
     }
 
-    logger.info({ message: 'Sports games polling stopped' });
+    // logger.info({ message: 'Sports games polling stopped' });
   }
 
   isRunningService(): boolean {

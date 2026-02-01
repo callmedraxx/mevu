@@ -70,10 +70,10 @@ class PositionsWebSocketService {
     this.wss.on('connection', async (ws: WebSocket, request) => {
       const clientIp = request.socket.remoteAddress;
       
-      logger.info({
-        message: 'Positions WebSocket client connected',
-        clientIp,
-      });
+      // logger.info({
+      //   message: 'Positions WebSocket client connected',
+      //   clientIp,
+      // });
 
       // Handle incoming messages (subscribe requests)
       ws.on('message', async (data) => {
@@ -185,10 +185,10 @@ class PositionsWebSocketService {
     for (const [privyUserId, subscription] of this.subscriptions) {
       if (subscription.ws === ws) {
         this.unsubscribeUser(privyUserId);
-        logger.info({
-          message: 'Positions WebSocket client disconnected',
-          privyUserId,
-        });
+        // logger.info({
+        //   message: 'Positions WebSocket client disconnected',
+        //   privyUserId,
+        // });
         break;
       }
     }
@@ -217,12 +217,12 @@ class PositionsWebSocketService {
       this.assetToUsers.get(asset)!.add(privyUserId);
     }
 
-    logger.info({
-      message: 'User subscribed to position updates',
-      privyUserId,
-      assetCount: assets.length,
-      totalSubscriptions: this.subscriptions.size,
-    });
+    // logger.info({
+    //   message: 'User subscribed to position updates',
+    //   privyUserId,
+    //   assetCount: assets.length,
+    //   totalSubscriptions: this.subscriptions.size,
+    // });
   }
 
   /**
@@ -275,11 +275,11 @@ class PositionsWebSocketService {
       this.assetToUsers.get(asset)!.add(privyUserId);
     }
 
-    logger.debug({
-      message: 'Updated user position assets',
-      privyUserId,
-      assetCount: newAssets.length,
-    });
+    // logger.debug({
+    //   message: 'Updated user position assets',
+    //   privyUserId,
+    //   assetCount: newAssets.length,
+    // });
   }
 
   /**
@@ -294,15 +294,15 @@ class PositionsWebSocketService {
     const affectedUsers = this.assetToUsers.get(assetId);
     
     // Debug: log when we have subscribed users for this asset
-    if (this.subscriptions.size > 0) {
-      logger.debug({
-        message: 'Positions WebSocket price update check',
-        assetId: assetId.substring(0, 20) + '...',
-        hasSubscribedUsers: !!affectedUsers && affectedUsers.size > 0,
-        totalSubscriptions: this.subscriptions.size,
-        totalTrackedAssets: this.assetToUsers.size,
-      });
-    }
+    // if (this.subscriptions.size > 0) {
+    //   logger.debug({
+    //     message: 'Positions WebSocket price update check',
+    //     assetId: assetId.substring(0, 20) + '...',
+    //     hasSubscribedUsers: !!affectedUsers && affectedUsers.size > 0,
+    //     totalSubscriptions: this.subscriptions.size,
+    //     totalTrackedAssets: this.assetToUsers.size,
+    //   });
+    // }
     
     if (!affectedUsers || affectedUsers.size === 0) return;
 
@@ -377,11 +377,11 @@ class PositionsWebSocketService {
       const newAssets = positions.map(p => p.asset);
       this.updateUserAssets(privyUserId, newAssets);
       
-      logger.debug({
-        message: 'Sent positions refresh to user',
-        privyUserId,
-        positionCount: positions.length,
-      });
+      // logger.debug({
+      //   message: 'Sent positions refresh to user',
+      //   privyUserId,
+      //   positionCount: positions.length,
+      // });
     } catch (error) {
       logger.warn({
         message: 'Failed to send positions refresh',

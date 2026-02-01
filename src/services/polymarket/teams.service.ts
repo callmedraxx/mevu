@@ -10,6 +10,7 @@ import { pool } from '../../config/database';
 import { getLeagueForSport, isValidLeague, getAvailableLeagues } from './teams.config';
 import { ValidationError, PolymarketError, ErrorCode } from '../../utils/errors';
 import { logoMappingService } from '../espn/logo-mapping.service';
+import { getAllUfcFighterRecordsFromDatabase, getUfcFighterByAbbreviation, type UfcFighterRecord } from '../ufc/ufc-fighter-records.service';
 
 /**
  * Team data structure from Polymarket API
@@ -39,6 +40,42 @@ const inMemoryTeams: Map<string, Map<number, Team>> = new Map();
  */
 const useDatabase = process.env.NODE_ENV === 'production';
 
+/** Simple hash to produce stable numeric id from string */
+function stringToId(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) - h) + s.charCodeAt(i);
+    h = h & 0x7fffffff; // keep positive 31-bit
+  }
+  return h || 1;
+}
+
+/** Derive abbreviation from fighter name (e.g. "Conor McGregor" -> "MCG") */
+function abbreviationFromName(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '';
+  const last = parts[parts.length - 1];
+  return last.substring(0, 3).toUpperCase().padEnd(3, last[0] || 'X');
+}
+
+/** Map UFC fighter record to Team format for API consistency */
+function ufcFighterToTeam(f: UfcFighterRecord, index: number): Team {
+  const abbr = abbreviationFromName(f.displayName);
+  return {
+    id: stringToId(f.nameNormalized),
+    name: f.displayName,
+    league: 'ufc',
+    record: f.record,
+    logo: '',
+    abbreviation: abbr || `UF${index}`,
+    alias: '',
+    providerId: 0,
+    color: '',
+    createdAt: '',
+    updatedAt: '',
+  };
+}
+
 /**
  * Teams Service
  */
@@ -49,10 +86,10 @@ export class TeamsService {
    * @returns Array of teams
    */
   async fetchTeamsFromAPI(league: string): Promise<Team[]> {
-    logger.info({
-      message: 'Fetching teams from API',
-      league,
-    });
+    // logger.info({
+    //   message: 'Fetching teams from API',
+    //   league,
+    // });
 
     try {
       const response = await polymarketClient.get<Team[]>(
@@ -72,11 +109,11 @@ export class TeamsService {
         teams = (response as any).data;
       }
 
-      logger.info({
-        message: 'Teams fetched from API',
-        league,
-        teamCount: teams.length,
-      });
+      // logger.info({
+      //   message: 'Teams fetched from API',
+      //   league,
+      //   teamCount: teams.length,
+      // });
 
       return teams;
     } catch (error) {
@@ -115,11 +152,11 @@ export class TeamsService {
     }
     
     // If no mapped logo, return team as-is (will use Polymarket logo)
-    logger.debug({
-      message: 'No mapped logo found for team, using original',
-      league: team.league,
-      abbreviation: team.abbreviation,
-    });
+    // logger.debug({
+    //   message: 'No mapped logo found for team, using original',
+    //   league: team.league,
+    //   abbreviation: team.abbreviation,
+    // });
     
     return team;
   }
@@ -208,11 +245,11 @@ export class TeamsService {
 
       await client.query('COMMIT');
 
-      logger.info({
-        message: 'Teams upserted to database',
-        league,
-        teamCount: teams.length,
-      });
+      // logger.info({
+      //   message: 'Teams upserted to database',
+      //   league,
+      //   teamCount: teams.length,
+      // });
     } catch (error) {
       try {
         await client.query('ROLLBACK');
@@ -246,19 +283,25 @@ export class TeamsService {
       leagueTeams.set(team.id, team);
     }
 
-    logger.info({
-      message: 'Teams upserted to memory',
-      league,
-      teamCount: teams.length,
-    });
+    // logger.info({
+    //   message: 'Teams upserted to memory',
+    //   league,
+    //   teamCount: teams.length,
+    // });
   }
 
   /**
-   * Get teams by league from database or memory
+   * Get teams by league from database or memory.
+   * For UFC, returns fighters from ufc_fighter_records (Ball Don't Lie) instead of Polymarket.
    * @param league - League name
    * @returns Array of teams
    */
   async getTeamsByLeague(league: string): Promise<Team[]> {
+    const leagueLower = league.toLowerCase();
+    if (leagueLower === 'ufc') {
+      const fighters = await getAllUfcFighterRecordsFromDatabase();
+      return fighters.map((f, i) => ufcFighterToTeam(f, i));
+    }
     if (useDatabase) {
       return this.getTeamsFromDatabase(league);
     } else {
@@ -302,11 +345,11 @@ export class TeamsService {
         return this.replaceLogoUrl(team);
       });
 
-      logger.info({
-        message: 'Teams retrieved from database',
-        league,
-        teamCount: teams.length,
-      });
+      // logger.info({
+      //   message: 'Teams retrieved from database',
+      //   league,
+      //   teamCount: teams.length,
+      // });
 
       return teams;
     } catch (error) {
@@ -336,11 +379,11 @@ export class TeamsService {
     // Replace logo URLs
     const teamsWithReplacedLogos = teams.map(team => this.replaceLogoUrl(team));
 
-    logger.info({
-      message: 'Teams retrieved from memory',
-      league,
-      teamCount: teamsWithReplacedLogos.length,
-    });
+    // logger.info({
+    //   message: 'Teams retrieved from memory',
+    //   league,
+    //   teamCount: teamsWithReplacedLogos.length,
+    // });
 
     return teamsWithReplacedLogos;
   }
@@ -446,10 +489,15 @@ export class TeamsService {
   /**
    * Get team by abbreviation
    * @param league - League name
-   * @param abbreviation - Team abbreviation (e.g., 'LAL', 'NYK')
+   * @param abbreviation - Team abbreviation (e.g., 'LAL', 'NYK', or UFC identifier like 'RIZ')
    * @returns Team or null if not found
    */
   async getTeamByAbbreviation(league: string, abbreviation: string): Promise<Team | null> {
+    const leagueLower = league.toLowerCase();
+    if (leagueLower === 'ufc') {
+      const fighter = await getUfcFighterByAbbreviation(abbreviation);
+      return fighter ? ufcFighterToTeam(fighter, 0) : null;
+    }
     if (useDatabase) {
       return this.getTeamByAbbreviationFromDatabase(league, abbreviation);
     } else {
@@ -508,20 +556,20 @@ export class TeamsService {
    * @param league - League name
    */
   async refreshLeague(league: string): Promise<void> {
-    logger.info({
-      message: 'Refreshing teams for league',
-      league,
-    });
+    // logger.info({
+    //   message: 'Refreshing teams for league',
+    //   league,
+    // });
 
     try {
       const teams = await this.fetchTeamsFromAPI(league);
       await this.upsertTeams(teams, league);
 
-      logger.info({
-        message: 'League teams refreshed successfully',
-        league,
-        teamCount: teams.length,
-      });
+      // logger.info({
+      //   message: 'League teams refreshed successfully',
+      //   league,
+      //   teamCount: teams.length,
+      // });
     } catch (error) {
       logger.error({
         message: 'Error refreshing league teams',
@@ -537,10 +585,10 @@ export class TeamsService {
    */
   async refreshAllLeagues(): Promise<void> {
     const leagues = getAvailableLeagues();
-    logger.info({
-      message: 'Refreshing teams for all leagues',
-      leagueCount: leagues.length,
-    });
+    // logger.info({
+    //   message: 'Refreshing teams for all leagues',
+    //   leagueCount: leagues.length,
+    // });
 
     const results = await Promise.allSettled(
       leagues.map(async (sport) => {
@@ -554,12 +602,12 @@ export class TeamsService {
     const successful = results.filter((r) => r.status === 'fulfilled').length;
     const failed = results.filter((r) => r.status === 'rejected').length;
 
-    logger.info({
-      message: 'All leagues refresh completed',
-      total: leagues.length,
-      successful,
-      failed,
-    });
+    // logger.info({
+    //   message: 'All leagues refresh completed',
+    //   total: leagues.length,
+    //   successful,
+    //   failed,
+    // });
   }
 
   /**

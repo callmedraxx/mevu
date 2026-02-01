@@ -9,6 +9,12 @@ import { Server as HttpServer } from 'http';
 import { logger } from '../../config/logger';
 import { LiveGame, getAllLiveGames, getLiveGameBySlug, liveGamesService } from './live-games.service';
 import { transformToActivityWatcherGame, ActivityWatcherGame } from './activity-watcher.transformer';
+import {
+  initRedisClusterBroadcast,
+  subscribeToActivityBroadcast,
+  publishActivityBroadcast,
+  isRedisClusterBroadcastReady,
+} from '../redis-cluster-broadcast.service';
 
 // Message types for WebSocket communication
 interface WSMessage {
@@ -35,6 +41,7 @@ export class ActivityWatcherWebSocketService {
   private slugClients: Map<string, Set<WebSocket>> = new Map(); // slug -> set of ws clients
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private isInitialized: boolean = false;
+  private activityRedisUnsubscribe: (() => void) | null = null;
 
   private wsPath: string = '/ws/activity';
   
@@ -76,6 +83,7 @@ export class ActivityWatcherWebSocketService {
 
     this.setupEventHandlers();
     this.setupBroadcastCallbacks();
+    this.setupActivityRedisBroadcast();
     this.startHeartbeat();
     this.isInitialized = true;
 
@@ -281,6 +289,30 @@ export class ActivityWatcherWebSocketService {
   }
 
   /**
+   * Subscribe to Redis for cluster-wide activity broadcasts
+   */
+  private setupActivityRedisBroadcast(): void {
+    if (!initRedisClusterBroadcast()) return;
+    this.activityRedisUnsubscribe = subscribeToActivityBroadcast((msg) => {
+      const data = JSON.stringify(msg.message);
+      for (const slug of msg.slugs) {
+        const clients = this.slugClients.get(slug.toLowerCase());
+        if (clients) {
+          for (const client of clients) {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(data, { compress: false });
+              } catch {
+                this.unsubscribeClient(client);
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  /**
    * Set up broadcast callbacks from live games service
    */
   private setupBroadcastCallbacks(): void {
@@ -301,7 +333,7 @@ export class ActivityWatcherWebSocketService {
    * Broadcast updates when multiple games change
    */
   async broadcastGamesUpdate(games: LiveGame[]): Promise<void> {
-    if (this.slugClients.size === 0) return;
+    if (this.slugClients.size === 0 && !isRedisClusterBroadcastReady()) return;
 
     // Build a map of slug -> game for quick lookup
     const gamesBySlug = new Map<string, LiveGame>();
@@ -313,27 +345,32 @@ export class ActivityWatcherWebSocketService {
       gamesBySlug.set(game.id.toLowerCase(), game);
     }
 
-    // Send updates to subscribed clients
+    // Send updates to subscribed clients (or publish to Redis for cluster-wide delivery)
     for (const [slug, clients] of this.slugClients.entries()) {
       if (clients.size === 0) continue;
-      
+
       const game = gamesBySlug.get(slug);
       if (!game) continue;
 
       try {
         const transformed = await transformToActivityWatcherGame(game);
-        const data = JSON.stringify({
+        const message = {
           type: 'game_update',
           game: transformed,
           timestamp: new Date().toISOString(),
-        });
+        };
 
-        for (const client of clients) {
-          if (client.readyState === WebSocket.OPEN) {
-            try {
-              client.send(data, { compress: false });
-            } catch (error) {
-              this.unsubscribeClient(client);
+        if (isRedisClusterBroadcastReady()) {
+          publishActivityBroadcast([slug], message);
+        } else {
+          const data = JSON.stringify(message);
+          for (const client of clients) {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(data, { compress: false });
+              } catch {
+                this.unsubscribeClient(client);
+              }
             }
           }
         }
@@ -351,62 +388,46 @@ export class ActivityWatcherWebSocketService {
    * Broadcast single game update to subscribed clients
    */
   async broadcastGameUpdate(game: LiveGame): Promise<void> {
-    // logger.info({
-    //   message: 'Activity watcher broadcastGameUpdate called',
-    //   gameId: game.id,
-    //   slug: game.slug,
-    //   totalSubscriptions: this.slugClients.size,
-    // });
+    if (this.slugClients.size === 0 && !isRedisClusterBroadcastReady()) return;
 
-    if (this.slugClients.size === 0) {
-      return;
-    }
-
-    // Find all slugs that match this game
     const matchingSlugs: string[] = [];
     if (game.slug) matchingSlugs.push(game.slug.toLowerCase());
     matchingSlugs.push(game.id.toLowerCase());
 
-    // logger.info({
-    //   message: 'Looking for matching slugs',
-    //   matchingSlugs,
-    //   subscribedSlugs: Array.from(this.slugClients.keys()),
-    // });
+    try {
+      const transformed = await transformToActivityWatcherGame(game);
+      const message = {
+        type: 'game_update',
+        game: transformed,
+        timestamp: new Date().toISOString(),
+      };
 
-    for (const slug of matchingSlugs) {
-      const clients = this.slugClients.get(slug);
-      if (!clients || clients.size === 0) continue;
+      if (isRedisClusterBroadcastReady()) {
+        publishActivityBroadcast(matchingSlugs, message);
+        return;
+      }
 
-      try {
-        const transformed = await transformToActivityWatcherGame(game);
-        const data = JSON.stringify({
-          type: 'game_update',
-          game: transformed,
-          timestamp: new Date().toISOString(),
-        });
+      for (const slug of matchingSlugs) {
+        const clients = this.slugClients.get(slug);
+        if (!clients || clients.size === 0) continue;
 
+        const data = JSON.stringify(message);
         for (const client of clients) {
           if (client.readyState === WebSocket.OPEN) {
             try {
               client.send(data, { compress: false });
-            } catch (error) {
+            } catch {
               this.unsubscribeClient(client);
             }
           }
         }
-
-        logger.debug({
-          message: 'Broadcasted activity update to subscribed clients',
-          slug,
-          clientCount: clients.size,
-        });
-      } catch (error) {
-        logger.error({
-          message: 'Error broadcasting activity game update',
-          slug,
-          error: error instanceof Error ? error.message : String(error),
-        });
       }
+    } catch (error) {
+      logger.error({
+        message: 'Error broadcasting activity game update',
+        slug: game.slug,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -415,21 +436,24 @@ export class ActivityWatcherWebSocketService {
    * This skips the transformation step entirely for maximum speed
    */
   broadcastActivityWatcherGame(game: ActivityWatcherGame): void {
-    if (this.slugClients.size === 0) {
-      return;
-    }
+    if (this.slugClients.size === 0 && !isRedisClusterBroadcastReady()) return;
 
-    // Find all slugs that match this game
     const matchingSlugs: string[] = [];
     if (game.slug) matchingSlugs.push(game.slug.toLowerCase());
     matchingSlugs.push(game.id.toLowerCase());
 
-    const data = JSON.stringify({
+    const message = {
       type: 'game_update',
       game,
       timestamp: new Date().toISOString(),
-    });
+    };
 
+    if (isRedisClusterBroadcastReady()) {
+      publishActivityBroadcast(matchingSlugs, message);
+      return;
+    }
+
+    const data = JSON.stringify(message);
     for (const slug of matchingSlugs) {
       const clients = this.slugClients.get(slug);
       if (!clients || clients.size === 0) continue;
@@ -438,7 +462,7 @@ export class ActivityWatcherWebSocketService {
         if (client.readyState === WebSocket.OPEN) {
           try {
             client.send(data, { compress: false });
-          } catch (error) {
+          } catch {
             this.unsubscribeClient(client);
           }
         }
@@ -512,6 +536,11 @@ export class ActivityWatcherWebSocketService {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
+    }
+
+    if (this.activityRedisUnsubscribe) {
+      this.activityRedisUnsubscribe();
+      this.activityRedisUnsubscribe = null;
     }
 
     // Notify clients of shutdown

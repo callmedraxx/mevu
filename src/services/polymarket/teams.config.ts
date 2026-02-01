@@ -42,6 +42,13 @@ const TEAMS_CONFIG: TeamsConfig = {
     league: 'ufc',
     label: 'UFC',
   },
+  cbb: {
+    // College basketball teams (NCAA). Gamma's /teams endpoint accepts
+    // "cbb" as the league identifier, and each team row includes a
+    // season record string that we surface in the frontend.
+    league: 'cbb',
+    label: 'College Basketball',
+  },
   epl: {
     league: 'epl',
     label: 'English Premier League',

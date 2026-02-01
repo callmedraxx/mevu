@@ -11,7 +11,10 @@ import { getLeagueForSport } from './teams.config';
 import { teamsService, Team } from './teams.service';
 import { transformEvents } from './polymarket.transformer';
 import { PolymarketEvent, TransformedEvent } from './polymarket.types';
-import { recordProbabilitySnapshot, initializeProbabilityHistoryTable } from './probability-history.service';
+import { recordProbabilitySnapshotsBulk, initializeProbabilityHistoryTable } from './probability-history.service';
+import type { ProbabilitySnapshot } from './probability-history.service';
+import { upsertFrontendGamesForLiveGames, upsertFrontendGameForLiveGame, bulkUpsertFrontendGamesWithClient, clearFrontendGamesCache } from './frontend-games.service';
+import { transformToFrontendGame } from './frontend-game.transformer';
 
 // Build ID may change - we'll need to fetch it dynamically or update periodically
 // Default build ID - will be updated when 404 is encountered
@@ -24,7 +27,100 @@ function getLiveEndpoint(): string {
   return `https://polymarket.com/_next/data/${currentBuildId}/sports/live.json?slug=live`;
 }
 
-const POLLING_INTERVAL = 20 * 60 * 1000; // 20 minutes in milliseconds
+const POLLING_INTERVAL = 60 * 60 * 1000; // 20 minutes in milliseconds
+
+/** Callbacks invoked when live_games is refreshed (live or sports pipeline) */
+const onGamesRefreshedCallbacks: Set<() => void> = new Set();
+
+/** Callbacks invoked when refresh starts (pause CLOB flush) */
+const onRefreshStartingCallbacks: Set<() => void> = new Set();
+/** Callbacks invoked when refresh ends (unpause CLOB flush) */
+const onRefreshEndedCallbacks: Set<() => void> = new Set();
+let refreshInProgressCount = 0;
+
+export function registerOnGamesRefreshed(callback: () => void): () => void {
+  onGamesRefreshedCallbacks.add(callback);
+  return () => onGamesRefreshedCallbacks.delete(callback);
+}
+
+export function registerOnRefreshStarting(callback: () => void): () => void {
+  onRefreshStartingCallbacks.add(callback);
+  return () => onRefreshStartingCallbacks.delete(callback);
+}
+
+export function registerOnRefreshEnded(callback: () => void): () => void {
+  onRefreshEndedCallbacks.add(callback);
+  return () => onRefreshEndedCallbacks.delete(callback);
+}
+
+export function notifyGamesRefreshStarting(): void {
+  refreshInProgressCount++;
+  if (refreshInProgressCount === 1) {
+    for (const cb of onRefreshStartingCallbacks) {
+      try {
+        cb();
+      } catch (err) {
+        logger.warn({
+          message: 'Error in onRefreshStarting callback',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+}
+
+export function notifyGamesRefreshEnded(): void {
+  if (refreshInProgressCount <= 0) return;
+  refreshInProgressCount--;
+  if (refreshInProgressCount === 0) {
+    for (const cb of onRefreshEndedCallbacks) {
+      try {
+        cb();
+      } catch (err) {
+        logger.warn({
+          message: 'Error in onRefreshEnded callback',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+}
+
+export function notifyGamesRefreshed(): void {
+  for (const cb of onGamesRefreshedCallbacks) {
+    try {
+      cb();
+    } catch (err) {
+      logger.warn({
+        message: 'Error in onGamesRefreshed callback',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/**
+ * Write mutex for live_games table. Serializes all writers to prevent lock contention.
+ */
+const liveGamesWriteLockQueue: Array<() => void> = [];
+let liveGamesWriteLockHeld = false;
+
+export async function acquireLiveGamesWriteLock(): Promise<void> {
+  if (!liveGamesWriteLockHeld) {
+    liveGamesWriteLockHeld = true;
+    return;
+  }
+  await new Promise<void>((resolve) => liveGamesWriteLockQueue.push(resolve));
+}
+
+export function releaseLiveGamesWriteLock(): void {
+  if (liveGamesWriteLockQueue.length > 0) {
+    const next = liveGamesWriteLockQueue.shift()!;
+    next();
+  } else {
+    liveGamesWriteLockHeld = false;
+  }
+}
 
 /**
  * Fast extraction of buildId from HTML response
@@ -49,9 +145,9 @@ export function extractBuildIdFromHtml(html: string): string | null {
  */
 async function fetchAndUpdateBuildId(): Promise<boolean> {
   try {
-    logger.info({
-      message: 'Fetching build ID from polymarket.com root page',
-    });
+    // logger.info({
+    //   message: 'Fetching build ID from polymarket.com root page',
+    // });
 
     const response = await axios.get<string>('https://polymarket.com', {
       headers: {
@@ -72,12 +168,12 @@ async function fetchAndUpdateBuildId(): Promise<boolean> {
       const oldBuildId = currentBuildId;
       currentBuildId = buildId;
       
-      logger.info({
-        message: 'Build ID updated successfully',
-        oldBuildId,
-        newBuildId: buildId,
-        endpoint: getLiveEndpoint(),
-      });
+      // logger.info({
+      //   message: 'Build ID updated successfully',
+      //   oldBuildId,
+      //   newBuildId: buildId,
+      //   endpoint: getLiveEndpoint(),
+      // });
       
       return true;
     } else {
@@ -100,7 +196,21 @@ async function fetchAndUpdateBuildId(): Promise<boolean> {
 const inMemoryGames: Map<string, LiveGame> = new Map();
 
 // In-memory cache for production (to avoid fetching all games on every update)
-const gamesCache: Map<string, LiveGame> = new Map();
+export const gamesCache: Map<string, LiveGame> = new Map();
+
+// Map gameId (numeric, from Sports WS) -> eventId (Polymarket id) for fast sports update lookups
+const gameIdToEventId: Map<number, string> = new Map();
+
+function addGameToCache(game: LiveGame): void {
+  gamesCache.set(game.id, game);
+  if (game.gameId != null) {
+    gameIdToEventId.set(game.gameId, game.id);
+  }
+}
+
+// Single-flight promise to avoid hammering the database with duplicate
+// "load all games" queries under concurrent load.
+let loadingAllLiveGamesPromise: Promise<LiveGame[]> | null = null;
 
 export interface LiveGameEvent {
   id: string;
@@ -196,11 +306,30 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
   const slug = game.slug?.toLowerCase() || '';
   const title = game.title?.toLowerCase() || '';
   
+  // Blacklist: Known non-sports slugs that should never be classified as sports
+  // These are financial/stock market games or other non-sports markets
+  const NON_SPORTS_BLACKLIST = new Set([
+    'nflx', // Netflix stock, not NFL
+    'tsla', // Tesla stock
+    'aapl', // Apple stock
+    'spy',  // S&P 500 ETF
+    'qqq',  // NASDAQ ETF
+    'dow',  // Dow Jones
+    'crypto', // Cryptocurrency markets
+    'btc',  // Bitcoin
+    'eth',  // Ethereum
+  ]);
+  
   const sportsConfig = getAllSportsGamesConfig();
   
   // PRIORITY 1: Check the first part of the slug as the sport identifier
   // Slug format is: sport-away-home-date, so the first part is always the sport
   const firstSlugPart = slug.split('-')[0];
+  
+  // If first slug part is in blacklist, reject immediately
+  if (firstSlugPart && NON_SPORTS_BLACKLIST.has(firstSlugPart)) {
+    return null;
+  }
   
   // Check if first slug part matches a sport directly
   if (firstSlugPart && firstSlugPart in sportsConfig) {
@@ -218,6 +347,9 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
     lal: ['lal', 'la liga', 'la-liga', 'laliga'],
     cbb: ['cbb', 'college basketball', 'ncaa basketball', 'ncaab'],
     cfb: ['cfb', 'college football', 'ncaa football', 'ncaaf'],
+    // Tennis games are listed under ATP/WTA tours in Polymarket slugs.
+    // We normalize both into a single "tennis" sport internally.
+    tennis: ['tennis', 'atp', 'wta'],
   };
   
   // First, check if first slug part matches any sport's indicators
@@ -230,12 +362,18 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
     }
   }
   
-  // PRIORITY 3: Fallback to substring matching in slug/title (for non-standard formats)
+  // PRIORITY 3: Fallback to word-boundary matching in slug/title (for non-standard formats)
+  // Use word boundaries to avoid false matches like "nflx" matching "nfl"
   for (const [sport] of Object.entries(sportsConfig)) {
     const indicators = sportIndicators[sport] || [sport];
     for (const indicator of indicators) {
-      const slugMatch = slug.includes(indicator);
-      const titleMatch = title.includes(indicator);
+      // Use word boundary regex to ensure exact word matches
+      // This prevents "nflx" from matching "nfl"
+      const slugWordBoundaryRegex = new RegExp(`\\b${indicator}\\b`, 'i');
+      const titleWordBoundaryRegex = new RegExp(`\\b${indicator}\\b`, 'i');
+      
+      const slugMatch = slugWordBoundaryRegex.test(slug);
+      const titleMatch = titleWordBoundaryRegex.test(title);
       
       if (slugMatch || titleMatch) {
         return sport;
@@ -246,7 +384,23 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
   return null;
 }
 
-const STANDARD_LEAGUES = new Set(['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'epl', 'lal', 'cbb', 'cfb']);
+// STANDARD_LEAGUES controls which slug prefixes are treated as "standard" sports
+// for live-games filtering. For tennis, game slugs use "atp-..." and "wta-...",
+// but we normalize the sport to "tennis" via the indicators above.
+const STANDARD_LEAGUES = new Set([
+  'nfl',
+  'nba',
+  'mlb',
+  'nhl',
+  'ufc',
+  'epl',
+  'lal',
+  'cbb',
+  'cfb',
+  'tennis',
+  'atp',
+  'wta',
+]);
 
 function extractLeagueFromSlug(slug: string): string | null {
   if (!slug) return null;
@@ -265,12 +419,7 @@ function isStandardLeague(league: string | null): boolean {
 function isGameInConfiguredSport(game: LiveGameEvent): boolean {
   const sport = extractSportFromGame(game);
   if (!sport) return false;
-  
-  const seriesId = getSeriesIdForSport(sport);
-  if (seriesId === null || seriesId === '') {
-    return false;
-  }
-  
+
   const league = extractLeagueFromSlug(game.slug);
   if (!isStandardLeague(league)) {
     return false;
@@ -341,8 +490,25 @@ function extractTeamsFromEvent(event: TransformedEvent, sport?: string): { home?
   const slugParts = slug.split('-');
   const teamAbbrevs: string[] = [];
   
-  // Common sport identifiers
-  const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+  // Common sport identifiers (first segment in slug)
+  const sportIdentifiers = new Set([
+    'nhl',
+    'nba',
+    'nfl',
+    'mlb',
+    'epl',
+    'cbb',
+    'cfb',
+    'lal',
+    'ser',
+    'bund',
+    'lig1',
+    'mls',
+    'ufc',
+    'tennis',
+    'atp',
+    'wta',
+  ]);
   
   for (let i = 0; i < slugParts.length; i++) {
     const part = slugParts[i];
@@ -526,9 +692,12 @@ export async function transformAndEnrichGames(events: LiveGameEvent[]): Promise<
       enrichedGame.period = rawEvent.period;
       enrichedGame.elapsed = rawEvent.elapsed;
       enrichedGame.live = rawEvent.live;
-      // Ensure consistency: if game is live, it cannot be ended
-      // Only set ended=true if the game is truly closed or the end date has passed
-      if (rawEvent.live === true) {
+      // End-date override: if endDate + 3h grace has passed, force ended=true and live=false,
+      // even if upstream still reports live=true (stale live flags happen occasionally).
+      if (hasEndDateGracePassed(rawEvent.endDate)) {
+        enrichedGame.live = false;
+        enrichedGame.ended = true;
+      } else if (rawEvent.live === true) {
         // If live is true, ended should be false unless game is explicitly closed
         enrichedGame.ended = rawEvent.closed === true ? true : false;
       } else {
@@ -562,12 +731,20 @@ function processLiveGamesResponse(response: AxiosResponse<LiveGamesApiResponse>)
 
   const eventArray = Object.values(events);
   
-  logger.info({
-    message: 'Live games fetched successfully',
-    totalGames: eventArray.length,
-  });
+  // logger.info({
+  //   message: 'Live games fetched successfully',
+  //   totalGames: eventArray.length,
+  // });
 
   return eventArray;
+}
+
+function hasEndDateGracePassed(endDate: string | undefined): boolean {
+  if (!endDate) return false;
+  const t = new Date(endDate).getTime();
+  if (Number.isNaN(t)) return false;
+  const graceTime = 3 * 60 * 60 * 1000; // 3 hours
+  return (t + graceTime) < Date.now();
 }
 
 /**
@@ -594,19 +771,19 @@ export async function fetchLiveGames(): Promise<LiveGameEvent[]> {
 
     // Check for 404 - build ID may be outdated
     if (response.status === 404) {
-      logger.warn({
-        message: 'Live games endpoint returned 404 - attempting to refresh build ID',
-        endpoint,
-      });
+      // logger.warn({
+      //   message: 'Live games endpoint returned 404 - attempting to refresh build ID',
+      //   endpoint,
+      // });
       
       const buildIdUpdated = await fetchAndUpdateBuildId();
       
       if (buildIdUpdated) {
         const newEndpoint = getLiveEndpoint();
-        logger.info({
-          message: 'Retrying live games fetch with updated build ID',
-          newEndpoint,
-        });
+        // logger.info({
+        //   message: 'Retrying live games fetch with updated build ID',
+        //   newEndpoint,
+        // });
         
         const retryResponse = await axios.get<LiveGamesApiResponse>(newEndpoint, {
           headers: {
@@ -721,11 +898,16 @@ export function filterOutEndedGames(games: LiveGameEvent[]): LiveGameEvent[] {
  * If game is live, ended should be false (unless explicitly closed)
  */
 function ensureLiveEndedConsistency(game: LiveGame): void {
-  if (game.live === true && game.ended === true) {
-    // If live is true, ended should be false unless game is explicitly closed
-    if (game.closed !== true) {
-      game.ended = false;
-    }
+  // End-date override: if endDate + 3h grace has passed, force ended=true and live=false.
+  if (hasEndDateGracePassed(game.endDate)) {
+    game.live = false;
+    game.ended = true;
+    return;
+  }
+
+  // Otherwise maintain consistency: if live is true, ended should be false unless explicitly closed.
+  if (game.live === true && game.ended === true && game.closed !== true) {
+    game.ended = false;
   }
 }
 
@@ -733,8 +915,8 @@ function ensureLiveEndedConsistency(game: LiveGame): void {
  * Check if a LiveGame is ended/closed
  */
 export function isLiveGameEnded(game: LiveGame): boolean {
-  // If game is live, it cannot be ended (even if ended flag is set incorrectly)
-  if (game.live === true) return false;
+  // End-date override first (handles stale live=true flags)
+  if (hasEndDateGracePassed(game.endDate)) return true;
   
   if (game.ended === true) return true;
   if (game.closed === true) return true;
@@ -764,69 +946,69 @@ export function filterOutEndedLiveGames(games: LiveGame[]): LiveGame[] {
   return games.filter(game => !isLiveGameEnded(game));
 }
 
-async function cleanupEndedGames(): Promise<number> {
-  const isProduction = process.env.NODE_ENV === 'production';
-  const GRACE_PERIOD_HOURS = 3; // 3 hour grace period after end_date
+// async function cleanupEndedGames(): Promise<number> {
+//   const isProduction = process.env.NODE_ENV === 'production';
+//   const GRACE_PERIOD_HOURS = 3; // 3 hour grace period after end_date
   
-  if (!isProduction) {
-    let removedCount = 0;
-    const now = new Date();
+//   if (!isProduction) {
+//     let removedCount = 0;
+//     const now = new Date();
     
-    for (const [id, game] of inMemoryGames.entries()) {
-      // Check explicit ended/closed flags first
-      let isEnded = game.ended === true || game.closed === true;
+//     for (const [id, game] of inMemoryGames.entries()) {
+//       // Check explicit ended/closed flags first
+//       let isEnded = game.ended === true || game.closed === true;
       
-      // Check if end_date + grace period has passed
-      if (!isEnded && game.endDate) {
-        const endDate = new Date(game.endDate);
-        const graceTime = GRACE_PERIOD_HOURS * 60 * 60 * 1000;
-        isEnded = (endDate.getTime() + graceTime) < now.getTime();
-      }
+//       // Check if end_date + grace period has passed
+//       if (!isEnded && game.endDate) {
+//         const endDate = new Date(game.endDate);
+//         const graceTime = GRACE_PERIOD_HOURS * 60 * 60 * 1000;
+//         isEnded = (endDate.getTime() + graceTime) < now.getTime();
+//       }
       
-      if (isEnded) {
-        inMemoryGames.delete(id);
-        gamesCache.delete(id);
-        removedCount++;
-      }
-    }
+//       if (isEnded) {
+//         inMemoryGames.delete(id);
+//         gamesCache.delete(id);
+//         removedCount++;
+//       }
+//     }
     
-    return removedCount;
-  }
+//     return removedCount;
+//   }
   
-  const client = await pool.connect();
+//   const client = await pool.connect();
   
-  try {
-    // Delete games that are:
-    // 1. Marked as ended
-    // 2. Marked as closed (market closed)
-    // 3. End date + 3 hours has passed (grace period for games that didn't update properly)
-    const result = await client.query(`
-      DELETE FROM live_games 
-      WHERE ended = true 
-         OR closed = true 
-         OR (end_date IS NOT NULL AND end_date + INTERVAL '3 hours' < NOW())
-    `);
+//   try {
+//     // Delete games that are:
+//     // 1. Marked as ended
+//     // 2. Marked as closed (market closed)
+//     // 3. End date + 3 hours has passed (grace period for games that didn't update properly)
+//     const result = await client.query(`
+//       DELETE FROM live_games 
+//       WHERE ended = true 
+//          OR closed = true 
+//          OR (end_date IS NOT NULL AND end_date + INTERVAL '3 hours' < NOW())
+//     `);
     
-    const removedCount = result.rowCount || 0;
-    if (removedCount > 0) {
-      logger.info({
-        message: 'Cleaned up ended games from database',
-        removedCount,
-      });
-      gamesCache.clear();
-    }
+//     const removedCount = result.rowCount || 0;
+//     if (removedCount > 0) {
+//       // logger.info({
+//       //   message: 'Cleaned up ended games from database',
+//       //   removedCount,
+//       // });
+//       gamesCache.clear();
+//     }
     
-    return removedCount;
-  } catch (error) {
-    logger.error({
-      message: 'Error cleaning up ended games from database',
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return 0;
-  } finally {
-    client.release();
-  }
-}
+//     return removedCount;
+//   } catch (error) {
+//     logger.error({
+//       message: 'Error cleaning up ended games from database',
+//       error: error instanceof Error ? error.message : String(error),
+//     });
+//     return 0;
+//   } finally {
+//     client.release();
+//   }
+// }
 
 /**
  * Extract probabilities from a game's moneyline market
@@ -884,24 +1066,35 @@ function extractGameProbabilities(game: LiveGame): { homeProb: number; awayProb:
   return null;
 }
 
+/** Excluded from storage so we don't duplicate games with placeholder -more-markets slugs */
+export function isMoreMarketsSlug(slug: string | null | undefined): boolean {
+  return !!(slug && slug.includes('-more-markets'));
+}
+
 export async function storeGames(games: LiveGame[], dataSource?: string): Promise<void> {
   const isProduction = process.env.NODE_ENV === 'production';
-  
+
+  // Exclude -more-markets games (duplicate/placeholder entries)
+  const toStore = games.filter((g) => !isMoreMarketsSlug(g.slug));
+
   // If dataSource is provided, set it on all games
   if (dataSource) {
-    for (const game of games) {
+    for (const game of toStore) {
       game.dataSource = dataSource;
     }
   }
-  
+
   if (isProduction) {
-    await storeGamesInDatabase(games);
+    await storeGamesInDatabase(toStore);
+    for (const game of toStore) {
+      gamesCache.set(game.id, game);
+    }
   } else {
-    storeGamesInMemory(games);
+    storeGamesInMemory(toStore);
   }
-  
+
   // Record probability snapshots for all games (async, non-blocking)
-  recordProbabilitySnapshots(games).catch(error => {
+  recordProbabilitySnapshots(toStore).catch(error => {
     logger.warn({
       message: 'Error recording probability snapshots (non-blocking)',
       error: error instanceof Error ? error.message : String(error),
@@ -910,128 +1103,141 @@ export async function storeGames(games: LiveGame[], dataSource?: string): Promis
 }
 
 /**
- * Record probability snapshots for multiple games
+ * Record probability snapshots for multiple games (bulk, single connection)
  */
 async function recordProbabilitySnapshots(games: LiveGame[]): Promise<void> {
+  const snapshots: ProbabilitySnapshot[] = [];
   for (const game of games) {
     const probs = extractGameProbabilities(game);
     if (probs) {
-      await recordProbabilitySnapshot(
-        game.id,
-        probs.homeProb,
-        probs.awayProb,
-        probs.homeBuy,
-        probs.awayBuy
-      );
+      snapshots.push({
+        gameId: game.id,
+        homeProbability: probs.homeProb,
+        awayProbability: probs.awayProb,
+        homeBuyPrice: probs.homeBuy,
+        awayBuyPrice: probs.awayBuy,
+        recordedAt: new Date(),
+      });
     }
+  }
+  if (snapshots.length > 0) {
+    await recordProbabilitySnapshotsBulk(snapshots);
   }
 }
 
+const INSERT_QUERY = `
+  INSERT INTO live_games (
+    id, ticker, slug, title, description, resolution_source,
+    start_date, end_date, image, icon, active, closed, archived,
+    restricted, liquidity, volume, volume_24hr, competitive,
+    sport, league, series_id, game_id, score, period, elapsed, live, ended,
+    period_scores, transformed_data, raw_data, created_at, updated_at
+  ) VALUES %PLACEHOLDERS%
+  ON CONFLICT (id) DO UPDATE SET
+    ticker = EXCLUDED.ticker, slug = EXCLUDED.slug, title = EXCLUDED.title,
+    description = EXCLUDED.description, resolution_source = EXCLUDED.resolution_source,
+    start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
+    image = EXCLUDED.image, icon = EXCLUDED.icon, active = EXCLUDED.active,
+    closed = EXCLUDED.closed, archived = EXCLUDED.archived, restricted = EXCLUDED.restricted,
+    liquidity = EXCLUDED.liquidity, volume = EXCLUDED.volume, volume_24hr = EXCLUDED.volume_24hr,
+    competitive = EXCLUDED.competitive, sport = EXCLUDED.sport, league = EXCLUDED.league,
+    series_id = EXCLUDED.series_id, game_id = EXCLUDED.game_id, score = EXCLUDED.score,
+    period = EXCLUDED.period, elapsed = EXCLUDED.elapsed, live = EXCLUDED.live,
+    ended = EXCLUDED.ended,
+    period_scores = COALESCE(EXCLUDED.period_scores, live_games.period_scores),
+    transformed_data = EXCLUDED.transformed_data,
+    raw_data = EXCLUDED.raw_data, updated_at = CURRENT_TIMESTAMP
+`;
+
 async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
-  const client = await pool.connect();
-  
-  try {
-    if (games.length === 0) {
-      return;
-    }
+  if (games.length === 0) return;
 
-    // Batch inserts to avoid PostgreSQL index size limits
-    // PostgreSQL has a limit on index entry sizes (~2700 bytes)
-    // Inserting too many rows at once can cause index maintenance issues
-    const BATCH_SIZE = 50; // Process 50 games at a time
-    const batches: LiveGame[][] = [];
-    
-    for (let i = 0; i < games.length; i += BATCH_SIZE) {
-      batches.push(games.slice(i, i + BATCH_SIZE));
-    }
+  // Do ALL prep work before acquiring a connection (no connection held during calc)
+  // Keep batch small to avoid "could not determine data type of parameter $1" (PostgreSQL limit)
+  const BATCH_SIZE = 500; // 30 params × 100 = 3000 per batch
+  const batches: { values: any[]; placeholders: string }[] = [];
 
-    await client.query('BEGIN');
-    
-    for (const batch of batches) {
-      // Build bulk insert query for this batch
-      const values: any[] = [];
-      const placeholders: string[] = [];
-      let paramIndex = 1;
+  for (let i = 0; i < games.length; i += BATCH_SIZE) {
+    const batch = games.slice(i, i + BATCH_SIZE);
+    const values: any[] = [];
+    const placeholderRows: string[] = [];
+    let paramIndex = 1; // Reset per batch: each query expects $1, $2, ... $N
 
-      for (const game of batch) {
-        const ticker = game.ticker || game.slug || game.id || 'UNKNOWN';
-        const rowPlaceholders: string[] = [];
-        
-        // Calculate period scores if game has score and period
-        let periodScores = game.periodScores || null;
-        if (!periodScores && game.score && game.period && game.period !== 'NS') {
-          const currentScore = parseScoreString(game.score);
-          if (currentScore) {
-            // Initial storage: no previous period, no previous score, no period change
-            periodScores = calculatePeriodScores(
-              currentScore,
-              game.period,
-              null, // No previous period scores when first storing
-              undefined, // No previous period
-              null, // No previous score
-              false // No period change (initial storage)
-            );
-            // Update game object with calculated period scores
-            game.periodScores = periodScores;
-          }
+    for (const game of batch) {
+      const ticker = game.ticker || game.slug || game.id || 'UNKNOWN';
+      const rowPlaceholders: string[] = [];
+
+      let periodScores = game.periodScores || null;
+      if (!periodScores && game.score && game.period && game.period !== 'NS') {
+        const currentScore = parseScoreString(game.score);
+        if (currentScore) {
+          periodScores = calculatePeriodScores(
+            currentScore,
+            game.period,
+            null,
+            undefined,
+            null,
+            false
+          );
+          game.periodScores = periodScores;
         }
-        
-        // 30 parameters (29 + period_scores) + 2 CURRENT_TIMESTAMP = 32 total
-        for (let i = 0; i < 30; i++) {
-          rowPlaceholders.push(`$${paramIndex++}`);
-        }
-        rowPlaceholders.push('CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP');
-        placeholders.push(`(${rowPlaceholders.join(', ')})`);
-        
-        values.push(
-          game.id, ticker, game.slug, game.title, game.description, game.resolutionSource,
-          game.startDate, game.endDate, game.image, game.icon, game.active, game.closed,
-          game.archived, game.restricted, game.liquidity, game.volume, game.volume24hr,
-          game.competitive, game.sport, game.league, game.seriesId, game.gameId,
-          game.score, game.period, game.elapsed, game.live, game.ended,
-          periodScores ? JSON.stringify(periodScores) : null,
-          JSON.stringify(game), JSON.stringify(game.rawData)
-        );
       }
 
-      const insertQuery = `
-        INSERT INTO live_games (
-          id, ticker, slug, title, description, resolution_source,
-          start_date, end_date, image, icon, active, closed, archived,
-          restricted, liquidity, volume, volume_24hr, competitive,
-          sport, league, series_id, game_id, score, period, elapsed, live, ended,
-          period_scores, transformed_data, raw_data, created_at, updated_at
-        ) VALUES ${placeholders.join(', ')}
-        ON CONFLICT (id) DO UPDATE SET
-          ticker = EXCLUDED.ticker, slug = EXCLUDED.slug, title = EXCLUDED.title,
-          description = EXCLUDED.description, resolution_source = EXCLUDED.resolution_source,
-          start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
-          image = EXCLUDED.image, icon = EXCLUDED.icon, active = EXCLUDED.active,
-          closed = EXCLUDED.closed, archived = EXCLUDED.archived, restricted = EXCLUDED.restricted,
-          liquidity = EXCLUDED.liquidity, volume = EXCLUDED.volume, volume_24hr = EXCLUDED.volume_24hr,
-          competitive = EXCLUDED.competitive, sport = EXCLUDED.sport, league = EXCLUDED.league,
-          series_id = EXCLUDED.series_id, game_id = EXCLUDED.game_id, score = EXCLUDED.score,
-          period = EXCLUDED.period, elapsed = EXCLUDED.elapsed, live = EXCLUDED.live,
-          ended = EXCLUDED.ended, 
-          period_scores = COALESCE(EXCLUDED.period_scores, live_games.period_scores),
-          transformed_data = EXCLUDED.transformed_data,
-          raw_data = EXCLUDED.raw_data, updated_at = CURRENT_TIMESTAMP
-      `;
+      for (let j = 0; j < 30; j++) {
+        rowPlaceholders.push(`$${paramIndex++}`);
+      }
+      rowPlaceholders.push('CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP');
+      placeholderRows.push(`(${rowPlaceholders.join(', ')})`);
 
-      await client.query(insertQuery, values);
+      values.push(
+        game.id, ticker, game.slug, game.title, game.description, game.resolutionSource,
+        game.startDate, game.endDate, game.image, game.icon, game.active, game.closed,
+        game.archived, game.restricted, game.liquidity, game.volume, game.volume24hr,
+        game.competitive, game.sport, game.league, game.seriesId, game.gameId,
+        game.score, game.period, game.elapsed, game.live, game.ended,
+        periodScores ? JSON.stringify(periodScores) : null,
+        JSON.stringify(game), JSON.stringify(game.rawData)
+      );
+    }
+
+    batches.push({
+      values,
+      placeholders: placeholderRows.join(', '),
+    });
+  }
+
+  // Connect only when ready to write
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    for (const { values, placeholders } of batches) {
+      const query = INSERT_QUERY.replace('%PLACEHOLDERS%', placeholders);
+      await client.query(query, values);
     }
 
     await client.query('COMMIT');
-    
+
     for (const game of games) {
-      gamesCache.set(game.id, game);
+      addGameToCache(game);
     }
-    
-    logger.info({ 
-      message: 'Games stored in database', 
-      count: games.length,
-      batches: batches.length 
-    });
+
+    // logger.info({ 
+    //   message: 'Games stored in database', 
+    //   count: games.length,
+    //   batches: batches.length 
+    // });
+
+    // Also update precomputed frontend games so that /api/games/frontend
+    // can serve data without doing heavy transformation per request.
+    try {
+      await upsertFrontendGamesForLiveGames(games);
+    } catch (error) {
+      logger.error({
+        message: 'Error upserting frontend games after storing live games',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   } catch (error) {
     try {
       await client.query('ROLLBACK');
@@ -1056,48 +1262,79 @@ function storeGamesInMemory(games: LiveGame[]): void {
   for (const game of games) {
     inMemoryGames.set(game.id, game);
   }
-  logger.info({ message: 'Games stored in memory', count: games.length, totalInMemory: inMemoryGames.size });
+  // logger.info({ message: 'Games stored in memory', count: games.length, totalInMemory: inMemoryGames.size });
+}
+
+/** Fast count without loading all rows (for early-exit returns) */
+async function getLiveGamesCount(): Promise<number> {
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (isProduction) {
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT COUNT(*)::int as count FROM live_games');
+      return result.rows[0]?.count ?? 0;
+    } finally {
+      client.release();
+    }
+  }
+  return inMemoryGames.size;
+}
+
+/** Get cached games for broadcast (avoids DB fetch after storeGames) */
+function getCachedGamesForBroadcast(): LiveGame[] {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const games = isProduction
+    ? Array.from(gamesCache.values())
+    : Array.from(inMemoryGames.values());
+  games.forEach(ensureLiveEndedConsistency);
+  return games;
 }
 
 export async function getAllLiveGames(): Promise<LiveGame[]> {
   const isProduction = process.env.NODE_ENV === 'production';
   
   if (isProduction) {
-    if (gamesCache.size > 0) {
-      return Array.from(gamesCache.values());
+    // If a load is already in progress, wait for it instead of starting
+    // another expensive full-table query. This avoids hammering Postgres
+    // when many requests arrive at the same time, but we do NOT cache the
+    // results between calls so we can still observe real DB behavior.
+    if (loadingAllLiveGamesPromise) {
+      return loadingAllLiveGamesPromise;
     }
-    
-    const games = await getAllLiveGamesFromDatabase();
-    for (const game of games) {
-      gamesCache.set(game.id, game);
-    }
-    
-    if (games.length === 0) {
-      logger.info({ message: 'Database is empty, fetching live games from API' });
-      await refreshLiveGames();
-      const refreshedGames = await getAllLiveGamesFromDatabase();
-      gamesCache.clear();
-      for (const game of refreshedGames) {
-        gamesCache.set(game.id, game);
+
+    // Single-flight loader: only one full DB scan at a time
+    loadingAllLiveGamesPromise = (async () => {
+      try {
+        const games = await getAllLiveGamesFromDatabase();
+
+        // Only trigger upstream refresh if truly empty
+        // if (games.length === 0) {
+        //   logger.info({ message: 'Database is empty, fetching live games from API' });
+        //   await refreshLiveGames();
+        //   const refreshed = await getAllLiveGamesFromDatabase();
+        //   return refreshed;
+        // }
+
+        return games;
+      } finally {
+        // Always clear the single-flight promise so future calls can reload
+        loadingAllLiveGamesPromise = null;
       }
-      return refreshedGames;
-    }
-    
-    return games;
+    })();
+
+    return loadingAllLiveGamesPromise;
   } else {
-    const games = Array.from(inMemoryGames.values());
-    
-    // Ensure consistency for in-memory games
-    games.forEach(ensureLiveEndedConsistency);
+    // Development mode
+    let games = Array.from(inMemoryGames.values());
     
     if (games.length === 0) {
-      logger.info({ message: 'In-memory storage is empty, fetching live games from API' });
+      //logger.info({ message: 'In-memory storage is empty, fetching live games from API' });
       await refreshLiveGames();
-      const refreshedGames = Array.from(inMemoryGames.values());
-      refreshedGames.forEach(ensureLiveEndedConsistency);
-      return refreshedGames;
+      games = Array.from(inMemoryGames.values());
     }
     
+    // Only apply consistency to in-memory games
+    games.forEach(ensureLiveEndedConsistency);
     return games;
   }
 }
@@ -1111,16 +1348,14 @@ export async function getLiveGameById(id: string): Promise<LiveGame | null> {
       const game = gamesCache.get(id);
       if (game) {
         ensureLiveEndedConsistency(game);
-        // Update cache with fixed game object
-        gamesCache.set(id, game);
+        addGameToCache(game);
         return game;
       }
       return null;
     }
     const game = await getLiveGameByIdFromDatabase(id);
     if (game) {
-      // Update cache with the game from database (already has consistency fix applied)
-      gamesCache.set(id, game);
+      addGameToCache(game);
     }
     return game;
   } else {
@@ -1138,83 +1373,81 @@ export async function getLiveGameById(id: string): Promise<LiveGame | null> {
 export async function getLiveGameBySlug(slug: string): Promise<LiveGame | null> {
   if (!slug) return null;
   const target = slug.toLowerCase();
-  
+
   const isProduction = process.env.NODE_ENV === 'production';
-  
+
   if (isProduction) {
-    // Try database query first (more efficient)
     const game = await getLiveGameBySlugFromDatabase(target);
     if (game) {
-      // Update cache
       gamesCache.set(game.id, game);
       return game;
     }
-    
-    // Fallback to in-memory search if database query fails
-    const games = await getAllLiveGames();
-    return games.find((game) => {
-      const slugMatch = game.slug && game.slug.toLowerCase() === target;
-      const tickerMatch = game.ticker && game.ticker.toLowerCase() === target;
-      const idMatch = game.id.toLowerCase() === target;
-      const rawSlugMatch = game.rawData?.slug && String(game.rawData.slug).toLowerCase() === target;
-      return slugMatch || tickerMatch || idMatch || rawSlugMatch;
-    }) || null;
-  } else {
-    // Development: search in-memory
-    const games = await getAllLiveGames();
-    return games.find((game) => {
-      const slugMatch = game.slug && game.slug.toLowerCase() === target;
-      const tickerMatch = game.ticker && game.ticker.toLowerCase() === target;
-      const idMatch = game.id.toLowerCase() === target;
-      const rawSlugMatch = game.rawData?.slug && String(game.rawData.slug).toLowerCase() === target;
-      return slugMatch || tickerMatch || idMatch || rawSlugMatch;
-    }) || null;
+    return null;
   }
+
+  const games = Array.from(inMemoryGames.values());
+  const game = games.find((g) => {
+    const slugMatch = g.slug?.toLowerCase() === target;
+    const tickerMatch = g.ticker?.toLowerCase() === target;
+    const idMatch = g.id?.toLowerCase() === target;
+    const rawSlugMatch = g.rawData?.slug && String(g.rawData.slug).toLowerCase() === target;
+    return slugMatch || tickerMatch || idMatch || rawSlugMatch;
+  }) || null;
+  if (game) ensureLiveEndedConsistency(game);
+  return game;
 }
 
 async function getLiveGameBySlugFromDatabase(slug: string): Promise<LiveGame | null> {
   const client = await pool.connect();
-  
+
   try {
-    // Query by slug (case-insensitive)
     const result = await client.query(
-      `SELECT transformed_data, raw_data, period_scores, balldontlie_game_id FROM live_games 
+      `SELECT 
+        COALESCE(
+          transformed_data,
+          jsonb_set(
+            jsonb_set(
+              raw_data,
+              '{createdAt}',
+              to_jsonb(CURRENT_TIMESTAMP)
+            ),
+            '{updatedAt}',
+            to_jsonb(CURRENT_TIMESTAMP)
+          )
+        ) as game_data,
+        period_scores,
+        balldontlie_game_id,
+        CASE 
+          WHEN end_date IS NOT NULL 
+            AND end_date + INTERVAL '3 hours' < NOW() 
+          THEN true 
+          ELSE false 
+        END as grace_passed
+       FROM live_games 
        WHERE LOWER(slug) = $1 OR LOWER(ticker) = $1 OR LOWER(id) = $1
        LIMIT 1`,
       [slug]
     );
-    
+
     if (result.rows.length === 0) return null;
-    
+
     const row = result.rows[0];
-    let game: LiveGame;
-    
-    if (row.transformed_data) {
-      game = typeof row.transformed_data === 'string' 
-        ? JSON.parse(row.transformed_data)
-        : row.transformed_data;
-      if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
-      if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
-    } else {
-      const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
-      game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
-    }
-    
-    // Add period_scores from database if available
+    const game = row.game_data as LiveGame;
+
     if (row.period_scores) {
-      game.periodScores = typeof row.period_scores === 'string'
-        ? JSON.parse(row.period_scores)
-        : row.period_scores;
+      game.periodScores = row.period_scores;
     }
-    
-    // Add balldontlie_game_id from database if available
     if (row.balldontlie_game_id) {
       (game as any).balldontlie_game_id = row.balldontlie_game_id;
     }
-    
-    // Ensure consistency between live and ended flags
-    ensureLiveEndedConsistency(game);
-    
+
+    if (row.grace_passed) {
+      game.live = false;
+      game.ended = true;
+    } else if (game.live === true && game.ended === true && game.closed !== true) {
+      game.ended = false;
+    }
+
     return game;
   } catch (error) {
     logger.error({
@@ -1230,44 +1463,54 @@ async function getLiveGameBySlugFromDatabase(slug: string): Promise<LiveGame | n
 
 async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null> {
   const client = await pool.connect();
-  
+
   try {
     const result = await client.query(
-      `SELECT transformed_data, raw_data, period_scores, balldontlie_game_id FROM live_games WHERE id = $1`,
+      `SELECT 
+        COALESCE(
+          transformed_data,
+          jsonb_set(
+            jsonb_set(
+              raw_data,
+              '{createdAt}',
+              to_jsonb(CURRENT_TIMESTAMP)
+            ),
+            '{updatedAt}',
+            to_jsonb(CURRENT_TIMESTAMP)
+          )
+        ) as game_data,
+        period_scores,
+        balldontlie_game_id,
+        CASE 
+          WHEN end_date IS NOT NULL 
+            AND end_date + INTERVAL '3 hours' < NOW() 
+          THEN true 
+          ELSE false 
+        END as grace_passed
+       FROM live_games 
+       WHERE id = $1`,
       [id]
     );
-    
+
     if (result.rows.length === 0) return null;
-    
+
     const row = result.rows[0];
-    let game: LiveGame;
-    
-    if (row.transformed_data) {
-      game = typeof row.transformed_data === 'string' 
-        ? JSON.parse(row.transformed_data)
-        : row.transformed_data;
-      if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
-      if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
-    } else {
-      const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
-      game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
-    }
-    
-    // Add period_scores from database if available
+    const game = row.game_data as LiveGame;
+
     if (row.period_scores) {
-      game.periodScores = typeof row.period_scores === 'string'
-        ? JSON.parse(row.period_scores)
-        : row.period_scores;
+      game.periodScores = row.period_scores;
     }
-    
-    // Add balldontlie_game_id from database if available
     if (row.balldontlie_game_id) {
       (game as any).balldontlie_game_id = row.balldontlie_game_id;
     }
-    
-    // Ensure consistency between live and ended flags
-    ensureLiveEndedConsistency(game);
-    
+
+    if (row.grace_passed) {
+      game.live = false;
+      game.ended = true;
+    } else if (game.live === true && game.ended === true && game.closed !== true) {
+      game.ended = false;
+    }
+
     return game;
   } finally {
     client.release();
@@ -1278,88 +1521,290 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
   const client = await pool.connect();
   
   try {
-    // Fetch all games from database - filtering by ended/closed happens at API layer
-    // This allows ended games to still be fetched by ID or slug
-    const result = await client.query(
-      `SELECT transformed_data, raw_data, period_scores, balldontlie_game_id FROM live_games
+    // Let PostgreSQL do ALL the transformation work
+    const result = await client.query(`
+      SELECT 
+        COALESCE(
+          transformed_data,
+          jsonb_set(
+            jsonb_set(
+              raw_data,
+              '{createdAt}',
+              to_jsonb(CURRENT_TIMESTAMP)
+            ),
+            '{updatedAt}',
+            to_jsonb(CURRENT_TIMESTAMP)
+          )
+        ) as game_data,
+        period_scores,
+        balldontlie_game_id,
+        -- Pre-calculate the grace period check in SQL
+        CASE 
+          WHEN end_date IS NOT NULL 
+            AND end_date + INTERVAL '3 hours' < NOW() 
+          THEN true 
+          ELSE false 
+        END as grace_passed
+      FROM live_games
       ORDER BY 
         CASE WHEN live = true THEN 0 ELSE 1 END,
         volume_24hr DESC NULLS LAST, 
-        created_at DESC`
-    );
+        created_at DESC
+    `);
     
+    // Fast path: minimal processing in Node.js
     return result.rows.map((row) => {
-      let game: LiveGame;
+      const game = row.game_data as LiveGame;
       
-      if (row.transformed_data) {
-        game = typeof row.transformed_data === 'string' 
-          ? JSON.parse(row.transformed_data) 
-          : row.transformed_data;
-        if (game.createdAt && typeof game.createdAt === 'string') game.createdAt = new Date(game.createdAt);
-        if (game.updatedAt && typeof game.updatedAt === 'string') game.updatedAt = new Date(game.updatedAt);
-      } else {
-        const rawData = typeof row.raw_data === 'string' ? JSON.parse(row.raw_data) : row.raw_data;
-        game = { ...rawData, createdAt: new Date(), updatedAt: new Date(), rawData } as LiveGame;
-      }
-      
-      // Add period_scores from database if available
+      // Only parse what's needed
       if (row.period_scores) {
-        game.periodScores = typeof row.period_scores === 'string'
-          ? JSON.parse(row.period_scores)
-          : row.period_scores;
+        game.periodScores = row.period_scores;
       }
-      
-      // Add balldontlie_game_id from database if available
       if (row.balldontlie_game_id) {
         (game as any).balldontlie_game_id = row.balldontlie_game_id;
       }
       
-      // Ensure consistency between live and ended flags
-      ensureLiveEndedConsistency(game);
+      // Fast consistency check using pre-calculated flag
+      if (row.grace_passed) {
+        game.live = false;
+        game.ended = true;
+      } else if (game.live === true && game.ended === true && game.closed !== true) {
+        game.ended = false;
+      }
       
       return game;
     });
   } catch (error) {
-    // If table doesn't exist, return empty array to trigger auto-population
     const errorMessage = error instanceof Error ? error.message : String(error);
-    if (errorMessage.includes('does not exist') || (errorMessage.includes('relation') && errorMessage.includes('live_games'))) {
+    if (errorMessage.includes('does not exist') || 
+        (errorMessage.includes('relation') && errorMessage.includes('live_games'))) {
       logger.warn({
         message: 'live_games table does not exist, will trigger auto-population',
         error: errorMessage,
       });
       return [];
     }
-    // Re-throw other errors
     throw error;
   } finally {
     client.release();
   }
 }
 
-export async function updateGame(gameUpdate: Partial<LiveGame> & { id: string }): Promise<void> {
-  const isProduction = process.env.NODE_ENV === 'production';
+// export async function updateGame(gameUpdate: Partial<LiveGame> & { id: string }): Promise<void> {
+//   const isProduction = process.env.NODE_ENV === 'production';
   
-  if (isProduction) {
-    await updateGameInDatabase(gameUpdate);
-  } else {
-    updateGameInMemory(gameUpdate);
-  }
-}
+//   if (isProduction) {
+//     await updateGameInDatabase(gameUpdate);
+//   } else {
+//     updateGameInMemory(gameUpdate);
+//   }
+// }
 
 /**
  * Update game in cache only (for real-time price updates that already wrote to DB)
  */
 export function updateGameInCache(gameId: string, updatedGame: LiveGame): void {
-  gamesCache.set(gameId, updatedGame);
+  addGameToCache(updatedGame);
+}
+
+/** Sports updates queue for batched DB flush (1s interval, one connection) */
+const sportsGameUpdateQueue = new Map<number, Partial<LiveGame>>();
+let sportsGameUpdateFlushTimer: NodeJS.Timeout | null = null;
+const SPORTS_UPDATE_FLUSH_MS = 1000;
+
+/** Merge sports updates into game, compute period scores, ensure consistency */
+function applySportsUpdateToGame(game: LiveGame, updates: Partial<LiveGame>): LiveGame {
+  const periodChanged = updates.period !== undefined && updates.period !== game.period;
+  const scoreChanged = updates.score !== undefined && updates.score !== game.score;
+  let newPeriodScores = game.periodScores;
+  const hasScoreAndPeriod = updates.score && updates.period && updates.period !== 'NS';
+  const shouldCalculate =
+    (periodChanged || scoreChanged || !game.periodScores) && hasScoreAndPeriod;
+
+  if (shouldCalculate && updates.score && updates.period) {
+    const currentScore = parseScoreString(updates.score);
+    const previousScoreParsed = game.score ? parseScoreString(game.score) : null;
+    if (currentScore) {
+      newPeriodScores = calculatePeriodScores(
+        currentScore,
+        updates.period,
+        game.periodScores || null,
+        game.period,
+        previousScoreParsed,
+        periodChanged
+      );
+    }
+  }
+
+  const merged = { ...game, ...updates, updatedAt: new Date() } as LiveGame;
+  if (newPeriodScores) merged.periodScores = newPeriodScores;
+
+  const isLive = updates.live !== undefined ? updates.live : game.live;
+  if (isLive === true && merged.ended === true && merged.closed !== true) {
+    merged.ended = false;
+  }
+  return merged;
+}
+
+/**
+ * Apply sports game update: update cache, broadcast immediately, queue for batched DB flush.
+ * Frontend gets real-time updates via WebSocket; DB is written in bulk every 1s.
+ */
+export function applySportsGameUpdate(gameId: number, updates: Partial<LiveGame>): void {
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  if (!isProduction) {
+    updateGameByGameIdInMemory(gameId, updates);
+    return;
+  }
+
+  // Merge into queue (overwrite = keep latest)
+  const existing = sportsGameUpdateQueue.get(gameId);
+  sportsGameUpdateQueue.set(gameId, { ...existing, ...updates });
+
+  // Update cache and broadcast immediately (no DB yet)
+  let eventId = gameIdToEventId.get(gameId);
+  let game = eventId ? gamesCache.get(eventId) : null;
+  if (!game) {
+    for (const g of gamesCache.values()) {
+      if (g.gameId === gameId) {
+        game = g;
+        eventId = g.id;
+        break;
+      }
+    }
+  }
+
+  if (game) {
+    const merged = applySportsUpdateToGame(game, updates);
+    addGameToCache(merged);
+    if (liveGamesService) {
+      liveGamesService.broadcastPartialUpdate(merged);
+    }
+  }
+
+  // Schedule batched flush
+  if (!sportsGameUpdateFlushTimer) {
+    sportsGameUpdateFlushTimer = setTimeout(() => {
+      sportsGameUpdateFlushTimer = null;
+      flushSportsGameUpdates().catch((err) =>
+        logger.warn({
+          message: 'Error flushing sports game updates',
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
+    }, SPORTS_UPDATE_FLUSH_MS);
+  }
 }
 
 export async function updateGameByGameId(gameId: number, updates: Partial<LiveGame>): Promise<void> {
-  const isProduction = process.env.NODE_ENV === 'production';
-  
-  if (isProduction) {
-    await updateGameByGameIdInDatabase(gameId, updates);
-  } else {
-    updateGameByGameIdInMemory(gameId, updates);
+  applySportsGameUpdate(gameId, updates);
+}
+
+/** Flush queued sports updates to DB. Prep everything before connect, hold connection only for writes. */
+async function flushSportsGameUpdates(): Promise<void> {
+  const pending = new Map(sportsGameUpdateQueue);
+  sportsGameUpdateQueue.clear();
+  if (pending.size === 0) return;
+
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  if (nodeEnv !== 'production') return;
+
+  // 1. Build updates from CACHE (no connection) - cache has merged state from applySportsGameUpdate
+  const toWrite: { eventId: string; game: LiveGame }[] = [];
+
+  for (const [gameId] of pending) {
+    let eventId = gameIdToEventId.get(gameId);
+    let game = eventId ? gamesCache.get(eventId) : null;
+    if (!game) {
+      for (const g of gamesCache.values()) {
+        if (g.gameId === gameId) {
+          game = g;
+          eventId = g.id;
+          break;
+        }
+      }
+    }
+    if (!game || !eventId) continue;
+    toWrite.push({ eventId, game });
+  }
+
+  if (toWrite.length === 0) return;
+
+  // 2. Build single bulk UPDATE (VALUES + UPDATE ... FROM)
+  const valueRows: string[] = [];
+  const allValues: unknown[] = [];
+  let paramIndex = 1;
+
+  for (const { eventId, game } of toWrite) {
+    const score = game.score ?? null;
+    const period = game.period ?? null;
+    const elapsed = game.elapsed ?? null;
+    const live = game.live ?? null;
+    const ended = game.ended ?? null;
+    const active = game.active ?? null;
+    const closed = game.closed ?? null;
+    const periodScores = game.periodScores != null ? JSON.stringify(game.periodScores) : null;
+    const transformedData = JSON.stringify(game);
+    const updatedAt = new Date().toISOString();
+
+    const placeholders = [
+      `$${paramIndex++}`,
+      `$${paramIndex++}`,
+      `$${paramIndex++}`,
+      `$${paramIndex++}`,
+      `$${paramIndex++}::boolean`,
+      `$${paramIndex++}::boolean`,
+      `$${paramIndex++}::boolean`,
+      `$${paramIndex++}::boolean`,
+      `$${paramIndex++}::jsonb`,
+      `$${paramIndex++}::jsonb`,
+      `$${paramIndex++}::timestamptz`,
+    ].join(', ');
+    valueRows.push(`(${placeholders})`);
+    allValues.push(eventId, score, period, elapsed, live, ended, active, closed, periodScores, transformedData, updatedAt);
+  }
+
+  const bulkUpdateQuery = `
+    UPDATE live_games lg SET
+      score = COALESCE(v.score, lg.score),
+      period = COALESCE(v.period, lg.period),
+      elapsed = COALESCE(v.elapsed, lg.elapsed),
+      live = COALESCE(v.live, lg.live),
+      ended = COALESCE(v.ended, lg.ended),
+      active = COALESCE(v.active, lg.active),
+      closed = COALESCE(v.closed, lg.closed),
+      period_scores = COALESCE(v.period_scores, lg.period_scores),
+      transformed_data = COALESCE(v.transformed_data, lg.transformed_data),
+      updated_at = v.updated_at
+    FROM (VALUES ${valueRows.join(', ')}) AS v(id, score, period, elapsed, live, ended, active, closed, period_scores, transformed_data, updated_at)
+    WHERE lg.id = v.id
+  `;
+
+  // 3. Transform to frontend games BEFORE connect (uses pool internally for prob history)
+  const frontendGames = await Promise.all(
+    toWrite.map(({ game }) => transformToFrontendGame(game))
+  );
+
+  // 4. Connect only when ready to write
+  const client = await pool.connect();
+
+  try {
+    await client.query(bulkUpdateQuery, allValues);
+    await bulkUpsertFrontendGamesWithClient(client, frontendGames);
+    clearFrontendGamesCache();
+  } catch (error) {
+    logger.error({
+      message: 'Error flushing sports game updates',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    for (const [gameId, data] of pending) {
+      if (!sportsGameUpdateQueue.has(gameId)) {
+        sportsGameUpdateQueue.set(gameId, data);
+      }
+    }
+  } finally {
+    client.release();
   }
 }
 
@@ -1500,160 +1945,6 @@ function calculatePeriodScores(
   return result;
 }
 
-async function updateGameByGameIdInDatabase(gameId: number, updates: Partial<LiveGame>): Promise<void> {
-  const client = await pool.connect();
-  
-  try {
-    const findResult = await client.query(
-      'SELECT id, transformed_data, period, score, period_scores FROM live_games WHERE game_id = $1',
-      [gameId]
-    );
-    
-    if (findResult.rows.length === 0) {
-      // Game doesn't exist - log for debugging (might be NFL or other missing game)
-      // logger.warn({
-      //   message: 'Websocket update received for game not in database - may need refresh',
-      //   gameId,
-      //   live: updates.live,
-      //   score: updates.score,
-      //   period: updates.period,
-      // });
-      return;
-    }
-    
-    const eventId = findResult.rows[0].id;
-    const current = findResult.rows[0].transformed_data 
-      ? (typeof findResult.rows[0].transformed_data === 'string' 
-          ? JSON.parse(findResult.rows[0].transformed_data) 
-          : findResult.rows[0].transformed_data)
-      : {};
-    
-    const previousPeriod = findResult.rows[0].period;
-    const previousScore = findResult.rows[0].score;
-    const previousPeriodScores = findResult.rows[0].period_scores 
-      ? (typeof findResult.rows[0].period_scores === 'string'
-          ? JSON.parse(findResult.rows[0].period_scores)
-          : findResult.rows[0].period_scores)
-      : null;
-    
-    // Check if period changed
-    const periodChanged = updates.period !== undefined && updates.period !== previousPeriod;
-    const scoreChanged = updates.score !== undefined && updates.score !== previousScore;
-    
-    // Calculate period scores if:
-    // 1. Period or score changed, OR
-    // 2. We have score/period but no previous period scores (initializing)
-    let newPeriodScores = previousPeriodScores;
-    const hasScoreAndPeriod = updates.score && updates.period && updates.period !== 'NS';
-    const shouldCalculatePeriodScores = (periodChanged || scoreChanged || !previousPeriodScores) && hasScoreAndPeriod;
-    
-    if (shouldCalculatePeriodScores && updates.score && updates.period) {
-      const currentScore = parseScoreString(updates.score);
-      const previousScoreParsed = previousScore ? parseScoreString(previousScore) : null;
-      
-      if (currentScore) {
-        newPeriodScores = calculatePeriodScores(
-          currentScore,
-          updates.period,
-          previousPeriodScores,
-          previousPeriod,
-          previousScoreParsed,
-          periodChanged
-        );
-        updates.periodScores = newPeriodScores;
-      }
-    }
-    
-    // Ensure consistency: if game is live, it cannot be ended
-    // Use the live value from updates if provided, otherwise use current value
-    const isLive = updates.live !== undefined ? updates.live : current.live;
-    if (isLive === true && updates.ended === true) {
-      // If live is true, ended should be false unless game is explicitly closed
-      if (updates.closed !== true && current.closed !== true) {
-        updates.ended = false;
-      }
-    }
-    
-    // Build atomic JSONB updates to avoid race conditions with CLOB price updates
-    // Each field is updated independently without reading/rewriting the whole object
-    const updateFields: string[] = [];
-    const values: any[] = [];
-    let paramIndex = 1;
-    
-    // Column updates (separate from JSONB)
-    if (updates.score !== undefined) { updateFields.push(`score = $${paramIndex++}`); values.push(updates.score); }
-    if (updates.period !== undefined) { updateFields.push(`period = $${paramIndex++}`); values.push(updates.period); }
-    if (updates.elapsed !== undefined) { updateFields.push(`elapsed = $${paramIndex++}`); values.push(updates.elapsed); }
-    if (updates.live !== undefined) { updateFields.push(`live = $${paramIndex++}`); values.push(updates.live); }
-    if (updates.ended !== undefined) { updateFields.push(`ended = $${paramIndex++}`); values.push(updates.ended); }
-    if (updates.active !== undefined) { updateFields.push(`active = $${paramIndex++}`); values.push(updates.active); }
-    if (updates.closed !== undefined) { updateFields.push(`closed = $${paramIndex++}`); values.push(updates.closed); }
-    if (newPeriodScores !== null) {
-      updateFields.push(`period_scores = $${paramIndex++}`);
-      values.push(JSON.stringify(newPeriodScores));
-    }
-    
-    // Build atomic JSONB set operations for transformed_data
-    // This preserves existing fields (like markets) while updating only specific fields
-    let jsonbUpdate = 'COALESCE(transformed_data, \'{}\'::jsonb)';
-    
-    if (updates.score !== undefined) {
-      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{score}', to_jsonb($${paramIndex++}::text))`;
-      values.push(updates.score);
-    }
-    if (updates.period !== undefined) {
-      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{period}', to_jsonb($${paramIndex++}::text))`;
-      values.push(updates.period);
-    }
-    if (updates.elapsed !== undefined) {
-      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{elapsed}', to_jsonb($${paramIndex++}::text))`;
-      values.push(updates.elapsed);
-    }
-    if (updates.live !== undefined) {
-      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{live}', to_jsonb($${paramIndex++}::boolean))`;
-      values.push(updates.live);
-    }
-    if (updates.ended !== undefined) {
-      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{ended}', to_jsonb($${paramIndex++}::boolean))`;
-      values.push(updates.ended);
-    }
-    if (updates.active !== undefined) {
-      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{active}', to_jsonb($${paramIndex++}::boolean))`;
-      values.push(updates.active);
-    }
-    if (updates.closed !== undefined) {
-      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{closed}', to_jsonb($${paramIndex++}::boolean))`;
-      values.push(updates.closed);
-    }
-    if (newPeriodScores !== null) {
-      jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{periodScores}', $${paramIndex++}::jsonb)`;
-      values.push(JSON.stringify(newPeriodScores));
-    }
-    // Always update timestamp
-    jsonbUpdate = `jsonb_set(${jsonbUpdate}, '{updatedAt}', to_jsonb($${paramIndex++}::text))`;
-    values.push(new Date().toISOString());
-    
-    updateFields.push(`transformed_data = ${jsonbUpdate}`);
-    updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
-    values.push(eventId);
-    
-    await client.query(`UPDATE live_games SET ${updateFields.join(', ')} WHERE id = $${paramIndex}`, values);
-    
-    // Build updated game from current + updates for broadcasting
-    const updatedGame = { ...current, ...updates, updatedAt: new Date() } as LiveGame;
-    if (newPeriodScores) {
-      updatedGame.periodScores = newPeriodScores;
-    }
-    gamesCache.set(eventId, updatedGame);
-    
-    if (liveGamesService) {
-      liveGamesService.broadcastPartialUpdate(updatedGame);
-    }
-  } finally {
-    client.release();
-  }
-}
-
 function updateGameByGameIdInMemory(gameId: number, updates: Partial<LiveGame>): void {
   for (const [eventId, game] of inMemoryGames.entries()) {
     if (game.gameId === gameId) {
@@ -1706,120 +1997,123 @@ function updateGameByGameIdInMemory(gameId: number, updates: Partial<LiveGame>):
   }
 }
 
-async function updateGameInDatabase(gameUpdate: Partial<LiveGame> & { id: string }): Promise<void> {
-  const client = await pool.connect();
-  
-  try {
-    // Get current game data if markets need updating
-    let current: any = null;
-    if (gameUpdate.markets !== undefined) {
-      const findResult = await client.query(
-        'SELECT transformed_data FROM live_games WHERE id = $1',
-        [gameUpdate.id]
-      );
-      
-      if (findResult.rows.length === 0) {
-        logger.warn({ message: 'Game not found for update', gameId: gameUpdate.id });
-        return;
-      }
-      
-      current = findResult.rows[0].transformed_data 
-        ? (typeof findResult.rows[0].transformed_data === 'string' 
-            ? JSON.parse(findResult.rows[0].transformed_data) 
-            : findResult.rows[0].transformed_data)
-        : {};
-    }
-    
-    const updates: string[] = [];
-    const values: any[] = [];
-    let paramIndex = 1;
-    
-    if (gameUpdate.score !== undefined) { updates.push(`score = $${paramIndex++}`); values.push(gameUpdate.score); }
-    if (gameUpdate.period !== undefined) { updates.push(`period = $${paramIndex++}`); values.push(gameUpdate.period); }
-    if (gameUpdate.elapsed !== undefined) { updates.push(`elapsed = $${paramIndex++}`); values.push(gameUpdate.elapsed); }
-    if (gameUpdate.live !== undefined) { updates.push(`live = $${paramIndex++}`); values.push(gameUpdate.live); }
-    if (gameUpdate.ended !== undefined) { updates.push(`ended = $${paramIndex++}`); values.push(gameUpdate.ended); }
-    
-    // Update transformed_data if markets changed
-    if (gameUpdate.markets !== undefined && current) {
-      const updated = { ...current, ...gameUpdate, updatedAt: new Date() };
-      updates.push(`transformed_data = $${paramIndex++}`);
-      values.push(JSON.stringify(updated));
-    }
-    
-    updates.push(`updated_at = CURRENT_TIMESTAMP`);
-    values.push(gameUpdate.id);
-    
-    await client.query(`UPDATE live_games SET ${updates.join(', ')} WHERE id = $${paramIndex}`, values);
-    
-    // Update cache and broadcast - ALWAYS broadcast even if not in cache
-    const cached = gamesCache.get(gameUpdate.id);
-    const updatedGame = cached 
-      ? { ...cached, ...gameUpdate, updatedAt: new Date() }
-      : gameUpdate as LiveGame;
-    
-    if (cached) {
-      gamesCache.set(gameUpdate.id, updatedGame);
-    }
-    
-    // Always broadcast updates
-    if (liveGamesService) {
-      logger.info({
-        message: 'Broadcasting game update',
-        gameId: gameUpdate.id,
-        inCache: !!cached,
-      });
-      liveGamesService.broadcastPartialUpdate(updatedGame);
-    }
-  } finally {
-    client.release();
-  }
-}
+// async function updateGameInDatabase(gameUpdate: Partial<LiveGame> & { id: string }): Promise<void> {
+//   const client = await pool.connect();
 
-function updateGameInMemory(gameUpdate: Partial<LiveGame> & { id: string }): void {
-  const existing = inMemoryGames.get(gameUpdate.id);
-  if (existing) {
-    const updatedGame = { ...existing, ...gameUpdate, updatedAt: new Date() };
-    inMemoryGames.set(gameUpdate.id, updatedGame);
+//   try {
+//     // Get current game data if markets need updating
+//     let current: any = null;
+//     if (gameUpdate.markets !== undefined) {
+//       const findResult = await client.query(
+//         'SELECT transformed_data FROM live_games WHERE id = $1',
+//         [gameUpdate.id]
+//       );
+      
+//       if (findResult.rows.length === 0) {
+//         logger.warn({ message: 'Game not found for update', gameId: gameUpdate.id });
+//         return;
+//       }
+      
+//       current = findResult.rows[0].transformed_data 
+//         ? (typeof findResult.rows[0].transformed_data === 'string' 
+//             ? JSON.parse(findResult.rows[0].transformed_data) 
+//             : findResult.rows[0].transformed_data)
+//         : {};
+//     }
     
-    if (liveGamesService) {
-      liveGamesService.broadcastPartialUpdate(updatedGame);
-    }
-  }
-}
+//     const updates: string[] = [];
+//     const values: any[] = [];
+//     let paramIndex = 1;
+    
+//     if (gameUpdate.score !== undefined) { updates.push(`score = $${paramIndex++}`); values.push(gameUpdate.score); }
+//     if (gameUpdate.period !== undefined) { updates.push(`period = $${paramIndex++}`); values.push(gameUpdate.period); }
+//     if (gameUpdate.elapsed !== undefined) { updates.push(`elapsed = $${paramIndex++}`); values.push(gameUpdate.elapsed); }
+//     if (gameUpdate.live !== undefined) { updates.push(`live = $${paramIndex++}`); values.push(gameUpdate.live); }
+//     if (gameUpdate.ended !== undefined) { updates.push(`ended = $${paramIndex++}`); values.push(gameUpdate.ended); }
+    
+//     // Update transformed_data if markets changed
+//     if (gameUpdate.markets !== undefined && current) {
+//       const updated = { ...current, ...gameUpdate, updatedAt: new Date() };
+//       updates.push(`transformed_data = $${paramIndex++}`);
+//       values.push(JSON.stringify(updated));
+//     }
+    
+//     updates.push(`updated_at = CURRENT_TIMESTAMP`);
+//     values.push(gameUpdate.id);
+    
+//     await client.query(`UPDATE live_games SET ${updates.join(', ')} WHERE id = $${paramIndex}`, values);
+    
+//     // Update cache and broadcast - ALWAYS broadcast even if not in cache
+//     const cached = gamesCache.get(gameUpdate.id);
+//     const updatedGame = cached 
+//       ? { ...cached, ...gameUpdate, updatedAt: new Date() }
+//       : gameUpdate as LiveGame;
+    
+//     if (cached) {
+//       addGameToCache(updatedGame);
+//     }
+    
+//     // Always broadcast updates
+//     if (liveGamesService) {
+//       liveGamesService.broadcastPartialUpdate(updatedGame);
+//     }
+
+//     // Update frontend_games so /api/games/frontend returns current status
+//     upsertFrontendGameForLiveGame(updatedGame).catch((err) => {
+//       logger.warn({
+//         message: 'Failed to upsert frontend game after updateGame',
+//         gameId: gameUpdate.id,
+//         error: err instanceof Error ? err.message : String(err),
+//       });
+//     });
+//   } finally {
+//     client.release();
+//   }
+// }
+
+// function updateGameInMemory(gameUpdate: Partial<LiveGame> & { id: string }): void {
+//   const existing = inMemoryGames.get(gameUpdate.id);
+//   if (existing) {
+//     const updatedGame = { ...existing, ...gameUpdate, updatedAt: new Date() };
+//     inMemoryGames.set(gameUpdate.id, updatedGame);
+    
+//     if (liveGamesService) {
+//       liveGamesService.broadcastPartialUpdate(updatedGame);
+//     }
+//   }
+// }
 
 export async function refreshLiveGames(): Promise<number> {
+  notifyGamesRefreshStarting();
   try {
-    logger.info({ message: 'Refreshing live games' });
+    //logger.info({ message: 'Refreshing live games' });
 
     const allGames = await fetchLiveGames();
     
     if (allGames.length === 0) {
       logger.warn({ message: 'No games fetched from API - endpoint may be unavailable' });
-      const existingGames = await getAllLiveGames();
-      return existingGames.length;
+      return await getLiveGamesCount();
     }
-    
+
     const filteredGames = filterGamesBySports(allGames);
     
     // Log filtering stats for debugging
-    const nflGames = allGames.filter(g => {
-      const slug = g.slug?.toLowerCase() || '';
-      const title = g.title?.toLowerCase() || '';
-      return slug.includes('nfl') || slug.includes('football') || title.includes('nfl') || title.includes('football');
-    });
+    // const nflGames = allGames.filter(g => {
+    //   const slug = g.slug?.toLowerCase() || '';
+    //   const title = g.title?.toLowerCase() || '';
+    //   return slug.includes('nfl') || slug.includes('football') || title.includes('nfl') || title.includes('football');
+    // });
     
-    if (nflGames.length > 0) {
-      logger.info({
-        message: 'NFL games found in API response',
-        totalNfl: nflGames.length,
-        nflSlugs: nflGames.map(g => g.slug).slice(0, 5),
-      });
-    }
+    // if (nflGames.length > 0) {
+    //   logger.info({
+    //     message: 'NFL games found in API response',
+    //     totalNfl: nflGames.length,
+    //     nflSlugs: nflGames.map(g => g.slug).slice(0, 5),
+    //   });
+    // }
 
     if (filteredGames.length === 0) {
-      const existingGames = await getAllLiveGames();
-      return existingGames.length;
+      return await getLiveGamesCount();
     }
     
     // No longer filter out ended games - store all games from Polymarket
@@ -1830,17 +2124,18 @@ export async function refreshLiveGames(): Promise<number> {
     // No longer cleanup ended games from database
     // They remain available for fetching by ID/slug
     
-    const allStoredGames = await getAllLiveGames();
+    const allStoredGames = getCachedGamesForBroadcast();
     if (liveGamesService) {
       liveGamesService.broadcastUpdate(allStoredGames);
     }
-    
-    logger.info({
-      message: 'Live games refreshed',
-      totalFetched: allGames.length,
-      afterSportFilter: filteredGames.length,
-      stored: liveGames.length,
-    });
+    notifyGamesRefreshed();
+
+    // logger.info({
+    //   message: 'Live games refreshed',
+    //   totalFetched: allGames.length,
+    //   afterSportFilter: filteredGames.length,
+    //   stored: liveGames.length,
+    // });
     
     return liveGames.length;
   } catch (error) {
@@ -1849,11 +2144,12 @@ export async function refreshLiveGames(): Promise<number> {
       error: error instanceof Error ? error.message : String(error),
     });
     try {
-      const existingGames = await getAllLiveGames();
-      return existingGames.length;
+      return await getLiveGamesCount();
     } catch {
       return 0;
     }
+  } finally {
+    notifyGamesRefreshEnded();
   }
 }
 
@@ -1892,7 +2188,7 @@ export class LiveGamesService {
       });
     }, POLLING_INTERVAL);
 
-    logger.info({ message: 'Live games polling started', intervalMinutes: POLLING_INTERVAL / 60000 });
+    //logger.info({ message: 'Live games polling started', intervalMinutes: POLLING_INTERVAL / 60000 });
   }
 
   stop(): void {
@@ -1904,7 +2200,7 @@ export class LiveGamesService {
     }
 
     this.isRunning = false;
-    logger.info({ message: 'Live games polling stopped' });
+    //logger.info({ message: 'Live games polling stopped' });
   }
 
   setSSEBroadcastCallback(callback: (games: LiveGame[]) => void): void {
@@ -1941,12 +2237,12 @@ export class LiveGamesService {
   }
 
   broadcastPartialUpdate(game: LiveGame): void {
-    logger.info({
-      message: 'Broadcasting partial update to callbacks',
-      gameId: game.id,
-      slug: game.slug,
-      callbackCount: this.ssePartialBroadcastCallbacks.size,
-    });
+    // logger.info({
+    //   message: 'Broadcasting partial update to callbacks',
+    //   gameId: game.id,
+    //   slug: game.slug,
+    //   callbackCount: this.ssePartialBroadcastCallbacks.size,
+    // });
 
     for (const callback of this.ssePartialBroadcastCallbacks) {
       try {

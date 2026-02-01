@@ -39,7 +39,7 @@ const SPORTS_GAMES_CONFIG: SportsGamesConfig = {
     label: 'NHL',
   },
   ufc: {
-    seriesId: '', // TODO: Add UFC series ID when available
+    seriesId: '38', // UFC series ID (Polymarket Gamma: series slug "ufc", id 38; 10500 returns NFLX)
     label: 'UFC',
   },
   epl: {
@@ -50,15 +50,47 @@ const SPORTS_GAMES_CONFIG: SportsGamesConfig = {
     seriesId: '10193', // TODO: Add La Liga series ID when available
     label: 'La Liga',
   },
+  tennis: {
+    // Tennis games use slugs like "atp-..." and "wta-...".
+    // Polymarket has separate series for ATP (10365) and WTA (10366).
+    // We use ATP series ID as the primary, and fetchSportsGamesForSport
+    // will also fetch WTA games separately.
+    // SeriesIdSyncService can override this at runtime if needed.
+    seriesId: '10365', // ATP series ID
+    label: 'Tennis',
+  },
   cbb: {
-    seriesId: '10347', // College Basketball
+    // NOTE: This series id is what Gamma uses for current NCAA CBB events.
+    // We observed `cbb-toledo-umass-2026-01-20` belongs to series id 10470.
+    seriesId: '10470', // NCAA CBB
     label: 'College Basketball',
   },
   cfb: {
-    seriesId: '10348', // College Football
+    // Observed `cfb-2025` series id is 10210 (and it may change seasonally)
+    seriesId: '10210', // College Football (fallback)
     label: 'College Football',
   },
 };
+
+// Runtime overrides (populated from Gamma /series at startup)
+const SERIES_ID_OVERRIDES: Record<string, string> = {};
+
+export function setSeriesIdOverride(sport: string, seriesId: string): void {
+  const normalizedSport = sport.toLowerCase().trim();
+  if (!normalizedSport) return;
+  if (!seriesId) return;
+  SERIES_ID_OVERRIDES[normalizedSport] = String(seriesId);
+}
+
+/**
+ * Clear series ID override for a sport (reverts to static config)
+ * @param sport - Sport name (e.g., 'ufc')
+ */
+export function clearSeriesIdOverride(sport: string): void {
+  const normalizedSport = sport.toLowerCase().trim();
+  if (!normalizedSport) return;
+  delete SERIES_ID_OVERRIDES[normalizedSport];
+}
 
 /**
  * Get series_id for a sport category
@@ -67,6 +99,8 @@ const SPORTS_GAMES_CONFIG: SportsGamesConfig = {
  */
 export function getSeriesIdForSport(sport: string): string | null {
   const normalizedSport = sport.toLowerCase().trim();
+  const override = SERIES_ID_OVERRIDES[normalizedSport];
+  if (override) return override;
   const config = SPORTS_GAMES_CONFIG[normalizedSport];
   return config && config.seriesId ? config.seriesId : null;
 }

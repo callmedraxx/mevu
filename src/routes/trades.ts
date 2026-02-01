@@ -22,7 +22,7 @@ const router = Router();
  * /api/trades/{gameIdentifier}:
  *   get:
  *     summary: Get trades for a game by ID or slug
- *     description: Fetches trades from Polymarket API for all markets in the game (not just moneyline), stores them in database, and returns transformed trade data. Fetches up to 500 trades from Polymarket API.
+ *     description: Fetches trades from Polymarket API for all markets in the game, stores them in database, and returns transformed trade data. Fetches up to 500 trades from Polymarket API.
  *     tags: [Trades]
  *     parameters:
  *       - in: path

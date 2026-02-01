@@ -387,10 +387,10 @@ export class ClobWebSocketService {
       type: 'market',
     };
 
-    logger.info({
-      message: 'Subscribing to CLOB assets',
-      count: assetIds.length,
-    });
+    // logger.info({
+    //   message: 'Subscribing to CLOB assets',
+    //   count: assetIds.length,
+    // });
 
     this.send(subscriptionMessage);
   }

@@ -73,12 +73,12 @@ router.post('/alchemy', async (req: Request, res: Response) => {
 
     const payload = req.body;
 
-    logger.info({
-      message: 'Received Alchemy webhook',
-      webhookId: payload.webhookId,
-      type: payload.type,
-      activityCount: payload.event?.activity?.length || 0,
-    });
+    // logger.info({
+    //   message: 'Received Alchemy webhook',
+    //   webhookId: payload.webhookId,
+    //   type: payload.type,
+    //   activityCount: payload.event?.activity?.length || 0,
+    // });
 
     // Process the webhook asynchronously
     // Respond immediately to avoid timeout
@@ -253,10 +253,10 @@ router.get('/deposits/stream/:privyUserId', async (req: Request, res: Response) 
     return res.status(400).json({ error: 'privyUserId is required' });
   }
 
-  logger.info({
-    message: 'Opening deposit notification SSE stream',
-    privyUserId,
-  });
+  // logger.info({
+  //   message: 'Opening deposit notification SSE stream',
+  //   privyUserId,
+  // });
 
   // Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
@@ -293,10 +293,10 @@ router.get('/deposits/stream/:privyUserId', async (req: Request, res: Response) 
 
   // Handle client disconnect
   req.on('close', () => {
-    logger.info({
-      message: 'Deposit notification SSE stream closed',
-      privyUserId,
-    });
+    // logger.info({
+    //   message: 'Deposit notification SSE stream closed',
+    //   privyUserId,
+    // });
     clearInterval(heartbeatInterval);
     unsubscribe();
     res.end();

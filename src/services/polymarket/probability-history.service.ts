@@ -106,57 +106,80 @@ export async function recordProbabilitySnapshot(
 }
 
 /**
- * Record snapshot to database
+ * Record snapshot to database (single snapshot - kept for backward compatibility)
  */
 async function recordSnapshotToDatabase(snapshot: ProbabilitySnapshot): Promise<void> {
+  await recordSnapshotsToDatabaseBulk([snapshot]);
+}
+
+const BULK_SNAPSHOT_CHUNK_SIZE = 1000; // Fewer round-trips = less connection time
+
+/**
+ * Record multiple probability snapshots in a single connection.
+ * Deduplicates: skips (game_id, home_probability, away_probability) if we have
+ * a recent identical snapshot within 5 minutes.
+ */
+async function recordSnapshotsToDatabaseBulk(snapshots: ProbabilitySnapshot[]): Promise<void> {
+  if (snapshots.length === 0) return;
+
   const client = await pool.connect();
   try {
-    // Check if we already have a recent snapshot (within last 5 minutes)
-    // to avoid storing too many records
-    const recentCheck = await client.query(
-      `SELECT id FROM game_probability_history 
-       WHERE game_id = $1 
-       AND recorded_at > NOW() - INTERVAL '5 minutes'
-       AND home_probability = $2
-       AND away_probability = $3
-       LIMIT 1`,
-      [snapshot.gameId, snapshot.homeProbability, snapshot.awayProbability]
-    );
-    
-    // Skip if we have a recent identical snapshot
-    if (recentCheck.rows.length > 0) {
-      return;
+    for (let i = 0; i < snapshots.length; i += BULK_SNAPSHOT_CHUNK_SIZE) {
+      const chunk = snapshots.slice(i, i + BULK_SNAPSHOT_CHUNK_SIZE);
+      const values: unknown[] = [];
+      const valueRows: string[] = [];
+
+      chunk.forEach((s, idx) => {
+        const base = idx * 6;
+        valueRows.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`);
+        values.push(s.gameId, s.homeProbability, s.awayProbability, s.homeBuyPrice, s.awayBuyPrice, s.recordedAt);
+      });
+
+      const query = `
+        INSERT INTO game_probability_history
+          (game_id, home_probability, away_probability, home_buy_price, away_buy_price, recorded_at)
+        SELECT v.game_id, v.home_probability::decimal, v.away_probability::decimal, v.home_buy_price::int, v.away_buy_price::int, v.recorded_at::timestamptz
+        FROM (VALUES ${valueRows.join(', ')}) AS v(game_id, home_probability, away_probability, home_buy_price, away_buy_price, recorded_at)
+        WHERE NOT EXISTS (
+          SELECT 1 FROM game_probability_history h
+          WHERE h.game_id = v.game_id
+            AND h.home_probability = v.home_probability::decimal
+            AND h.away_probability = v.away_probability::decimal
+            AND h.recorded_at > NOW() - INTERVAL '5 minutes'
+        )
+      `;
+      await client.query(query, values);
     }
-    
-    await client.query(
-      `INSERT INTO game_probability_history 
-       (game_id, home_probability, away_probability, home_buy_price, away_buy_price, recorded_at)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [
-        snapshot.gameId,
-        snapshot.homeProbability,
-        snapshot.awayProbability,
-        snapshot.homeBuyPrice,
-        snapshot.awayBuyPrice,
-        snapshot.recordedAt,
-      ]
-    );
-    
+
     logger.debug({
-      message: 'Recorded probability snapshot',
-      gameId: snapshot.gameId,
-      homeProb: snapshot.homeProbability,
-      awayProb: snapshot.awayProbability,
+      message: 'Recorded probability snapshots (bulk)',
+      count: snapshots.length,
     });
   } catch (error) {
-    // Don't throw - probability tracking shouldn't break main flow
     logger.error({
-      message: 'Error recording probability snapshot',
-      gameId: snapshot.gameId,
+      message: 'Error recording probability snapshots (bulk)',
+      count: snapshots.length,
       error: error instanceof Error ? error.message : String(error),
     });
   } finally {
     client.release();
+  }
+}
+
+/**
+ * Record multiple probability snapshots (bulk). Single connection, batched INSERTs.
+ * Use this when storing many games at once instead of recordProbabilitySnapshot in a loop.
+ */
+export async function recordProbabilitySnapshotsBulk(snapshots: ProbabilitySnapshot[]): Promise<void> {
+  if (snapshots.length === 0) return;
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  if (isProduction) {
+    await recordSnapshotsToDatabaseBulk(snapshots);
+  } else {
+    for (const s of snapshots) {
+      recordSnapshotToMemory(s);
+    }
   }
 }
 

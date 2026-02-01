@@ -7,6 +7,12 @@
 import { EventEmitter } from 'events';
 import { logger } from '../../config/logger';
 import { pool } from '../../config/database';
+import {
+  initRedisClusterBroadcast,
+  publishDepositsProgress,
+  subscribeToDepositsProgress,
+  isRedisClusterBroadcastReady,
+} from '../redis-cluster-broadcast.service';
 
 export type DepositStatus = 
   | 'deposit_received'
@@ -344,7 +350,7 @@ class DepositProgressService extends EventEmitter {
   }
 
   /**
-   * Emit progress event to listeners
+   * Emit progress event to listeners (or publish to Redis for cluster-wide delivery)
    */
   private emitProgressEvent(
     progress: DepositProgress,
@@ -355,10 +361,12 @@ class DepositProgressService extends EventEmitter {
       ...progress,
     };
 
-    // Emit to user-specific channel
-    this.emit(`progress:${progress.privyUserId}`, event);
+    if (isRedisClusterBroadcastReady()) {
+      publishDepositsProgress(progress.privyUserId, event);
+      return;
+    }
 
-    // Emit to global channel (for admin/debugging)
+    this.emit(`progress:${progress.privyUserId}`, event);
     this.emit('progress', event);
   }
 

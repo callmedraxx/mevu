@@ -6,6 +6,7 @@
 import { LiveGame } from './live-games.service';
 import { Team } from './teams.service';
 import { logger } from '../../config/logger';
+import { getFighterRecord, getFighterDisplayName, prefetchFighterRecords } from '../ufc/ufc-fighter-records.service';
 import { calculateProbabilityChange, getProbabilityFromHoursAgo } from './probability-history.service';
 
 /**
@@ -169,18 +170,113 @@ function formatQuarter(period: string | undefined): string | undefined {
 }
 
 /**
+ * Clean tennis team names by removing tournament prefixes like "Australian Open Men's", "American Open Women's", etc.
+ */
+function cleanTennisTeamName(name: string | undefined | null): string | undefined {
+  if (!name) return undefined;
+  
+  let cleaned = name.trim();
+  
+  // Remove tournament prefixes (case-insensitive, with optional apostrophe variations)
+  // Pattern: [Tournament Name] [Men's/Women's]: [Player Name]
+  const tournamentPrefixes = [
+    /^Australian\s+Open\s+Men'?s?\s*:\s*/i,
+    /^Australian\s+Open\s+Women'?s?\s*:\s*/i,
+    /^American\s+Open\s+Men'?s?\s*:\s*/i,
+    /^American\s+Open\s+Women'?s?\s*:\s*/i,
+    /^US\s+Open\s+Men'?s?\s*:\s*/i,
+    /^US\s+Open\s+Women'?s?\s*:\s*/i,
+    /^French\s+Open\s+Men'?s?\s*:\s*/i,
+    /^French\s+Open\s+Women'?s?\s*:\s*/i,
+    /^Wimbledon\s+Men'?s?\s*:\s*/i,
+    /^Wimbledon\s+Women'?s?\s*:\s*/i,
+    // Generic patterns
+    /^[A-Z][a-z]+\s+Open\s+Men'?s?\s*:\s*/i,
+    /^[A-Z][a-z]+\s+Open\s+Women'?s?\s*:\s*/i,
+  ];
+  
+  for (const pattern of tournamentPrefixes) {
+    cleaned = cleaned.replace(pattern, '').trim();
+  }
+  
+  return cleaned || undefined;
+}
+
+/**
  * Extract team info from title (e.g., "Warriors vs Lakers" or "WAS @ PHX")
  */
 function extractTeamsFromTitle(title: string): { home?: string; away?: string } {
+  if (!title) return {};
+
+  // Normalize common noise in titles before extracting team/fighter names.
+  let working = title.trim();
+
+  // 1) Drop trailing parenthetical details:
+  //    "Finney vs. Malkoun (Middleweight, Prelims)" -> "Finney vs. Malkoun"
+  working = working.replace(/\s*\([^)]*\)\s*$/, '').trim();
+
+  // 2) Drop leading competition / event prefixes before the first colon:
+  //    "UFC 325: Finney vs. Malkoun" -> "Finney vs. Malkoun"
+  //    "NFL Week 5: Bills @ Chiefs"  -> "Bills @ Chiefs"
+  const colonIndex = working.indexOf(':');
+  if (colonIndex !== -1) {
+    const afterColon = working.slice(colonIndex + 1).trim();
+    if (afterColon.length > 0) {
+      working = afterColon;
+    }
+  }
+
   // Try "Team1 vs Team2" or "Team1 @ Team2" format
   // Format: "Away vs Home" or "Away @ Home" -> team1 is away, team2 is home
-  const vsMatch = title.match(/(.+?)\s+(?:vs\.?|@|at)\s+(.+?)(?:\s*[-–—]|$)/i);
+  const vsMatch = working.match(/(.+?)\s+(?:vs\.?|@|at)\s+(.+)$/i);
   if (vsMatch) {
     // For "vs" format: "Away vs Home" -> team1 is away, team2 is home
     // For "@" format: "Away @ Home" -> team1 is away, team2 is home
     return { away: vsMatch[1].trim(), home: vsMatch[2].trim() };
   }
   
+  return {};
+}
+
+/**
+ * Extract full participant names (e.g., "First Last") from an event or market
+ * description. Intended for UFC and Tennis where the title may only contain
+ * surnames or include tournament prefixes, but the description includes full names.
+ *
+ * Examples:
+ *   UFC: "Torrez Finney vs. Jacob Malkoun in a middleweight bout at UFC 325..."
+ *        -> { away: "Torrez Finney", home: "Jacob Malkoun" }
+ *   Tennis: "Lorenzo Musetti vs. Novak Djokovic in the Australian Open..."
+ *           -> { away: "Lorenzo Musetti", home: "Novak Djokovic" }
+ */
+function extractFullNamesFromDescription(desc?: string | null): { away?: string; home?: string } {
+  if (!desc) return {};
+
+  // Look only at the first sentence/line to reduce noise.
+  let working = String(desc).split(/[\n\.]/)[0] || '';
+  working = working.trim();
+  if (!working) return {};
+
+  // Drop leading prefixes before the first colon, e.g. "UFC 325: Alexander Volkanovski vs ..."
+  const colonIndex = working.indexOf(':');
+  if (colonIndex !== -1) {
+    const after = working.slice(colonIndex + 1).trim();
+    if (after) {
+      working = after;
+    }
+  }
+
+  // Regex: "Name1 vs Name2" or "Name1 vs. Name2"
+  // Name is at least two capitalized words (to avoid matching stray single words).
+  const namePart = '([A-Z][A-Za-zÀ-ÖØ-öø-ÿ\'’\\-]+(?:\\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ\'’\\-]+)+)';
+  const re = new RegExp(`${namePart}\\s+vs\\.?\\s+${namePart}`, 'i');
+  const match = working.match(re);
+  if (match) {
+    const away = match[1].trim();
+    const home = match[2].trim();
+    return { away, home };
+  }
+
   return {};
 }
 
@@ -198,7 +294,42 @@ function extractAbbrevsFromSlug(slug: string | undefined, gameSport?: string): {
   const teamAbbrevs: string[] = [];
   
   // Common sport identifiers
-  const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+  const sportIdentifiers = new Set([
+    'nhl',
+    'nba',
+    'nfl',
+    'mlb',
+    'epl',
+    'cbb',
+    'cfb',
+    'lal',
+    'ser',
+    'bund',
+    'lig1',
+    'mls',
+    'ufc',
+    'tennis',
+    'atp',
+    'wta',
+  ]);
+
+  const firstPartLower = slugParts[0]?.toLowerCase() || '';
+
+  // UFC-specific handling: slugs look like "ufc-ale14-die4-2026-01-31"
+  // The middle tokens (e.g. "ale14", "die4") are the fighter abbreviations we want.
+  if (firstPartLower === 'ufc') {
+    const fighterCodes = slugParts
+      .slice(1)
+      // Drop pure date segments (YYYY, MM, DD)
+      .filter((part) => !/^\d{4}$/.test(part) && !/^\d{2}$/.test(part));
+    
+    if (fighterCodes.length >= 2) {
+      return {
+        away: fighterCodes[0].toUpperCase(),
+        home: fighterCodes[1].toUpperCase(),
+      };
+    }
+  }
   
   for (let i = 0; i < slugParts.length; i++) {
     const part = slugParts[i];
@@ -273,6 +404,11 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
   let awayTeamName = game.awayTeam?.name?.toLowerCase() || game.teamIdentifiers?.away?.toLowerCase() || '';
   let homeAbbr = game.homeTeam?.abbreviation?.toLowerCase() || '';
   let awayAbbr = game.awayTeam?.abbreviation?.toLowerCase() || '';
+
+  // UFC: normalize "UFC Fight Night: Fighter Name" -> "Fighter Name" for matching market labels
+  const stripUfcPrefix = (s: string) => s.replace(/^ufc[^:]*:\s*/i, '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+  if (homeTeamName) homeTeamName = stripUfcPrefix(homeTeamName);
+  if (awayTeamName) awayTeamName = stripUfcPrefix(awayTeamName);
   
   // Fallback: Extract team names from title if teams aren't enriched
   if (!homeTeamName && !awayTeamName && game.title) {
@@ -282,8 +418,8 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     for (const sep of separators) {
       const parts = title.split(sep);
       if (parts.length === 2) {
-        awayTeamName = parts[0].trim().toLowerCase();
-        homeTeamName = parts[1].trim().toLowerCase();
+        awayTeamName = stripUfcPrefix(parts[0].trim().toLowerCase());
+        homeTeamName = stripUfcPrefix(parts[1].trim().toLowerCase());
         break;
       }
     }
@@ -293,7 +429,7 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
   if (!homeTeamName && !awayTeamName && game.slug) {
     const slugParts = game.slug.split('-');
     // Skip sport identifier and date, get team abbreviations
-    const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+    const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls', 'ufc']);
     const teamParts: string[] = [];
     for (let i = 1; i < slugParts.length; i++) {
       const part = slugParts[i];
@@ -309,6 +445,22 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       awayAbbr = teamParts[0];
       homeAbbr = teamParts[1];
     }
+  }
+
+  // UFC: resolve abbreviations to full names from Ball Don't Lie for better market label matching
+  // Market labels are often last names (e.g. "Kuniev", "Almeida") while Polymarket may only have "RIZ", "JAI3"
+  const isUfc = (game.sport && game.sport.toLowerCase() === 'ufc') || (game.league && game.league.toLowerCase() === 'ufc');
+  if (isUfc) {
+    if (homeAbbr) {
+      const resolved = getFighterDisplayName(homeAbbr);
+      if (resolved) homeTeamName = homeTeamName || resolved.toLowerCase();
+    }
+    if (awayAbbr) {
+      const resolved = getFighterDisplayName(awayAbbr);
+      if (resolved) awayTeamName = awayTeamName || resolved.toLowerCase();
+    }
+    if (homeTeamName) homeTeamName = stripUfcPrefix(homeTeamName);
+    if (awayTeamName) awayTeamName = stripUfcPrefix(awayTeamName);
   }
   
   // SOCCER/FOOTBALL: First try to find individual "Will X win?" markets
@@ -366,30 +518,58 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     };
   }
   
-  // Look through markets to find the moneyline (team vs team) market
-  for (const market of game.markets) {
-    // Prefer raw outcomes+outcomePrices as they're more reliable than transformed data
-    let outcomes: any[] | null = null;
-    
-    if (market.outcomes && market.outcomePrices) {
-      const rawOutcomes = market.outcomes as string[];
-      const rawPrices = market.outcomePrices as string[];
-      const structuredOutcomes = market.structuredOutcomes || [];
-      if (rawOutcomes.length === 2 && rawPrices.length === 2) {
-        // Convert price from decimal (0.745) to percentage (74.5)
-        // Also get buyPrice/sellPrice from structuredOutcomes if available (from CLOB)
-        outcomes = rawOutcomes.map((label: string, i: number) => ({
-          label,
-          price: parseFloat(rawPrices[i]) * 100,
-          buyPrice: structuredOutcomes[i]?.buyPrice,
-          sellPrice: structuredOutcomes[i]?.sellPrice,
-        }));
+  // Helper: normalize outcomes/prices to arrays (Gamma API sometimes returns JSON strings)
+  const parseOutcomesArray = (val: any): string[] => {
+    if (!val) return [];
+    if (Array.isArray(val)) return val.map((o) => String(o));
+    if (typeof val === 'string') {
+      try {
+        const p = JSON.parse(val);
+        return Array.isArray(p) ? p.map((o: any) => String(o)) : [];
+      } catch {
+        return [];
       }
     }
-    
-    // Fallback to structuredOutcomes if raw data not available
+    return [];
+  };
+  const parsePricesArray = (val: any): number[] => {
+    if (!val) return [];
+    if (Array.isArray(val)) return val.map((p) => parseFloat(String(p)));
+    if (typeof val === 'string') {
+      try {
+        const p = JSON.parse(val);
+        return Array.isArray(p) ? p.map((x: any) => parseFloat(String(x))) : [];
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  };
+
+  // Look through markets to find the moneyline (team vs team) market
+  for (const market of game.markets) {
+    let outcomes: any[] | null = null;
+    const structuredOutcomes = market.structuredOutcomes || [];
+
+    // outcomes/outcomePrices: may be arrays or JSON strings (Gamma API returns strings)
+    const rawOutcomes = parseOutcomesArray(market.outcomes);
+    const rawPrices = parsePricesArray(market.outcomePrices);
+
+    if (rawOutcomes.length === 2 && rawPrices.length === 2) {
+      outcomes = rawOutcomes.map((label: string, i: number) => {
+        const rawPrice = rawPrices[i];
+        const pricePct = typeof rawPrice === 'number' && rawPrice <= 1 ? rawPrice * 100 : rawPrice;
+        return {
+          label,
+          price: typeof pricePct === 'number' && !isNaN(pricePct) ? pricePct : parseFloat(String(rawPrice)) * 100,
+          buyPrice: structuredOutcomes[i]?.buyPrice,
+          sellPrice: structuredOutcomes[i]?.sellPrice,
+        };
+      });
+    }
+
     if (!outcomes || outcomes.length === 0) {
-      outcomes = market.structuredOutcomes || null;
+      outcomes = structuredOutcomes.length === 2 ? structuredOutcomes : null;
     }
     
     if (!outcomes || outcomes.length !== 2) continue;
@@ -497,16 +677,54 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     // NO FALLBACKS - if we can't match both teams explicitly, this is not a moneyline market
     // Continue to next market
   }
+
+  // UFC fallback: first moneyline-like market (2 fighter outcomes, not Yes/No or O/U)
+  if (isUfc && game.markets.length > 0) {
+    for (const m of game.markets) {
+      const rawOutcomes = parseOutcomesArray(m.outcomes);
+      const rawPrices = parsePricesArray(m.outcomePrices);
+      if (rawOutcomes.length !== 2 || rawPrices.length !== 2) continue;
+      const questionLower = (m.question || '').toLowerCase();
+      const isSpreadMarket = questionLower.includes('spread') || questionLower.includes('handicap');
+      const isTotalsMarket = questionLower.includes('o/u') || questionLower.includes('over/under') || questionLower.includes('total');
+      const labels = rawOutcomes.map((l: string) => String(l).toLowerCase());
+      const hasNonMoneyline = labels.some(l =>
+        l === 'over' || l === 'under' || l === 'yes' || l === 'no' ||
+        l.includes('points') || l.includes('rounds')
+      );
+      if (isSpreadMarket || isTotalsMarket || hasNonMoneyline) continue;
+      const structuredOutcomes = m.structuredOutcomes || [];
+      const outcomes = rawOutcomes.map((label: string, i: number) => {
+        const rawPrice = rawPrices[i];
+        const pricePct = typeof rawPrice === 'number' && rawPrice <= 1 ? rawPrice * 100 : rawPrice;
+        return {
+          label,
+          price: typeof pricePct === 'number' && !isNaN(pricePct) ? pricePct : parseFloat(String(rawPrice)) * 100,
+          buyPrice: structuredOutcomes[i]?.buyPrice,
+          sellPrice: structuredOutcomes[i]?.sellPrice,
+        };
+      });
+      // Slug convention: away-home, so outcome[0]=away, outcome[1]=home
+      return {
+        away: { label: outcomes[0].label, price: outcomes[0].price, buyPrice: outcomes[0].buyPrice, sellPrice: outcomes[0].sellPrice },
+        home: { label: outcomes[1].label, price: outcomes[1].price, buyPrice: outcomes[1].buyPrice, sellPrice: outcomes[1].sellPrice },
+      };
+    }
+  }
   
   // No moneyline market found - return null (no fallbacks to spread/totals markets)
   return { home: null, away: null };
 }
+
+/** Sentinel when moneyline/prices not found - surfaces missing data instead of silent 50/50 */
+const NO_PRICE = -1;
 
 /**
  * Get prices for Yes/No outcomes from moneyline market
  * probability = raw YES outcome probability (team wins)
  * buyPrice = YES outcome price rounded UP
  * sellPrice = NO outcome price rounded UP = ceil(100 - YES price)
+ * Returns NO_PRICE (-1) when moneyline not found instead of 50 to surface errors.
  */
 function extractPrices(game: LiveGame): { 
   homeBuy: number; 
@@ -516,16 +734,28 @@ function extractPrices(game: LiveGame): {
   homeProb: number;
   awayProb: number;
 } {
-  // Default prices (50/50)
-  let homeBuy = 50;
-  let homeSell = 50;
-  let awayBuy = 50;
-  let awaySell = 50;
-  let homeProb = 50;
-  let awayProb = 50;
+  let homeBuy = NO_PRICE;
+  let homeSell = NO_PRICE;
+  let awayBuy = NO_PRICE;
+  let awaySell = NO_PRICE;
+  let homeProb = NO_PRICE;
+  let awayProb = NO_PRICE;
   
   // Find moneyline market with team outcomes
   const moneyline = findMoneylineMarket(game);
+
+  if (!moneyline.home || !moneyline.away) {
+    // logger.warn({
+    //   message: 'Moneyline market not found - prices will show as -1',
+    //   gameId: game.id,
+    //   slug: game.slug,
+    //   sport: game.sport,
+    //   marketCount: game.markets?.length ?? 0,
+    //   homeTeam: game.homeTeam?.name ?? game.teamIdentifiers?.home,
+    //   awayTeam: game.awayTeam?.name ?? game.teamIdentifiers?.away,
+    // });
+    return { homeBuy, homeSell, awayBuy, awaySell, homeProb, awayProb };
+  }
   
   // Debug logging for specific game
   if (game.id === '117348') {
@@ -594,7 +824,7 @@ function extractPrices(game: LiveGame): {
  * This represents the bid-ask spread
  */
 function calculateSpread(buyPrice: number, sellPrice: number): string {
-  // Spread is the gap between buying YES and selling (buying NO)
+  if (buyPrice === NO_PRICE || sellPrice === NO_PRICE) return '—';
   const spread = Math.abs(buyPrice - sellPrice);
   if (spread <= 1) return '1¢';
   return `1-${spread}¢`;
@@ -603,15 +833,21 @@ function calculateSpread(buyPrice: number, sellPrice: number): string {
 /**
  * Check if a game is ended
  * Returns true if:
- * - game.ended is true (but not if game is live)
- * - game.closed is true (but not if game is live)
+ * - game.ended is true
+ * - game.closed is true
  * - All markets are closed
- * - endDate + 4 hours has passed (fallback)
+ * - endDate + 3 hours has passed (fallback)
  */
 function isGameEnded(game: LiveGame): boolean {
-  // If game is live, it cannot be ended (even if ended flag is set incorrectly)
-  if (game.live === true) return false;
-  
+  // End-date override first (handles occasional stale live=true flags)
+  if (game.endDate) {
+    const endDate = new Date(game.endDate);
+    const graceTime = 3 * 60 * 60 * 1000; // 3 hours in ms
+    if ((endDate.getTime() + graceTime) < Date.now()) {
+      return true;
+    }
+  }
+
   // Check explicit ended/closed flags
   if (game.ended === true) return true;
   if (game.closed === true) return true;
@@ -620,15 +856,6 @@ function isGameEnded(game: LiveGame): boolean {
   if (game.markets && game.markets.length > 0) {
     const allMarketsClosed = game.markets.every((m: any) => m.closed === true);
     if (allMarketsClosed) return true;
-  }
-
-  // Fallback: Check if endDate + 4 hours has passed
-  if (game.endDate) {
-    const endDate = new Date(game.endDate);
-    const fallbackTime = 4 * 60 * 60 * 1000; // 4 hours in ms
-    if ((endDate.getTime() + fallbackTime) < Date.now()) {
-      return true;
-    }
   }
 
   return false;
@@ -692,6 +919,44 @@ function calculatePercentChange(chartData: number[]): number {
 }
 
 /**
+ * Extract UFC fighter names from a LiveGame for record lookup.
+ * Returns null if not a UFC game.
+ */
+export function getUfcFighterNamesFromGame(
+  game: LiveGame
+): { away: string; home: string } | null {
+  const isUfc =
+    (game.sport && game.sport.toLowerCase() === 'ufc') ||
+    (game.league && game.league.toLowerCase() === 'ufc');
+  if (!isUfc) return null;
+
+  const titleTeams = extractTeamsFromTitle(game.title);
+  const rawAwayId = game.teamIdentifiers?.away ?? '';
+  const rawHomeId = game.teamIdentifiers?.home ?? '';
+  const homeTeam = game.homeTeam;
+  const awayTeam = game.awayTeam;
+
+  let descNames: { away?: string; home?: string } = {};
+  const rawDesc =
+    (game.description as string | undefined) ||
+    (game.rawData && (game.rawData as any).description as string | undefined) ||
+    '';
+  let effectiveDesc = rawDesc;
+  if (!effectiveDesc && Array.isArray((game.rawData as any)?.markets)) {
+    const withDesc = (game.rawData as any).markets.find(
+      (m: any) => typeof m.description === 'string' && m.description.trim().length > 0
+    );
+    if (withDesc) effectiveDesc = withDesc.description;
+  }
+  if (effectiveDesc) descNames = extractFullNamesFromDescription(effectiveDesc);
+
+  const away = awayTeam?.name || descNames.away || titleTeams.away || rawAwayId || '';
+  const home = homeTeam?.name || descNames.home || titleTeams.home || rawHomeId || '';
+  if (!away.trim() && !home.trim()) return null;
+  return { away: away.trim() || 'Away Fighter', home: home.trim() || 'Home Fighter' };
+}
+
+/**
  * Transform a LiveGame to FrontendGame format
  * @param game - The LiveGame to transform
  * @param historicalChange - Optional pre-calculated probability change (for batch processing)
@@ -717,7 +982,22 @@ export async function transformToFrontendGame(
   const awayTeam = game.awayTeam;
   
   // Extract team names from title if no team data
-  const titleTeams = extractTeamsFromTitle(game.title);
+  let titleTeams = extractTeamsFromTitle(game.title);
+  
+  // Detect tennis games where we need to clean tournament prefixes from team names
+  const isTennis =
+    (game.sport && game.sport.toLowerCase() === 'tennis') ||
+    (game.league && game.league.toLowerCase() === 'tennis');
+  
+  // Clean tennis team names from title if this is a tennis game
+  if (isTennis) {
+    if (titleTeams.away) {
+      titleTeams.away = cleanTennisTeamName(titleTeams.away) || titleTeams.away;
+    }
+    if (titleTeams.home) {
+      titleTeams.home = cleanTennisTeamName(titleTeams.home) || titleTeams.home;
+    }
+  }
   
   // Extract team abbreviations from slug as fallback (format: sport-away-home-date)
   // Pass the game's sport to avoid incorrectly skipping team abbreviations that match sport identifiers
@@ -777,12 +1057,55 @@ export async function transformToFrontendGame(
   const seedNum = game.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
   const mockTraders = 50 + (seedNum % 500);
   
-  // Determine if game is ended (explicit flag, market closed, or 4 hours past endDate)
+  // Determine if game is ended (explicit flag, market closed, or end_date + grace)
   const gameEnded = isGameEnded(game);
   
   // Show scores for both live AND ended games (if available)
   const showScores = game.live || gameEnded;
-  
+
+  // Detect UFC fights where "teams" are fighters and names can often be
+  // reconstructed from event metadata instead of generic team names.
+  const isUfc =
+    (game.sport && game.sport.toLowerCase() === 'ufc') ||
+    (game.league && game.league.toLowerCase() === 'ufc');
+
+  const rawAwayId = game.teamIdentifiers?.away ?? '';
+  const rawHomeId = game.teamIdentifiers?.home ?? '';
+
+  // For UFC and Tennis, try to parse full participant names from description first (event or market),
+  // then fall back to title-derived names or identifiers.
+  let descNames: { away?: string; home?: string } = {};
+  if (isUfc || isTennis) {
+    const rawDesc =
+      (game.description as string | undefined) ||
+      (game.rawData && (game.rawData as any).description as string | undefined) ||
+      '';
+    let effectiveDesc = rawDesc;
+
+    if (!effectiveDesc && Array.isArray((game.rawData as any)?.markets)) {
+      const withDesc = (game.rawData as any).markets.find(
+        (m: any) => typeof m.description === 'string' && m.description.trim().length > 0
+      );
+      if (withDesc) {
+        effectiveDesc = withDesc.description;
+      }
+    }
+
+    if (effectiveDesc) {
+      descNames = extractFullNamesFromDescription(effectiveDesc);
+    }
+  }
+
+  // UFC: prefer Ball Don't Lie display name from DB, fallback to current method
+  const ufcAwayIdentifier = descNames.away || titleTeams.away || rawAwayId || awayTeam?.name || '';
+  const ufcHomeIdentifier = descNames.home || titleTeams.home || rawHomeId || homeTeam?.name || '';
+  const ufcAwayAbbr = slugAbbrevs.away || awayTeam?.abbreviation || rawAwayId;
+  const ufcHomeAbbr = slugAbbrevs.home || homeTeam?.abbreviation || rawHomeId;
+  const ufcAwayName =
+    isUfc ? (getFighterDisplayName(ufcAwayIdentifier) || getFighterDisplayName(ufcAwayAbbr) || null) : null;
+  const ufcHomeName =
+    isUfc ? (getFighterDisplayName(ufcHomeIdentifier) || getFighterDisplayName(ufcHomeAbbr) || null) : null;
+
   // Build frontend game
   const frontendGame: FrontendGame = {
     id: game.id,
@@ -790,18 +1113,58 @@ export async function transformToFrontendGame(
     time: formatGameTime(endDateStr), // Display-friendly time from endDate
     volume: formatVolume(game.totalVolume || game.volume),
     awayTeam: {
-      abbr: awayTeam?.abbreviation || slugAbbrevs.away || game.teamIdentifiers?.away?.substring(0, 3).toUpperCase() || titleTeams.away?.substring(0, 3).toUpperCase() || 'AWY',
-      name: awayTeam?.name || game.teamIdentifiers?.away || titleTeams.away || 'Away Team',
-      record: awayTeam?.record || '0-0',
+      abbr: isUfc
+        ? (
+            slugAbbrevs.away ||
+            (awayTeam?.abbreviation && awayTeam.abbreviation.toUpperCase()) ||
+            rawAwayId.toUpperCase() ||
+            (titleTeams.away && titleTeams.away.replace(/\s+/g, '').slice(0, 6).toUpperCase()) ||
+            'AWY'
+          )
+        : (
+            awayTeam?.abbreviation ||
+            slugAbbrevs.away ||
+            (rawAwayId && rawAwayId.substring(0, 3).toUpperCase()) ||
+            (titleTeams.away && titleTeams.away.substring(0, 3).toUpperCase()) ||
+            'AWY'
+          ),
+      name: isUfc
+        ? (ufcAwayName || descNames.away || titleTeams.away || rawAwayId || awayTeam?.name || 'Away Fighter')
+        : isTennis
+        ? (descNames.away || cleanTennisTeamName(awayTeam?.name) || cleanTennisTeamName(rawAwayId) || cleanTennisTeamName(titleTeams.away) || 'Away Player')
+        : (awayTeam?.name || rawAwayId || titleTeams.away || 'Away Team'),
+      record: isUfc
+        ? getFighterRecord(ufcAwayName || descNames.away || titleTeams.away || rawAwayId || awayTeam?.name || '')
+        : (awayTeam?.record || '0-0'),
       probability: prices.awayProb,  // Raw YES probability (e.g., 35.5)
       buyPrice: prices.awayBuy,      // YES price rounded up (e.g., 36)
       sellPrice: prices.awaySell,    // NO price rounded up (e.g., 65)
       score: showScores ? scores.away : undefined,
     },
     homeTeam: {
-      abbr: homeTeam?.abbreviation || slugAbbrevs.home || game.teamIdentifiers?.home?.substring(0, 3).toUpperCase() || titleTeams.home?.substring(0, 3).toUpperCase() || 'HME',
-      name: homeTeam?.name || game.teamIdentifiers?.home || titleTeams.home || 'Home Team',
-      record: homeTeam?.record || '0-0',
+      abbr: isUfc
+        ? (
+            slugAbbrevs.home ||
+            (homeTeam?.abbreviation && homeTeam.abbreviation.toUpperCase()) ||
+            rawHomeId.toUpperCase() ||
+            (titleTeams.home && titleTeams.home.replace(/\s+/g, '').slice(0, 6).toUpperCase()) ||
+            'HME'
+          )
+        : (
+            homeTeam?.abbreviation ||
+            slugAbbrevs.home ||
+            (rawHomeId && rawHomeId.substring(0, 3).toUpperCase()) ||
+            (titleTeams.home && titleTeams.home.substring(0, 3).toUpperCase()) ||
+            'HME'
+          ),
+      name: isUfc
+        ? (ufcHomeName || descNames.home || titleTeams.home || rawHomeId || homeTeam?.name || 'Home Fighter')
+        : isTennis
+        ? (descNames.home || cleanTennisTeamName(homeTeam?.name) || cleanTennisTeamName(rawHomeId) || cleanTennisTeamName(titleTeams.home) || 'Home Player')
+        : (homeTeam?.name || rawHomeId || titleTeams.home || 'Home Team'),
+      record: isUfc
+        ? getFighterRecord(ufcHomeName || descNames.home || titleTeams.home || rawHomeId || homeTeam?.name || '')
+        : (homeTeam?.record || '0-0'),
       probability: prices.homeProb,  // Raw YES probability (e.g., 64.5)
       buyPrice: prices.homeBuy,      // YES price rounded up (e.g., 65)
       sellPrice: prices.homeSell,    // NO price rounded up (e.g., 36)

@@ -40,16 +40,17 @@ export const pool: Pool = (() => {
       
       poolInstance = new Pool({
         connectionString,
-        // Reduced pool size to prevent connection exhaustion during startup
-        // PgBouncer will handle the actual PostgreSQL connection pooling
-        max: 50, // taken to 100 to allow more concurrent flow and less delay in updates
+        // Per-worker pool size. 4 workers × 50 = 200 connections to PgBouncer.
+        // Override with DATABASE_POOL_MAX if needed.
+        max: 200,
+        min:20,
         idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 5000, // Reduced from 10s to 5s to fail faster
-        // Add retry logic and better error handling
+        connectionTimeoutMillis: 15000,  // Increased for high load
         allowExitOnIdle: false,
-        // Keep connections alive
         keepAlive: true,
         keepAliveInitialDelayMillis: 10000,
+        // Add connection queue management
+        maxUses: 7500, 
         // Note: statement_timeout removed from Pool config - PgBouncer doesn't support it as a startup parameter
         // We set it via SQL query after connection instead (see poolInstance.on('connect') below)
         // Also ensure no options object is passed that might include statement_timeout

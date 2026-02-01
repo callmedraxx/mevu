@@ -7,8 +7,15 @@ import WebSocket from 'ws';
 import { WebSocketServer } from 'ws';
 import { Server as HttpServer } from 'http';
 import { logger } from '../../config/logger';
-import { LiveGame, getAllLiveGames, liveGamesService, filterOutEndedLiveGames, isLiveGameEnded } from './live-games.service';
+import { LiveGame, getAllLiveGames, liveGamesService, filterOutEndedLiveGames } from './live-games.service';
 import { transformToFrontendGames, transformToFrontendGame, FrontendGame } from './frontend-game.transformer';
+import { getFrontendGamesFromDatabase } from './frontend-games.service';
+import {
+  initRedisGamesBroadcast,
+  subscribeToGamesBroadcast,
+  publishGamesBroadcast,
+  isRedisGamesBroadcastReady,
+} from '../redis-games-broadcast.service';
 
 // Message types for WebSocket communication
 interface WSMessage {
@@ -29,6 +36,7 @@ export class GamesWebSocketService {
   private clients: Set<WebSocket> = new Set();
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private isInitialized: boolean = false;
+  private redisUnsubscribe: (() => void) | null = null;
 
   private wsPath: string = '/ws/games';
   
@@ -70,12 +78,38 @@ export class GamesWebSocketService {
 
     this.setupEventHandlers();
     this.setupBroadcastCallbacks();
+    this.setupRedisBroadcast();
     this.startHeartbeat();
     this.isInitialized = true;
 
     logger.info({ 
       message: 'Games WebSocket server initialized',
       path,
+    });
+  }
+
+  /**
+   * Subscribe to Redis for cluster-wide broadcasts. When we receive a message,
+   * broadcast to our local WebSocket clients.
+   */
+  private setupRedisBroadcast(): void {
+    if (!initRedisGamesBroadcast()) return;
+
+    this.redisUnsubscribe = subscribeToGamesBroadcast((msg) => {
+      try {
+        if ((msg as { type?: string }).type === 'batch') {
+          const arr = JSON.parse(msg.payload) as WSMessage[];
+          for (const p of arr) this.broadcast(p);
+        } else {
+          const parsed = JSON.parse(msg.payload);
+          this.broadcast(parsed);
+        }
+      } catch (err) {
+        logger.warn({
+          message: 'Failed to parse Redis broadcast payload',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     });
   }
 
@@ -179,14 +213,15 @@ export class GamesWebSocketService {
    */
   private async sendInitialData(ws: WebSocket): Promise<void> {
     try {
-      const allGames = await getAllLiveGames();
-      // Filter out ended games for initial data
-      const games = filterOutEndedLiveGames(allGames);
-      const frontendGames = await transformToFrontendGames(games);
+      const result = await getFrontendGamesFromDatabase({
+        includeEnded: 'false',
+        page: 1,
+        limit: 1000,
+      });
       
       this.sendToClient(ws, {
         type: 'initial',
-        games: frontendGames,
+        games: result.games,
         timestamp: new Date().toISOString(),
       });
 
@@ -229,24 +264,22 @@ export class GamesWebSocketService {
    * Broadcast full games update to all connected clients
    */
   async broadcastGamesUpdate(games: LiveGame[]): Promise<void> {
-    if (this.clients.size === 0) return;
+    if (this.clients.size === 0 && !isRedisGamesBroadcastReady()) return;
 
     try {
-      // Filter out ended games before broadcasting
       const activeGames = filterOutEndedLiveGames(games);
       const frontendGames = await transformToFrontendGames(activeGames);
-      
-      this.broadcast({
+      const message: WSMessage = {
         type: 'games_update',
         games: frontendGames,
         timestamp: new Date().toISOString(),
-      });
+      };
 
-      // logger.debug({
-      //   message: 'Broadcasted games update to WebSocket clients',
-      //   clientCount: this.clients.size,
-      //   gameCount: games.length,
-      // });
+      if (isRedisGamesBroadcastReady()) {
+        await publishGamesBroadcast({ type: 'games_update', payload: JSON.stringify(message) });
+      } else {
+        this.broadcast(message);
+      }
     } catch (error) {
       logger.error({
         message: 'Error broadcasting games update',
@@ -259,22 +292,21 @@ export class GamesWebSocketService {
    * Broadcast single game update to all connected clients (partial update)
    */
   async broadcastGameUpdate(game: LiveGame): Promise<void> {
-    if (this.clients.size === 0) return;
+    if (this.clients.size === 0 && !isRedisGamesBroadcastReady()) return;
 
     try {
       const frontendGame = await transformToFrontendGame(game);
-      
-      this.broadcast({
+      const message: WSMessage = {
         type: 'game_update',
         game: frontendGame,
         timestamp: new Date().toISOString(),
-      });
+      };
 
-      // logger.debug({
-      //   message: 'Broadcasted game update to WebSocket clients',
-      //   clientCount: this.clients.size,
-      //   gameId: game.id,
-      // });
+      if (isRedisGamesBroadcastReady()) {
+        await publishGamesBroadcast({ type: 'game_update', payload: JSON.stringify(message) });
+      } else {
+        this.broadcast(message);
+      }
     } catch (error) {
       logger.error({
         message: 'Error broadcasting game update',
@@ -287,23 +319,21 @@ export class GamesWebSocketService {
    * Broadcast price update to all connected clients (fast path for real-time prices)
    */
   async broadcastPriceUpdate(game: LiveGame): Promise<void> {
-    if (this.clients.size === 0) return;
+    if (this.clients.size === 0 && !isRedisGamesBroadcastReady()) return;
 
     try {
       const frontendGame = await transformToFrontendGame(game);
-
-      this.broadcast({
+      const message: WSMessage = {
         type: 'price_update' as any,
         game: frontendGame,
         timestamp: new Date().toISOString(),
-      });
+      };
 
-      // logger.info({
-      //   message: 'Broadcasted price update to WebSocket clients',
-      //   clientCount: this.clients.size,
-      //   gameId: game.id,
-      //   slug: game.slug,
-      // });
+      if (isRedisGamesBroadcastReady()) {
+        await publishGamesBroadcast({ type: 'price_update', payload: JSON.stringify(message) });
+      } else {
+        this.broadcast(message);
+      }
     } catch (error) {
       logger.error({
         message: 'Error broadcasting price update',
@@ -317,13 +347,19 @@ export class GamesWebSocketService {
    * This skips the transformation step entirely for maximum speed
    */
   broadcastFrontendGame(frontendGame: FrontendGame, type: 'price_update' | 'game_update' = 'price_update'): void {
-    if (this.clients.size === 0) return;
+    if (this.clients.size === 0 && !isRedisGamesBroadcastReady()) return;
 
-    this.broadcast({
+    const message: WSMessage = {
       type: type as any,
       game: frontendGame,
       timestamp: new Date().toISOString(),
-    });
+    };
+
+    if (isRedisGamesBroadcastReady()) {
+      publishGamesBroadcast({ type, payload: JSON.stringify(message) }).catch(() => {});
+    } else {
+      this.broadcast(message);
+    }
   }
 
   /**
@@ -404,6 +440,11 @@ export class GamesWebSocketService {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
+    }
+
+    if (this.redisUnsubscribe) {
+      this.redisUnsubscribe();
+      this.redisUnsubscribe = null;
     }
 
     // Notify clients of shutdown

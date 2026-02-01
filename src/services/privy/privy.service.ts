@@ -49,9 +49,11 @@ class PrivyService {
 
   /**
    * Initialize the Privy service
-   * Validates configuration and sets up PrivyClient SDK
+   * Validates configuration and sets up PrivyClient SDK.
+   * Idempotent: safe to call multiple times.
    */
   initialize(): void {
+    if (this.initialized) return;
     const validation = validatePrivyConfig();
     
     if (!validation.valid) {
