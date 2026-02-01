@@ -9,12 +9,16 @@ import { ClobOrderBookUpdate, ClobWebSocketMessage } from './polymarket.types';
 
 const CLOB_WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
+/** Interval (ms) for client-side ping to prevent idle timeout (1006) */
+const PING_INTERVAL_MS = 25_000;
+
 export class ClobWebSocketService {
   private ws: WebSocket | null = null;
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 10;
   private reconnectDelay: number = 5000; // Start with 5 seconds
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private pingInterval: NodeJS.Timeout | null = null;
   private isConnecting: boolean = false;
   private isConnected: boolean = false;
   private messageHistory: ClobWebSocketMessage[] = [];
@@ -76,16 +80,14 @@ export class ClobWebSocketService {
       this.isConnecting = false;
       this.isConnected = true;
       this.reconnectAttempts = 0;
-      
+
+      this.clearPingInterval();
+      this.pingInterval = setInterval(() => this.ping(), PING_INTERVAL_MS);
+
       logger.info({
         message: 'CLOB WebSocket connected',
         url: CLOB_WS_URL,
       });
-
-      // Log that we're ready to receive messages
-      // logger.info({
-//         message: 'Waiting for initial messages from server...',
-//       });
     });
 
     this.ws.on('message', (data: WebSocket.Data) => {
@@ -110,6 +112,7 @@ export class ClobWebSocketService {
     });
 
     this.ws.on('close', (code: number, reason: Buffer) => {
+      this.clearPingInterval();
       this.isConnected = false;
       this.isConnecting = false;
 
@@ -411,20 +414,25 @@ export class ClobWebSocketService {
   }
 
 
+  private clearPingInterval(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+  }
+
   /**
    * Disconnect from WebSocket
    */
   disconnect(): void {
+    this.clearPingInterval();
     if (this.ws) {
-      // logger.info({
-//         message: 'Disconnecting from CLOB WebSocket',
-//       });
       this.ws.close(1000, 'Client disconnect');
       this.ws = null;
     }
     this.isConnected = false;
     this.isConnecting = false;
-    
+
     // Clear reconnect timer if any
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);

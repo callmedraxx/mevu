@@ -12,6 +12,20 @@ import { PolymarketTrade, StoredTrade } from './trades.types';
 
 const DATA_API_BASE_URL = 'https://data-api.polymarket.com';
 
+/** In-memory cache for trades by game (avoids DB on repeated requests) */
+const TRADES_CACHE_TTL_MS = 10_000; // 10 seconds
+const tradesCache = new Map<string, { data: StoredTrade[]; expires: number }>();
+
+function getTradesCacheKey(gameId: string, limit: number): string {
+  return `trades:${gameId}:${limit}`;
+}
+
+function invalidateTradesCacheForGame(gameId: string): void {
+  for (const key of tradesCache.keys()) {
+    if (key.startsWith(`trades:${gameId}:`)) tradesCache.delete(key);
+  }
+}
+
 /**
  * Extract all market conditionIds from a game
  * Similar to holders.service.ts extractAllMarketConditionIds()
@@ -136,76 +150,63 @@ export async function storeTrades(trades: PolymarketTrade[], gameId: string): Pr
     return;
   }
 
-  const client = await pool.connect();
+  if (trades.length === 0) return;
 
+  // Build bulk insert query and values before acquiring connection
+  const values: any[] = [];
+  const placeholders: string[] = [];
+  let paramIndex = 1;
+
+  for (const trade of trades) {
+    const rowPlaceholders: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      rowPlaceholders.push(`$${paramIndex++}`);
+    }
+    rowPlaceholders.push('CURRENT_TIMESTAMP');
+    placeholders.push(`(${rowPlaceholders.join(', ')})`);
+
+    values.push(
+      trade.proxyWallet,
+      trade.side,
+      trade.asset,
+      trade.conditionId,
+      trade.size,
+      trade.price,
+      trade.timestamp,
+      trade.title,
+      trade.slug,
+      trade.icon,
+      trade.eventSlug,
+      trade.outcome,
+      trade.outcomeIndex,
+      trade.name,
+      trade.pseudonym,
+      trade.bio,
+      trade.profileImage,
+      trade.profileImageOptimized,
+      trade.transactionHash,
+      gameId,
+    );
+  }
+
+  const insertQuery = `
+    INSERT INTO trades (
+      proxy_wallet, side, asset, condition_id, size, price, timestamp,
+      title, slug, icon, event_slug, outcome, outcome_index,
+      name, pseudonym, bio, profile_image, profile_image_optimized,
+      transaction_hash, game_id, created_at
+    )
+    VALUES ${placeholders.join(', ')}
+    ON CONFLICT (transaction_hash) DO NOTHING
+  `;
+
+  // Acquire connection only when about to write
+  const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    if (trades.length === 0) {
-      await client.query('COMMIT');
-      return;
-    }
-
-    // Build bulk insert query with multiple VALUES
-    const values: any[] = [];
-    const placeholders: string[] = [];
-    let paramIndex = 1;
-
-    for (const trade of trades) {
-      const rowPlaceholders: string[] = [];
-      for (let i = 0; i < 20; i++) {
-        rowPlaceholders.push(`$${paramIndex++}`);
-      }
-      rowPlaceholders.push('CURRENT_TIMESTAMP');
-      placeholders.push(`(${rowPlaceholders.join(', ')})`);
-      
-      values.push(
-        trade.proxyWallet,
-        trade.side,
-        trade.asset,
-        trade.conditionId,
-        trade.size,
-        trade.price,
-        trade.timestamp,
-        trade.title,
-        trade.slug,
-        trade.icon,
-        trade.eventSlug,
-        trade.outcome,
-        trade.outcomeIndex,
-        trade.name,
-        trade.pseudonym,
-        trade.bio,
-        trade.profileImage,
-        trade.profileImageOptimized,
-        trade.transactionHash,
-        gameId,
-      );
-    }
-
-    const insertQuery = `
-      INSERT INTO trades (
-        proxy_wallet, side, asset, condition_id, size, price, timestamp,
-        title, slug, icon, event_slug, outcome, outcome_index,
-        name, pseudonym, bio, profile_image, profile_image_optimized,
-        transaction_hash, game_id, created_at
-      )
-      VALUES ${placeholders.join(', ')}
-      ON CONFLICT (transaction_hash) DO NOTHING
-    `;
-
-    const result = await client.query(insertQuery, values);
-    const insertedCount = result.rowCount || 0;
-
+    await client.query(insertQuery, values);
     await client.query('COMMIT');
-
-    // logger.info({
-    //   message: 'Trades stored in database',
-    //   gameId,
-    //   totalTrades: trades.length,
-    //   insertedCount,
-    //   skippedCount: trades.length - insertedCount,
-    // });
+    invalidateTradesCacheForGame(gameId);
   } catch (error) {
     try {
       await client.query('ROLLBACK');
@@ -220,7 +221,6 @@ export async function storeTrades(trades: PolymarketTrade[], gameId: string): Pr
       gameId,
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined,
-      // Check if it's a table doesn't exist error
       isTableMissing: error instanceof Error && error.message.includes('does not exist'),
     });
     throw error;
@@ -229,8 +229,37 @@ export async function storeTrades(trades: PolymarketTrade[], gameId: string): Pr
   }
 }
 
+function mapRowToStoredTrade(row: any): StoredTrade {
+  return {
+    id: row.id,
+    proxyWallet: row.proxy_wallet,
+    side: row.side,
+    asset: row.asset,
+    conditionId: row.condition_id,
+    size: Number(row.size),
+    price: Number(row.price),
+    timestamp: Number(row.timestamp),
+    title: row.title,
+    slug: row.slug,
+    icon: row.icon,
+    eventSlug: row.event_slug,
+    outcome: row.outcome,
+    outcomeIndex: row.outcome_index,
+    name: row.name,
+    pseudonym: row.pseudonym,
+    bio: row.bio,
+    profileImage: row.profile_image,
+    profileImageOptimized: row.profile_image_optimized,
+    transactionHash: row.transaction_hash,
+    gameId: row.game_id,
+    createdAt: new Date(row.created_at),
+  };
+}
+
 /**
  * Get trades by game ID from database
+ * Uses in-memory cache (10s TTL) to avoid DB on repeated requests.
+ * Cache is invalidated when storeTrades writes for that game.
  */
 export async function getTradesByGameId(gameId: string, limit: number = 100): Promise<StoredTrade[]> {
   const isProduction = process.env.NODE_ENV === 'production';
@@ -243,10 +272,14 @@ export async function getTradesByGameId(gameId: string, limit: number = 100): Pr
     return [];
   }
 
-  const client = await pool.connect();
+  const cacheKey = getTradesCacheKey(gameId, limit);
+  const cached = tradesCache.get(cacheKey);
+  if (cached && Date.now() < cached.expires) {
+    return cached.data;
+  }
 
   try {
-    const result = await client.query(
+    const result = await pool.query(
       `SELECT 
         id, proxy_wallet, side, asset, condition_id,
         size, price, timestamp, title, slug, icon, event_slug,
@@ -260,42 +293,21 @@ export async function getTradesByGameId(gameId: string, limit: number = 100): Pr
       [gameId, limit]
     );
 
-    return result.rows.map(row => ({
-      id: row.id,
-      proxyWallet: row.proxy_wallet,
-      side: row.side,
-      asset: row.asset,
-      conditionId: row.condition_id,
-      size: Number(row.size),
-      price: Number(row.price),
-      timestamp: Number(row.timestamp),
-      title: row.title,
-      slug: row.slug,
-      icon: row.icon,
-      eventSlug: row.event_slug,
-      outcome: row.outcome,
-      outcomeIndex: row.outcome_index,
-      name: row.name,
-      pseudonym: row.pseudonym,
-      bio: row.bio,
-      profileImage: row.profile_image,
-      profileImageOptimized: row.profile_image_optimized,
-      transactionHash: row.transaction_hash,
-      gameId: row.game_id,
-      createdAt: new Date(row.created_at),
-    }));
+    const rows = result.rows.map(mapRowToStoredTrade);
+    tradesCache.set(cacheKey, {
+      data: rows,
+      expires: Date.now() + TRADES_CACHE_TTL_MS,
+    });
+    return rows;
   } catch (error) {
     logger.error({
       message: 'Error fetching trades from database',
       gameId,
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined,
-      // Check if it's a table doesn't exist error
       isTableMissing: error instanceof Error && error.message.includes('does not exist'),
     });
     throw error;
-  } finally {
-    client.release();
   }
 }
 

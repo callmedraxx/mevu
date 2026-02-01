@@ -106,10 +106,12 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
         sport: game.sport,
       });
       
-      // Use a longer timeout for European soccer leagues which require extra API calls
-      // (rosters endpoint for player names/positions)
-      const isSoccerLeague = ['epl', 'lal', 'laliga', 'ser', 'seriea', 'bund', 'bundesliga', 'lig', 'ligue1'].includes(game.sport?.toLowerCase() || '');
-      const timeoutMs = isSoccerLeague ? 15000 : 8000; // 15 seconds for soccer, 8 for others
+      // Use a longer timeout for European soccer leagues (rosters for player names)
+      // and for tennis (ATP/WTA match_stats API)
+      const sport = game.sport?.toLowerCase() || '';
+      const isSoccerLeague = ['epl', 'lal', 'laliga', 'ser', 'seriea', 'bund', 'bundesliga', 'lig', 'ligue1'].includes(sport);
+      const isTennis = ['tennis', 'atp', 'wta'].includes(sport);
+      const timeoutMs = isSoccerLeague || isTennis ? 15000 : 8000; // 15 seconds for soccer/tennis, 8 for others
       
       // Always call fetchAndStorePlayerStats - it handles 5-minute caching internally
       // This ensures live game stats are refreshed when they become stale

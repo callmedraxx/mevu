@@ -1280,6 +1280,20 @@ async function getLiveGamesCount(): Promise<number> {
   return inMemoryGames.size;
 }
 
+function sortGamesForGetAll(games: LiveGame[]): LiveGame[] {
+  return [...games].sort((a, b) => {
+    const aLive = a.live === true ? 0 : 1;
+    const bLive = b.live === true ? 0 : 1;
+    if (aLive !== bLive) return aLive - bLive;
+    const aVol = (a as any).volume24hr ?? (a as any).volume ?? 0;
+    const bVol = (b as any).volume24hr ?? (b as any).volume ?? 0;
+    if (bVol !== aVol) return bVol - aVol;
+    const aCreated = (a as any).createdAt ? new Date((a as any).createdAt).getTime() : 0;
+    const bCreated = (b as any).createdAt ? new Date((b as any).createdAt).getTime() : 0;
+    return bCreated - aCreated;
+  });
+}
+
 /** Get cached games for broadcast (avoids DB fetch after storeGames) */
 function getCachedGamesForBroadcast(): LiveGame[] {
   const isProduction = process.env.NODE_ENV === 'production';
@@ -1377,6 +1391,17 @@ export async function getLiveGameBySlug(slug: string): Promise<LiveGame | null> 
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (isProduction) {
+    // Check cache first (avoids DB when game is already cached)
+    for (const game of gamesCache.values()) {
+      const slugMatch = game.slug?.toLowerCase() === target;
+      const tickerMatch = game.ticker?.toLowerCase() === target;
+      const idMatch = game.id?.toLowerCase() === target;
+      const rawSlugMatch = game.rawData?.slug && String(game.rawData.slug).toLowerCase() === target;
+      if (slugMatch || tickerMatch || idMatch || rawSlugMatch) {
+        ensureLiveEndedConsistency(game);
+        return game;
+      }
+    }
     const game = await getLiveGameBySlugFromDatabase(target);
     if (game) {
       gamesCache.set(game.id, game);
@@ -1731,6 +1756,9 @@ async function flushSportsGameUpdates(): Promise<void> {
 
   if (toWrite.length === 0) return;
 
+  // Sort by eventId so all writers acquire row locks in same order (prevents deadlock)
+  toWrite.sort((a, b) => a.eventId.localeCompare(b.eventId));
+
   // 2. Build single bulk UPDATE (VALUES + UPDATE ... FROM)
   const valueRows: string[] = [];
   const allValues: unknown[] = [];
@@ -1786,7 +1814,8 @@ async function flushSportsGameUpdates(): Promise<void> {
     toWrite.map(({ game }) => transformToFrontendGame(game))
   );
 
-  // 4. Connect only when ready to write
+  // 4. Acquire write lock (serializes with CLOB flush - prevents deadlock)
+  await acquireLiveGamesWriteLock();
   const client = await pool.connect();
 
   try {
@@ -1794,17 +1823,31 @@ async function flushSportsGameUpdates(): Promise<void> {
     await bulkUpsertFrontendGamesWithClient(client, frontendGames);
     clearFrontendGamesCache();
   } catch (error) {
+    const isDeadlock = error instanceof Error && /deadlock detected/i.test(error.message);
     logger.error({
       message: 'Error flushing sports game updates',
       error: error instanceof Error ? error.message : String(error),
+      isDeadlock,
     });
     for (const [gameId, data] of pending) {
       if (!sportsGameUpdateQueue.has(gameId)) {
         sportsGameUpdateQueue.set(gameId, data);
       }
     }
+    if (isDeadlock && pending.size > 0 && !sportsGameUpdateFlushTimer) {
+      sportsGameUpdateFlushTimer = setTimeout(() => {
+        sportsGameUpdateFlushTimer = null;
+        flushSportsGameUpdates().catch((err) =>
+          logger.warn({
+            message: 'Error retrying sports game flush',
+            error: err instanceof Error ? err.message : String(err),
+          })
+        );
+      }, 500);
+    }
   } finally {
     client.release();
+    releaseLiveGamesWriteLock();
   }
 }
 

@@ -13,7 +13,9 @@
     "swagger": "swagger-jsdoc -d swaggerDef.js src/routes/*.ts -o swagger.json",
     "download-logos": "tsx src/scripts/download-logos.ts",
     "test-teams-storage": "tsx src/scripts/test-teams-storage.ts",
-    "loadtest:games-frontend": "tsx src/scripts/load-test-games-frontend.ts"
+    "loadtest:games-frontend": "tsx src/scripts/load-test-games-frontend.ts",
+    "debug:ufc-moneyline": "tsx scripts/debug-ufc-moneyline.ts",
+    "debug:ufc-moneyline:docker": "bash scripts/run-debug-ufc-moneyline.sh"
   },
   "keywords": [],
   "author": "",

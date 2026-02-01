@@ -9,6 +9,11 @@ import { logger } from '../../config/logger';
 
 const DATA_API_URL = 'https://data-api.polymarket.com';
 
+/** In-memory cache for whale profiles (avoids re-fetching same wallet) */
+const WHALE_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+const whaleProfileCache = new Map<string, { data: WhaleProfileResponse; expires: number }>();
+const whaleStatsCache = new Map<string, { data: { success: boolean; stats?: WhaleStats }; expires: number }>();
+
 // ==================== Types ====================
 
 /**
@@ -269,42 +274,56 @@ function isValidAddress(address: string): boolean {
 // ==================== API Fetchers ====================
 
 /**
- * Fetch all trades for a wallet (paginated)
+ * Fetch a single page of trades
+ */
+async function fetchTradesPage(
+  wallet: string,
+  limit: number,
+  offset: number
+): Promise<PolymarketTrade[]> {
+  const response = await axios.get<PolymarketTrade[]>(`${DATA_API_URL}/trades`, {
+    params: { user: wallet, limit, offset },
+    timeout: 15000,
+  });
+  return response.data || [];
+}
+
+/**
+ * Fetch all trades for a wallet (parallel page fetches)
+ * Fetches up to maxTrades by requesting pages in parallel instead of sequentially.
  */
 async function fetchAllTrades(wallet: string, maxTrades: number = 1000): Promise<PolymarketTrade[]> {
-  const allTrades: PolymarketTrade[] = [];
   const pageSize = 100;
-  let offset = 0;
-  
-  while (allTrades.length < maxTrades) {
-    try {
-      const response = await axios.get<PolymarketTrade[]>(`${DATA_API_URL}/trades`, {
-        params: {
-          user: wallet,
-          limit: pageSize,
-          offset,
-        },
-        timeout: 15000,
-      });
-      
-      const trades = response.data || [];
-      if (trades.length === 0) break;
-      
-      allTrades.push(...trades);
-      offset += pageSize;
-      
-      if (trades.length < pageSize) break;
-    } catch (error) {
+  const numPages = Math.ceil(maxTrades / pageSize);
+
+  const pagePromises = Array.from({ length: numPages }, (_, i) =>
+    fetchTradesPage(wallet, pageSize, i * pageSize)
+  );
+
+  const results = await Promise.allSettled(pagePromises);
+
+  const allTrades: PolymarketTrade[] = [];
+  const seen = new Set<string>();
+
+  for (const result of results) {
+    if (result.status === 'rejected') {
       logger.warn({
         message: 'Error fetching trades page',
         wallet,
-        offset,
-        error: error instanceof Error ? error.message : String(error),
+        error: result.reason instanceof Error ? result.reason.message : String(result.reason),
       });
-      break;
+      continue;
     }
+    for (const trade of result.value) {
+      if (trade?.transactionHash && !seen.has(trade.transactionHash)) {
+        seen.add(trade.transactionHash);
+        allTrades.push(trade);
+      }
+    }
+    if (result.value.length < pageSize) break;
   }
-  
+
+  allTrades.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
   return allTrades;
 }
 
@@ -534,12 +553,18 @@ export async function getWhaleProfile(wallet: string): Promise<WhaleProfileRespo
   }
   
   const normalizedWallet = wallet.toLowerCase();
-  
+
+  const cacheKey = `profile:${normalizedWallet}`;
+  const cached = whaleProfileCache.get(cacheKey);
+  if (cached && Date.now() < cached.expires) {
+    return cached.data;
+  }
+
   logger.info({
     message: 'Fetching whale profile',
     wallet: normalizedWallet,
   });
-  
+
   try {
     // Fetch trades and positions in parallel
     const [trades, positions] = await Promise.all([
@@ -556,7 +581,7 @@ export async function getWhaleProfile(wallet: string): Promise<WhaleProfileRespo
     
     // Check if wallet has any activity
     if (trades.length === 0 && positions.length === 0) {
-      return {
+      const emptyResponse: WhaleProfileResponse = {
         success: true,
         stats: {
           wallet: normalizedWallet,
@@ -575,6 +600,11 @@ export async function getWhaleProfile(wallet: string): Promise<WhaleProfileRespo
         pnlChart: [],
         volumeBySport: [],
       };
+      whaleProfileCache.set(cacheKey, {
+        data: emptyResponse,
+        expires: Date.now() + WHALE_CACHE_TTL_MS,
+      });
+      return emptyResponse;
     }
     
     // Calculate and transform data
@@ -583,8 +613,8 @@ export async function getWhaleProfile(wallet: string): Promise<WhaleProfileRespo
     const recentTrades = transformTrades(trades);
     const pnlChart = generatePnlChart(positions);
     const volumeBySport = calculateVolumeBySport(trades);
-    
-    return {
+
+    const response: WhaleProfileResponse = {
       success: true,
       stats,
       positions: transformedPositions,
@@ -592,6 +622,11 @@ export async function getWhaleProfile(wallet: string): Promise<WhaleProfileRespo
       pnlChart,
       volumeBySport,
     };
+    whaleProfileCache.set(cacheKey, {
+      data: response,
+      expires: Date.now() + WHALE_CACHE_TTL_MS,
+    });
+    return response;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     
@@ -620,20 +655,29 @@ export async function getWhaleStats(wallet: string): Promise<{ success: boolean;
   if (!isValidAddress(wallet)) {
     return { success: false, error: 'Invalid wallet address format' };
   }
-  
+
   const normalizedWallet = wallet.toLowerCase();
-  
+  const cacheKey = `stats:${normalizedWallet}`;
+  const cached = whaleStatsCache.get(cacheKey);
+  if (cached && Date.now() < cached.expires) {
+    return cached.data;
+  }
+
   try {
     const [trades, positions] = await Promise.all([
       fetchAllTrades(normalizedWallet, 200),
       fetchPositions(normalizedWallet),
     ]);
-    
-    const stats = calculateStats(normalizedWallet, trades, positions);
-    return { success: true, stats };
+
+    const result = { success: true as const, stats: calculateStats(normalizedWallet, trades, positions) };
+    whaleStatsCache.set(cacheKey, {
+      data: result,
+      expires: Date.now() + WHALE_CACHE_TTL_MS,
+    });
+    return result;
   } catch (error) {
-    return { 
-      success: false, 
+    return {
+      success: false,
       error: error instanceof Error ? error.message : String(error),
     };
   }

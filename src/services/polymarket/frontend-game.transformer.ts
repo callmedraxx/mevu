@@ -395,10 +395,16 @@ interface TeamOutcome {
  * The moneyline market has structuredOutcomes with team names, not Over/Under
  */
 function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: TeamOutcome | null } {
-  if (!game.markets || game.markets.length === 0) {
+  // Use game.markets; for UFC, fall back to rawData.markets when game.markets is empty
+  const markets = game.markets && game.markets.length > 0
+    ? game.markets
+    : ((game.sport?.toLowerCase() === 'ufc' || game.league?.toLowerCase() === 'ufc') && (game.rawData as any)?.markets?.length > 0
+      ? (game.rawData as any).markets
+      : []);
+  if (markets.length === 0) {
     return { home: null, away: null };
   }
-  
+
   // Get team identifiers to match - try multiple sources
   let homeTeamName = game.homeTeam?.name?.toLowerCase() || game.teamIdentifiers?.home?.toLowerCase() || '';
   let awayTeamName = game.awayTeam?.name?.toLowerCase() || game.teamIdentifiers?.away?.toLowerCase() || '';
@@ -469,10 +475,13 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
   let homeWinMarket: { price: number } | null = null;
   let awayWinMarket: { price: number } | null = null;
   
-  for (const market of game.markets) {
+  for (const market of markets) {
     const question = (market.question || '').toLowerCase();
-    
-    // Check if this is a "Will X win?" market
+
+    // Exclude prop markets: "Will X win by KO/TKO/submission?" - only match main "Will X win?"
+    if (question.includes('win by') || question.includes(' by ko') || question.includes(' by tko') || question.includes('by submission')) continue;
+
+    // Check if this is a "Will X win?" market (main match outcome, not props)
     if (question.includes('will') && question.includes('win')) {
       // Prefer raw outcomePrices as they're more reliable
       let yesPrice: number | null = null; // Use null to indicate "not found"
@@ -547,7 +556,7 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
   };
 
   // Look through markets to find the moneyline (team vs team) market
-  for (const market of game.markets) {
+  for (const market of markets) {
     let outcomes: any[] | null = null;
     const structuredOutcomes = market.structuredOutcomes || [];
 
@@ -679,8 +688,8 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
   }
 
   // UFC fallback: first moneyline-like market (2 fighter outcomes, not Yes/No or O/U)
-  if (isUfc && game.markets.length > 0) {
-    for (const m of game.markets) {
+  if (isUfc && markets.length > 0) {
+    for (const m of markets) {
       const rawOutcomes = parseOutcomesArray(m.outcomes);
       const rawPrices = parsePricesArray(m.outcomePrices);
       if (rawOutcomes.length !== 2 || rawPrices.length !== 2) continue;

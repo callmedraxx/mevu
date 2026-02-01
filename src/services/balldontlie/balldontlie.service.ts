@@ -17,15 +17,23 @@ import { getLeagueForSport } from '../polymarket/teams.config';
 /**
  * Type for all supported Ball Don't Lie sports
  * Soccer leagues: EPL, La Liga, Serie A, Bundesliga, Ligue 1
+ * Tennis: ATP (men's), WTA (women's)
  */
 type BallDontLieSport = 'nba' | 'nfl' | 'mlb' | 'nhl' | 'epl' | 'ncaaf' | 'ncaab' | 
-  'laliga' | 'seriea' | 'bundesliga' | 'ligue1';
+  'laliga' | 'seriea' | 'bundesliga' | 'ligue1' | 'atp' | 'wta';
 
 /**
  * Check if a sport is a soccer/football league
  */
 function isSoccerSport(sport: BallDontLieSport | null): boolean {
   return sport !== null && ['epl', 'laliga', 'seriea', 'bundesliga', 'ligue1'].includes(sport);
+}
+
+/**
+ * Check if a sport is tennis (ATP or WTA)
+ */
+function isTennisSport(sport: BallDontLieSport | null): boolean {
+  return sport !== null && (sport === 'atp' || sport === 'wta');
 }
 
 /**
@@ -46,7 +54,10 @@ function convertToApiTimezone(utcDate: Date, sport: string): string {
   
   // Determine timezone based on sport
   let timezone: string;
-  if (isSoccerSport(bdSport)) {
+  if (isTennisSport(bdSport)) {
+    // Tennis tournaments are global; use UTC for date extraction
+    timezone = 'UTC';
+  } else if (isSoccerSport(bdSport)) {
     // European soccer leagues use their respective timezones
     // Most use CET (Central European Time) or GMT
     switch (bdSport) {
@@ -132,6 +143,10 @@ const SPORT_MAPPING: Record<string, BallDontLieSport | null> = {
   'ligue 1': 'ligue1',
   // UEFA Champions League
   ucl: 'ucl' as BallDontLieSport,
+  // Tennis - ATP (men's) and WTA (women's)
+  tennis: 'atp', // Default to ATP when sport is generic 'tennis'; slug (atp-*/wta-*) determines actual league
+  atp: 'atp',
+  wta: 'wta',
 };
 
 /**
@@ -154,6 +169,15 @@ function getBalldontlieSport(sport: string): BallDontLieSport | null {
  */
 export function isSportSupported(sport: string): boolean {
   return getBalldontlieSport(sport) !== null;
+}
+
+/**
+ * Resolve effective sport for Ball Don't Lie when sport is generic 'tennis'.
+ * Polymarket uses sport='tennis' for both ATP and WTA; slug (atp-*, wta-*) identifies the league.
+ */
+function getEffectiveTennisLeague(game: any): 'atp' | 'wta' {
+  const slug = (game.slug || '').toLowerCase();
+  return slug.startsWith('wta') ? 'wta' : 'atp';
 }
 
 /**
@@ -220,6 +244,10 @@ class BallDontLieClient {
         case 'ncaab':
           // NCAAB not in SDK yet, use direct API call
           return await this.getNCAABStatsDirect(gameIds);
+        case 'atp':
+        case 'wta':
+          // Tennis uses /match_stats with match_ids[] parameter
+          return await this.getTennisMatchStatsDirect(balldontlieSport, gameIds);
         default:
           throw new Error(`Unsupported sport: ${sport}`);
       }
@@ -783,6 +811,87 @@ class BallDontLieClient {
   }
 
   /**
+   * Get tennis match stats via direct API call
+   * ATP/WTA use /match_stats endpoint with match_ids[] parameter
+   */
+  private async getTennisMatchStatsDirect(league: 'atp' | 'wta', matchIds: number[]): Promise<any[]> {
+    const axios = require('axios');
+    const apiKey = getApiKey();
+
+    const params = new URLSearchParams();
+    matchIds.forEach((id) => {
+      params.append('match_ids[]', id.toString());
+    });
+
+    try {
+      const response = await axios.get(`https://api.balldontlie.io/${league}/v1/match_stats`, {
+        headers: { Authorization: apiKey },
+        params,
+      });
+      return response.data.data || [];
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        logger.warn({
+          message: `${league.toUpperCase()} match not found in Ball Don't Lie API (404)`,
+          matchIds,
+          note: 'Match may not exist or stats may not be available yet',
+        });
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get tennis matches for mapping - public method used by findAndMapBalldontlieGameId
+   * Fetches live matches when isLive, else matches for the given date
+   */
+  async getTennisMatchesForMapping(league: 'atp' | 'wta', date: string, isLive: boolean): Promise<any[]> {
+    const axios = require('axios');
+    const apiKey = getApiKey();
+
+    const params = new URLSearchParams();
+    if (isLive) {
+      params.append('is_live', 'true');
+    } else {
+      const year = new Date(date + 'T00:00:00Z').getFullYear();
+      params.append('season', year.toString());
+    }
+
+    try {
+      const response = await axios.get(`https://api.balldontlie.io/${league}/v1/matches`, {
+        headers: { Authorization: apiKey },
+        params,
+      });
+      const matches = response.data.data || [];
+
+      if (!isLive && date) {
+        const targetDate = date.split('T')[0];
+        return matches.filter((m: any) => {
+          const matchDate = m.date || m.start_date;
+          if (!matchDate) return true;
+          const d = new Date(matchDate).toISOString().split('T')[0];
+          return d === targetDate;
+        });
+      }
+      return matches;
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get tennis matches for a date (used by getGamesByDate)
+   * Fetches by season and filters by date
+   */
+  private async getTennisMatchesDirect(league: 'atp' | 'wta', date: string): Promise<any[]> {
+    return this.getTennisMatchesForMapping(league, date, false);
+  }
+
+  /**
    * Get games for a specific date
    * @param sport - Sport name (nba, nfl, mlb, nhl, epl, ncaaf, ncaab)
    * @param date - Date string (YYYY-MM-DD)
@@ -823,6 +932,10 @@ class BallDontLieClient {
         case 'ncaab':
           // NCAAB not in SDK yet, use direct API call
           return await this.getNCAABGamesDirect(date);
+        case 'atp':
+        case 'wta':
+          // Tennis uses /matches - we fetch live matches or by season+date
+          return await this.getTennisMatchesDirect(balldontlieSport, date);
         default:
           throw new Error(`Unsupported sport: ${sport}`);
       }
@@ -1199,6 +1312,7 @@ export async function storePlayerStats(
   const awayTeamNameFromTitle = titleMatch ? titleMatch[1].toLowerCase().trim() : '';
   const homeTeamNameFromTitle = titleMatch ? titleMatch[2].toLowerCase().trim() : '';
   const isNba = sport.toLowerCase() === 'nba';
+  const isTennis = sport.toLowerCase() === 'atp' || sport.toLowerCase() === 'wta';
 
   const normalizeAbbr = (abbr: string) => abbr.replace(/[^a-z0-9]/gi, '').toLowerCase();
   const normalizedHomeAbbr = normalizeAbbr(homeTeamAbbr);
@@ -1212,7 +1326,14 @@ export async function storePlayerStats(
     const normalizedStatAbbr = normalizeAbbr(statTeamAbbr);
 
     let isHome: boolean | null = null;
-    if (normalizedStatAbbr || statTeamName) {
+    if (isTennis && stat.match) {
+      // Tennis: player1 = away (isHome false), player2 = home (isHome true)
+      const playerId = stat.player?.id ?? stat.player_id;
+      const p1Id = stat.match?.player1_id ?? stat.match?.player1?.id;
+      const p2Id = stat.match?.player2_id ?? stat.match?.player2?.id;
+      if (playerId === p2Id) isHome = true;
+      else if (playerId === p1Id) isHome = false;
+    } else if (normalizedStatAbbr || statTeamName) {
       const matchesHome =
         normalizedStatAbbr === normalizedHomeAbbr ||
         (normalizedHomeAbbr && normalizedStatAbbr.includes(normalizedHomeAbbr)) ||
@@ -1237,9 +1358,9 @@ export async function storePlayerStats(
       stat.player?.first_name || null,
       stat.player?.last_name || null,
       (stat.player?.position || stat.position)?.substring(0, 50) || null,
-      stat.team?.id || stat.team_id,
-      (stat.team?.tricode || stat.team?.abbreviation)?.substring(0, 50) || null,
-      stat.team?.full_name || stat.team?.name || null,
+      (isTennis ? null : (stat.team?.id || stat.team_id)),
+      (isTennis ? null : (stat.team?.tricode || stat.team?.abbreviation)?.substring(0, 50)),
+      (isTennis ? null : (stat.team?.full_name || stat.team?.name)),
       isHome,
       isNba ? (stat.min ?? null) : null,
       isNba ? (stat.fgm ?? null) : null,
@@ -1637,6 +1758,26 @@ function extractSportStats(sport: string, stat: any): Record<string, any> {
       sportStats.sacks = stat.sacks ?? null;
       sportStats.interceptions = stat.interceptions ?? null;
       sportStats.passes_defended = stat.passes_defended ?? null;
+      break;
+
+    case 'atp':
+    case 'wta':
+      // Tennis match stats (ATP/WTA)
+      sportStats.serve_rating = stat.serve_rating ?? null;
+      sportStats.aces = stat.aces ?? null;
+      sportStats.double_faults = stat.double_faults ?? null;
+      sportStats.first_serve_pct = stat.first_serve_pct ?? null;
+      sportStats.first_serve_points_won_pct = stat.first_serve_points_won_pct ?? null;
+      sportStats.second_serve_points_won_pct = stat.second_serve_points_won_pct ?? null;
+      sportStats.break_points_saved_pct = stat.break_points_saved_pct ?? null;
+      sportStats.return_rating = stat.return_rating ?? null;
+      sportStats.first_return_won_pct = stat.first_return_won_pct ?? null;
+      sportStats.second_return_won_pct = stat.second_return_won_pct ?? null;
+      sportStats.break_points_converted_pct = stat.break_points_converted_pct ?? null;
+      sportStats.total_service_points_won_pct = stat.total_service_points_won_pct ?? null;
+      sportStats.total_return_points_won_pct = stat.total_return_points_won_pct ?? null;
+      sportStats.total_points_won_pct = stat.total_points_won_pct ?? null;
+      sportStats.set_number = stat.set_number ?? null;
       break;
 
     default:
@@ -2199,6 +2340,20 @@ async function fetchSoccerPeriodScores(
 }
 
 /**
+ * Check if two names match by last name (for tennis player matching)
+ * "Carlos Alcaraz" matches "alcaraz", "Alcaraz" matches "Carlos Alcaraz"
+ */
+function lastNameMatch(ourName: string, bdlName: string): boolean {
+  if (!ourName || !bdlName) return false;
+  const ourParts = ourName.split(/\s+/).filter(Boolean);
+  const bdlParts = bdlName.split(/\s+/).filter(Boolean);
+  const ourLast = ourParts[ourParts.length - 1];
+  const bdlLast = bdlParts[bdlParts.length - 1];
+  if (!ourLast || !bdlLast) return false;
+  return ourLast === bdlLast || ourLast.includes(bdlLast) || bdlLast.includes(ourLast);
+}
+
+/**
  * Extract team abbreviation from slug
  * Format: sport-away-home-YYYY-MM-DD (e.g., nhl-sea-ana-2025-12-22)
  */
@@ -2343,9 +2498,20 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
     //   sport: game.sport,
     // });
 
-    // Get games/matches for that date
-    const bdSport = getBalldontlieSport(game.sport);
-    let balldontlieGames = await ballDontLieClient.getGamesByDate(game.sport, dateStr);
+    // Resolve effective sport (tennis -> atp/wta from slug)
+    const effectiveSport = game.sport?.toLowerCase() === 'tennis'
+      ? getEffectiveTennisLeague(game)
+      : game.sport;
+    const bdSport = getBalldontlieSport(effectiveSport);
+
+    let balldontlieGames: any[];
+    if (isTennisSport(bdSport)) {
+      // Tennis: fetch live matches when game is live, else by date
+      const isLive = !!game.live;
+      balldontlieGames = await ballDontLieClient.getTennisMatchesForMapping(bdSport as 'atp' | 'wta', dateStr, isLive);
+    } else {
+      balldontlieGames = await ballDontLieClient.getGamesByDate(effectiveSport, dateStr);
+    }
     
     // // If no games found, this might be a timezone edge case or the game isn't scheduled yet
     // if (balldontlieGames.length === 0) {
@@ -2411,7 +2577,7 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
     //   note: isSoccerSport(bdSport) ? 'Soccer matches use home_team/away_team objects with name/short_name' : 'Other sports use team objects',
     // });
 
-    // Match by team identifiers - try multiple sources
+    // Match by team/player identifiers - try multiple sources
     const homeTeamAbbr = game.homeTeam?.abbreviation?.toLowerCase() || 
                          game.teamIdentifiers?.home?.toLowerCase() || 
                          extractTeamFromSlug(game.slug, 'home') || '';
@@ -2419,9 +2585,9 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
                          game.teamIdentifiers?.away?.toLowerCase() || 
                          extractTeamFromSlug(game.slug, 'away') || '';
     
-    // Get full team names if available (useful for soccer matching)
-    const homeTeamName = game.homeTeam?.name?.toLowerCase() || '';
-    const awayTeamName = game.awayTeam?.name?.toLowerCase() || '';
+    // Get full team/player names (for tennis, these are player names)
+    const homeTeamName = (game.homeTeam?.name || game.title?.split(/\s+vs\.?\s+/i)?.[1]?.trim() || '').toLowerCase();
+    const awayTeamName = (game.awayTeam?.name || game.title?.split(/\s+vs\.?\s+/i)?.[0]?.trim() || '').toLowerCase();
     
     // logger.info({
     //   message: 'Team identifiers for matching',
@@ -2468,6 +2634,25 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
 
     // Find matching game/match
     const matchedGame = balldontlieGames.find((bdGame: any) => {
+      // Tennis: match by player names (player1/player2)
+      if (isTennisSport(bdSport)) {
+        const p1 = bdGame.player1;
+        const p2 = bdGame.player2;
+        const bdP1Name = (p1?.full_name || `${p1?.first_name || ''} ${p1?.last_name || ''}`.trim()).toLowerCase();
+        const bdP2Name = (p2?.full_name || `${p2?.first_name || ''} ${p2?.last_name || ''}`.trim()).toLowerCase();
+
+        const normalizeName = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+        const awayNorm = normalizeName(awayTeamName);
+        const homeNorm = normalizeName(homeTeamName);
+
+        const awayMatchesP1 = awayNorm && bdP1Name && (bdP1Name.includes(awayNorm) || awayNorm.includes(bdP1Name) || lastNameMatch(awayNorm, bdP1Name));
+        const awayMatchesP2 = awayNorm && bdP2Name && (bdP2Name.includes(awayNorm) || awayNorm.includes(bdP2Name) || lastNameMatch(awayNorm, bdP2Name));
+        const homeMatchesP1 = homeNorm && bdP1Name && (bdP1Name.includes(homeNorm) || homeNorm.includes(bdP1Name) || lastNameMatch(homeNorm, bdP1Name));
+        const homeMatchesP2 = homeNorm && bdP2Name && (bdP2Name.includes(homeNorm) || homeNorm.includes(bdP2Name) || lastNameMatch(homeNorm, bdP2Name));
+
+        return (awayMatchesP1 && homeMatchesP2) || (awayMatchesP2 && homeMatchesP1);
+      }
+
       // Soccer leagues: EPL has home_team_id/away_team_id (not objects)
       if (isSoccerSport(bdSport)) {
         // Get team info from the teams map using the IDs
@@ -2794,14 +2979,20 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
         date: dateStr,
         homeTeamAbbr,
         awayTeamAbbr,
-        availableGames: balldontlieGames.map((g: any) => {
-          const awayTeam = g.away_team || g.visitor_team;
-          return {
-          id: g.id,
-          home: g.home_team?.abbreviation || g.home_team?.name,
-            away: awayTeam?.abbreviation || awayTeam?.name,
-          };
-        }),
+        availableGames: isTennisSport(bdSport)
+          ? balldontlieGames.map((g: any) => ({
+              id: g.id,
+              player1: g.player1?.full_name,
+              player2: g.player2?.full_name,
+            }))
+          : balldontlieGames.map((g: any) => {
+              const awayTeam = g.away_team || g.visitor_team;
+              return {
+                id: g.id,
+                home: g.home_team?.abbreviation || g.home_team?.name,
+                away: awayTeam?.abbreviation || awayTeam?.name,
+              };
+            }),
       });
       return null;
     }
@@ -2823,22 +3014,33 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
  * @returns Array of player stats (from database, not API)
  */
 export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
-  // logger.info({
-  //   message: 'fetchAndStorePlayerStats called',
-  //   gameId: game.id,
-  //   sport: game.sport,
-  //   startDate: game.startDate,
-  // });
+  // Resolve effective sport (tennis -> atp/wta from slug)
+  const effectiveSport = game.sport?.toLowerCase() === 'tennis'
+    ? getEffectiveTennisLeague(game)
+    : game.sport;
 
   // Check if sport is supported
-  if (!isSportSupported(game.sport)) {
+  if (!isSportSupported(effectiveSport)) {
     logger.warn({
       message: 'Sport not supported by Ball Don\'t Lie API',
       gameId: game.id,
       sport: game.sport,
-      note: `Ball Don't Lie API currently supports: NBA, NFL, MLB, NHL, EPL, NCAAF, NCAAB.`,
+      effectiveSport,
+      note: `Ball Don't Lie API supports: NBA, NFL, MLB, NHL, EPL, NCAAF, NCAAB, ATP, WTA.`,
     });
     return [];
+  }
+
+  // For tennis (ATP/WTA), only fetch match stats when game is live
+  if (getBalldontlieSport(effectiveSport) === 'atp' || getBalldontlieSport(effectiveSport) === 'wta') {
+    if (!game.live) {
+      logger.debug({
+        message: 'Skipping tennis match stats fetch - game is not live',
+        gameId: game.id,
+        sport: effectiveSport,
+      });
+      return [];
+    }
   }
 
   try {
@@ -2926,7 +3128,7 @@ export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
     //   statsCount: stats.length,
     // });
     
-    await storePlayerStats(game.id, game.sport, balldontlieGameId, stats);
+    await storePlayerStats(game.id, effectiveSport, balldontlieGameId, stats);
 
     // Return stats from database (ensures consistent format)
     const dbStats = await getPlayerStats(game.id);

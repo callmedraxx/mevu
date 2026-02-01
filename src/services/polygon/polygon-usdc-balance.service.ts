@@ -65,10 +65,10 @@ export class PolygonUsdcBalanceService {
     }
 
     try {
-      logger.info({
-        message: 'Initializing Polygon USDC balance watcher',
-        wssUrl: wssUrl.substring(0, 30) + '...', // Log partial URL for security
-      });
+      // logger.info({
+      //   message: 'Initializing Polygon USDC balance watcher',
+      //   wssUrl: wssUrl.substring(0, 30) + '...', // Log partial URL for security
+      // });
 
       // Create WebSocket provider for event listening
       this.provider = new ethers.providers.WebSocketProvider(wssUrl);
@@ -83,10 +83,10 @@ export class PolygonUsdcBalanceService {
         chainId: 137,
       };
       this.httpProvider = new ethers.providers.StaticJsonRpcProvider(rpcUrl, polygonNetwork);
-      logger.info({
-        message: 'HTTP provider initialized for balance queries',
-        rpcUrl: 'polygon-rpc.com',
-      });
+      // logger.info({
+      //   message: 'HTTP provider initialized for balance queries',
+      //   rpcUrl: 'polygon-rpc.com',
+      // });
 
       // Create USDC contract instance
       const usdcAbi = [
@@ -110,11 +110,11 @@ export class PolygonUsdcBalanceService {
       this.startBalancePolling();
 
       this.isConnected = true;
-      logger.info({
-        message: 'Polygon USDC balance watcher initialized successfully',
-        mode: 'polling',
-        intervalMs: this.pollingIntervalMs,
-      });
+      // logger.info({
+      //   message: 'Polygon USDC balance watcher initialized successfully',
+      //   mode: 'polling',
+      //   intervalMs: this.pollingIntervalMs,
+      // });
     } catch (error) {
       logger.error({
         message: 'Failed to initialize Polygon USDC balance watcher',
@@ -170,9 +170,9 @@ export class PolygonUsdcBalanceService {
       });
 
       this.provider._websocket.on('open', () => {
-        logger.info({
-          message: 'WebSocket connection opened',
-        });
+        // logger.info({
+        //   message: 'WebSocket connection opened',
+        // });
         this.isConnected = true;
         this.reconnectAttempts = 0;
       });
@@ -192,11 +192,11 @@ export class PolygonUsdcBalanceService {
     }
 
     this.reconnectAttempts++;
-    logger.info({
-      message: 'Attempting to reconnect WebSocket',
-      attempt: this.reconnectAttempts,
-      maxAttempts: this.maxReconnectAttempts,
-    });
+    // logger.info({
+    //   message: 'Attempting to reconnect WebSocket',
+    //   attempt: this.reconnectAttempts,
+    //   maxAttempts: this.maxReconnectAttempts,
+    // });
 
     // Wait before reconnecting
     await new Promise((resolve) => setTimeout(resolve, this.reconnectDelay));
@@ -227,11 +227,11 @@ export class PolygonUsdcBalanceService {
       clearInterval(this.pollingInterval);
     }
 
-    logger.info({
-      message: 'Starting balance polling',
-      intervalMs: this.pollingIntervalMs,
-      contractAddress: USDC_CONTRACT_ADDRESS,
-    });
+    // logger.info({
+    //   message: 'Starting balance polling',
+    //   intervalMs: this.pollingIntervalMs,
+    //   contractAddress: USDC_CONTRACT_ADDRESS,
+    // });
 
     // Poll every 2 seconds
     this.pollingInterval = setInterval(async () => {
@@ -365,26 +365,26 @@ export class PolygonUsdcBalanceService {
 
     // Check if we're rate limited
     if (this.isRateLimited()) {
-      logger.debug({
-        message: 'Skipping poll - rate limited',
-        resumeAt: this.rateLimitBackoffUntil?.toISOString(),
-      });
+      // logger.debug({
+      //   message: 'Skipping poll - rate limited',
+      //   resumeAt: this.rateLimitBackoffUntil?.toISOString(),
+      // });
       return;
     }
 
     if (this.watchedAddresses.size === 0) {
-      logger.debug({
-        message: 'No addresses to poll',
-        watchedCount: 0,
-      });
+      // logger.debug({
+      //   message: 'No addresses to poll',
+      //   watchedCount: 0,
+      // });
       return;
     }
 
     const addresses = Array.from(this.watchedAddresses.keys());
-    logger.debug({
-      message: 'Polling balances',
-      addressCount: addresses.length,
-    });
+    // logger.debug({
+    //   message: 'Polling balances',
+    //   addressCount: addresses.length,
+    // });
     
     // Poll addresses sequentially with delay to avoid rate limits
     // Only poll a few addresses per cycle to reduce load
@@ -432,24 +432,24 @@ export class PolygonUsdcBalanceService {
           const difference = currentBalance - previousBalance;
           const isIncoming = difference > 0;
           
-          logger.info({
-            message: 'Balance change detected',
-            proxyWalletAddress: watched.proxyWalletAddress,
-            privyUserId: watched.privyUserId,
-            previousBalance: previousBalance.toString(),
-            currentBalance: currentBalance.toString(),
-            difference: difference.toString(),
-            type: isIncoming ? 'in' : 'out',
-          });
+          // logger.info({
+          //   message: 'Balance change detected',
+          //   proxyWalletAddress: watched.proxyWalletAddress,
+          //   privyUserId: watched.privyUserId,
+          //   previousBalance: previousBalance.toString(),
+          //   currentBalance: currentBalance.toString(),
+          //   difference: difference.toString(),
+          //   type: isIncoming ? 'in' : 'out',
+          // });
 
           // Update watched balance
           watched.balance = currentBalance;
           
-          logger.info({
-            message: 'Balance updated in memory and database',
-            proxyWalletAddress: watched.proxyWalletAddress,
-            newBalance: currentBalance.toString(),
-          });
+          // logger.info({
+          //   message: 'Balance updated in memory and database',
+          //   proxyWalletAddress: watched.proxyWalletAddress,
+          //   newBalance: currentBalance.toString(),
+          // });
 
           // Persist transfer record
           const humanAmount = ethers.utils.formatUnits(difference > 0 ? difference : -difference, USDC_DECIMALS);
@@ -493,13 +493,13 @@ export class PolygonUsdcBalanceService {
           const retryAfter = this.extractRetryAfter(error);
           this.handleRateLimitError(retryAfter);
           
-          logger.warn({
-            message: 'Rate limit error while polling balance',
-            proxyWalletAddress: watched.proxyWalletAddress,
-            privyUserId: watched.privyUserId,
-            retryAfterSeconds: retryAfter,
-            consecutiveErrors: this.consecutiveRateLimitErrors,
-          });
+          // logger.warn({
+          //   message: 'Rate limit error while polling balance',
+          //   proxyWalletAddress: watched.proxyWalletAddress,
+          //   privyUserId: watched.privyUserId,
+          //   retryAfterSeconds: retryAfter,
+          //   consecutiveErrors: this.consecutiveRateLimitErrors,
+          // });
           
           // Stop polling this cycle - will resume after backoff
           break;
@@ -670,12 +670,12 @@ export class PolygonUsdcBalanceService {
     // Check if already watching
     if (this.watchedAddresses.has(addressLower)) {
       const watched = this.watchedAddresses.get(addressLower)!;
-      logger.info({
-        message: 'Address already being watched',
-        proxyWalletAddress,
-        privyUserId,
-        currentBalance: watched.balance.toString(),
-      });
+      // logger.info({
+      //   message: 'Address already being watched',
+      //   proxyWalletAddress,
+      //   privyUserId,
+      //   currentBalance: watched.balance.toString(),
+      // });
       return watched.balance.toString();
     }
 
@@ -683,11 +683,11 @@ export class PolygonUsdcBalanceService {
       throw new Error('Service not initialized. Call initialize() first.');
     }
 
-    logger.info({
-      message: 'Starting to watch proxy wallet address',
-      proxyWalletAddress,
-      privyUserId,
-    });
+    // logger.info({
+    //   message: 'Starting to watch proxy wallet address',
+    //   proxyWalletAddress,
+    //   privyUserId,
+    // });
 
     // Fetch initial balance with timeout and fallback
     let balance: bigint = BigInt(0); // Default to 0 if fetch fails
@@ -696,10 +696,10 @@ export class PolygonUsdcBalanceService {
     // Try HTTP provider first (more reliable)
     if (this.httpContract) {
       try {
-        logger.info({
-          message: 'Fetching balance via HTTP provider',
-          proxyWalletAddress,
-        });
+        // logger.info({
+        //   message: 'Fetching balance via HTTP provider',
+        //   proxyWalletAddress,
+        // });
         const balancePromise = this.httpContract.balanceOf(proxyWalletAddress);
         const timeoutPromise = new Promise<never>((_, reject) => {
           setTimeout(() => reject(new Error('Balance fetch timeout after 5 seconds')), 5000);
@@ -709,11 +709,11 @@ export class PolygonUsdcBalanceService {
         balance = BigInt(balanceBN.toString());
         balanceFetched = true;
         
-        logger.info({
-          message: 'Successfully fetched initial balance via HTTP',
-          proxyWalletAddress,
-          balance: balance.toString(),
-        });
+        // logger.info({
+        //   message: 'Successfully fetched initial balance via HTTP',
+        //   proxyWalletAddress,
+        //   balance: balance.toString(),
+        // });
       } catch (httpError) {
         // Check if this is a rate limit error
         if (this.isRateLimitError(httpError)) {
@@ -738,10 +738,10 @@ export class PolygonUsdcBalanceService {
     // Fallback to WebSocket provider if HTTP failed
     if (!balanceFetched && this.contract) {
       try {
-        logger.info({
-          message: 'Fetching balance via WebSocket provider',
-          proxyWalletAddress,
-        });
+        // logger.info({
+        //   message: 'Fetching balance via WebSocket provider',
+        //   proxyWalletAddress,
+        // });
         const balancePromise = this.contract.balanceOf(proxyWalletAddress);
         const timeoutPromise = new Promise<never>((_, reject) => {
           setTimeout(() => reject(new Error('Balance fetch timeout after 5 seconds')), 5000);
@@ -751,11 +751,11 @@ export class PolygonUsdcBalanceService {
         balance = BigInt(balanceBN.toString());
         balanceFetched = true;
         
-        logger.info({
-          message: 'Successfully fetched initial balance via WebSocket',
-          proxyWalletAddress,
-          balance: balance.toString(),
-        });
+        // logger.info({
+        //   message: 'Successfully fetched initial balance via WebSocket',
+        //   proxyWalletAddress,
+        //   balance: balance.toString(),
+        // });
       } catch (wsError) {
         logger.warn({
           message: 'WebSocket balance fetch failed, will use 0 and rely on transfer events',
@@ -788,13 +788,13 @@ export class PolygonUsdcBalanceService {
     // Persist initial balance to database
     await this.updateBalance(proxyWalletAddress, privyUserId, balance.toString());
 
-    logger.info({
-      message: 'Started watching proxy wallet address',
-      proxyWalletAddress,
-      privyUserId,
-      initialBalance: balance.toString(),
-      humanBalance: ethers.utils.formatUnits(balance.toString(), USDC_DECIMALS),
-    });
+    // logger.info({
+    //   message: 'Started watching proxy wallet address',
+    //   proxyWalletAddress,
+    //   privyUserId,
+    //   initialBalance: balance.toString(),
+    //   humanBalance: ethers.utils.formatUnits(balance.toString(), USDC_DECIMALS),
+    // });
 
     return balance.toString();
   }

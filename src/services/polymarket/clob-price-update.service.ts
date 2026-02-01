@@ -511,7 +511,6 @@ export class ClobPriceUpdateService {
       if (client) {
         client.release();
       }
-      releaseLiveGamesWriteLock();
       this.isFlushingWrites = false;
 
       if (this.pendingWrites.size > 0 && !this.writeFlushTimer && !this.flushPaused) {
