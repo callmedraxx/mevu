@@ -97,7 +97,14 @@ export class GamesWebSocketService {
 
     this.redisUnsubscribe = subscribeToGamesBroadcast((msg) => {
       try {
-        if ((msg as { type?: string }).type === 'batch') {
+        const msgType = (msg as { type?: string }).type;
+
+        // Skip cache_invalidate messages - they're for HTTP workers, not WebSocket clients
+        if (msgType === 'cache_invalidate') {
+          return;
+        }
+
+        if (msgType === 'batch') {
           const arr = JSON.parse(msg.payload) as WSMessage[];
           for (const p of arr) this.broadcast(p);
         } else {
@@ -141,7 +148,7 @@ export class GamesWebSocketService {
       });
 
       // Send initial games data immediately
-      await this.sendInitialData(ws);
+      // await this.sendInitialData(ws);
 
       // Handle incoming messages (for future command support)
       ws.on('message', (data) => {

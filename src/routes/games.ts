@@ -20,7 +20,7 @@ import { getProbabilityHistoryStats } from '../services/polymarket/probability-h
 import { transformToFrontendGames, transformToFrontendGame, FrontendGame } from '../services/polymarket/frontend-game.transformer';
 import { teamsService } from '../services/polymarket/teams.service';
 import { logger } from '../config/logger';
-import { getFrontendGamesFromDatabase } from '../services/polymarket/frontend-games.service';
+import { getFrontendGamesFromDatabase, getFrontendGameByIdFromDatabase, getFrontendGameBySlugFromDatabase } from '../services/polymarket/frontend-games.service';
 import { initRedisGamesBroadcast, subscribeToGamesBroadcast, isRedisGamesBroadcastReady } from '../services/redis-games-broadcast.service';
 
 const router = Router();
@@ -33,6 +33,12 @@ initRedisGamesBroadcast();
 subscribeToGamesBroadcast((msg) => {
   try {
     const raw = msg as { type?: string; payload: string };
+
+    // Skip cache_invalidate messages - they're for HTTP workers, not SSE clients
+    if (raw.type === 'cache_invalidate') {
+      return;
+    }
+
     if (raw.type === 'batch') {
       const arr = JSON.parse(raw.payload) as unknown[];
       for (const item of arr) {
@@ -489,17 +495,18 @@ router.get('/slug/:slug', async (req: Request, res: Response) => {
 router.get('/slug/:slug/frontend', async (req: Request, res: Response) => {
   try {
     const { slug } = req.params;
-    const game = await getLiveGameBySlug(slug);
-    
-    if (!game) {
+
+    // Get pre-computed frontend game directly from frontend_games table
+    // This ensures consistency with /games/frontend endpoint
+    const frontendGame = await getFrontendGameBySlugFromDatabase(slug);
+
+    if (!frontendGame) {
       return res.status(404).json({
         success: false,
         error: 'Game not found',
       });
     }
-    
-    const frontendGame = await transformToFrontendGame(game);
-    
+
     res.json({
       success: true,
       game: frontendGame,
@@ -587,17 +594,18 @@ router.get('/:id', async (req: Request, res: Response) => {
 router.get('/:id/frontend', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const game = await getLiveGameById(id);
-    
-    if (!game) {
+
+    // Get pre-computed frontend game directly from frontend_games table
+    // This ensures consistency with /games/frontend endpoint
+    const frontendGame = await getFrontendGameByIdFromDatabase(id);
+
+    if (!frontendGame) {
       return res.status(404).json({
         success: false,
         error: 'Game not found',
       });
     }
-    
-    const frontendGame = await transformToFrontendGame(game);
-    
+
     res.json({
       success: true,
       game: frontendGame,

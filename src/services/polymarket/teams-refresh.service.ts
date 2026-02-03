@@ -6,7 +6,7 @@
 
 import { logger } from '../../config/logger';
 import { teamsService } from './teams.service';
-import { gamesCache, registerOnGamesRefreshed } from './live-games.service';
+import { getAllLiveGamesFromCache, registerOnGamesRefreshed } from './live-games.service';
 import { getUfcFighterNamesFromGame } from './frontend-game.transformer';
 import {
   prefetchAndPersistFighterRecords,
@@ -91,7 +91,8 @@ export class TeamsRefreshService {
     }
 
     // UFC fighter records: pull from cache, fetch from API, bulk persist
-    const ufcGames = Array.from(gamesCache.values()).filter(
+    const allGames = await getAllLiveGamesFromCache();
+    const ufcGames = allGames.filter(
       (g) =>
         (g.sport && g.sport.toLowerCase() === 'ufc') ||
         (g.league && g.league.toLowerCase() === 'ufc')

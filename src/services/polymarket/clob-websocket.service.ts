@@ -30,44 +30,67 @@ export class ClobWebSocketService {
 
   /**
    * Connect to the CLOB WebSocket endpoint
+   * Returns a Promise that resolves when the WebSocket is actually connected
    */
   async connect(): Promise<void> {
-    if (this.isConnecting || this.isConnected) {
-      // logger.warn({
-//         message: 'WebSocket already connecting or connected',
-//         isConnecting: this.isConnecting,
-//         isConnected: this.isConnected,
-//       });
+    if (this.isConnecting) {
+      // Wait for existing connection attempt to complete
+      return new Promise((resolve, reject) => {
+        const checkInterval = setInterval(() => {
+          if (this.isConnected) {
+            clearInterval(checkInterval);
+            resolve();
+          } else if (!this.isConnecting) {
+            clearInterval(checkInterval);
+            reject(new Error('Connection attempt failed'));
+          }
+        }, 100);
+        // Timeout after 30 seconds
+        setTimeout(() => {
+          clearInterval(checkInterval);
+          reject(new Error('Connection timeout'));
+        }, 30000);
+      });
+    }
+    
+    if (this.isConnected) {
       return;
     }
 
     // Reset state for new connection
     this.isConnecting = true;
     this.isConnected = false;
-    this.reconnectAttempts = 0;
 
-    try {
-      // logger.info({
-//         message: 'Connecting to CLOB WebSocket',
-//         url: CLOB_WS_URL,
-//       });
+    return new Promise((resolve, reject) => {
+      try {
+        this.ws = new WebSocket(CLOB_WS_URL, {
+          headers: {
+            'Origin': 'https://polymarket.com',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+          },
+        });
 
-      this.ws = new WebSocket(CLOB_WS_URL, {
-        headers: {
-          'Origin': 'https://polymarket.com',
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-        },
-      });
+        // Set up a one-time handler to resolve the promise when connected
+        const onOpen = () => {
+          this.ws?.removeListener('error', onError);
+          resolve();
+        };
+        
+        const onError = (error: Error) => {
+          this.ws?.removeListener('open', onOpen);
+          this.isConnecting = false;
+          reject(error);
+        };
+        
+        this.ws.once('open', onOpen);
+        this.ws.once('error', onError);
 
-      this.setupEventHandlers();
-    } catch (error) {
-      this.isConnecting = false;
-      // logger.error({
-//         message: 'Failed to create WebSocket connection',
-//         error: error instanceof Error ? error.message : String(error),
-//       });
-      throw error;
-    }
+        this.setupEventHandlers();
+      } catch (error) {
+        this.isConnecting = false;
+        reject(error);
+      }
+    });
   }
 
   /**
@@ -385,15 +408,27 @@ export class ClobWebSocketService {
     // Store subscriptions for reconnect
     this.pendingSubscriptions = assetIds;
 
+    // Check if WebSocket is actually ready to send
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      logger.warn({
+        message: 'CLOB WebSocket not ready for subscription, will retry on reconnect',
+        readyState: this.ws?.readyState,
+        isConnected: this.isConnected,
+        assetCount: assetIds.length,
+      });
+      return;
+    }
+
     const subscriptionMessage = {
       assets_ids: assetIds,
       type: 'market',
     };
 
-    // logger.info({
-    //   message: 'Subscribing to CLOB assets',
-    //   count: assetIds.length,
-    // });
+    logger.info({
+      message: 'Subscribing to CLOB assets',
+      count: assetIds.length,
+      firstAsset: assetIds[0]?.substring(0, 20) + '...',
+    });
 
     this.send(subscriptionMessage);
   }
@@ -463,25 +498,55 @@ export class ClobWebSocketService {
       this.reconnectTimer = null;
       
       try {
+        logger.info({
+          message: 'CLOB WebSocket reconnect attempt starting',
+          attempt: this.reconnectAttempts,
+          pendingSubscriptionCount: this.pendingSubscriptions.length,
+        });
+        
         await this.connect();
         
+        logger.info({
+          message: 'CLOB WebSocket reconnect successful',
+          isConnected: this.isConnected,
+          pendingSubscriptionCount: this.pendingSubscriptions.length,
+        });
+        
         // Re-subscribe to assets after successful reconnection
-        if (this.isConnected && this.pendingSubscriptions.length > 0) {
+        if (this.pendingSubscriptions.length > 0) {
+          // Small delay to ensure connection is stable before subscribing
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
           logger.info({
-            message: 'Re-subscribing to assets after reconnect',
+            message: 'Re-subscribing to CLOB assets after reconnect',
             assetCount: this.pendingSubscriptions.length,
+            firstAsset: this.pendingSubscriptions[0]?.substring(0, 20) + '...',
           });
+          
           this.subscribeToAssets(this.pendingSubscriptions);
+        } else {
+          logger.warn({
+            message: 'CLOB WebSocket reconnected but no pending subscriptions to restore',
+          });
         }
+        
+        // Reset reconnect attempts on successful reconnection
+        this.reconnectAttempts = 0;
       } catch (error) {
         logger.error({
           message: 'Failed to reconnect CLOB WebSocket',
           error: error instanceof Error ? error.message : String(error),
+          attempt: this.reconnectAttempts,
         });
         
         // Schedule another reconnect if we haven't exceeded max attempts
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
           this.scheduleReconnect();
+        } else {
+          logger.error({
+            message: 'CLOB WebSocket max reconnect attempts reached, giving up',
+            attempts: this.reconnectAttempts,
+          });
         }
       }
     }, delay);

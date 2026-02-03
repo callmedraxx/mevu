@@ -40,25 +40,38 @@ export const pool: Pool = (() => {
       
       poolInstance = new Pool({
         connectionString,
-        // Per-worker pool size. 4 workers × 50 = 200 connections to PgBouncer.
-        // Override with DATABASE_POOL_MAX if needed.
-        max: 200,
-        min:20,
-        idleTimeoutMillis: 30000,
+        // Per-worker pool size. 4 workers × 25 = 100 connections to PgBouncer.
+        // Reduced from 200 to prevent connection pool exhaustion and PgBouncer timeout issues.
+        max: Number(process.env.DATABASE_POOL_MAX) || 25,
+        min: Number(process.env.DATABASE_POOL_MIN) || 2,
+        // Idle timeout MUST be shorter than PgBouncer's client_idle_timeout (usually 300s).
+        // Set to 10 seconds to release connections quickly and avoid stale connection errors.
+        idleTimeoutMillis: 10000,
         connectionTimeoutMillis: 15000,  // Increased for high load
         allowExitOnIdle: false,
         keepAlive: true,
-        keepAliveInitialDelayMillis: 10000,
-        // Add connection queue management
-        maxUses: 7500, 
+        // Send keepalive every 5 seconds to prevent PgBouncer from closing the connection.
+        // This must be shorter than PgBouncer's client_idle_timeout.
+        keepAliveInitialDelayMillis: 5000,
+        // Limit connection reuse to prevent issues with long-lived connections
+        maxUses: 5000,
         // Note: statement_timeout removed from Pool config - PgBouncer doesn't support it as a startup parameter
         // We set it via SQL query after connection instead (see poolInstance.on('connect') below)
         // Also ensure no options object is passed that might include statement_timeout
       });
       
       // Handle pool errors
-      poolInstance.on('error', (err) => {
-        console.error('Unexpected error on idle client', err);
+      // PgBouncer sends client_idle_timeout errors when connections are idle too long.
+      // These are expected and the pool will create new connections as needed.
+      poolInstance.on('error', (err: Error & { code?: string }) => {
+        const isIdleTimeout = err.message?.includes('client_idle_timeout') || err.code === '08P01';
+        if (isIdleTimeout) {
+          // This is expected with PgBouncer - the connection was idle and got closed.
+          // The pool will create a new connection when needed. No action required.
+          console.log('PgBouncer closed idle connection (expected behavior)');
+        } else {
+          console.error('Unexpected error on idle client error:', err.message || err);
+        }
       });
       
       poolInstance.on('connect', async (client) => {

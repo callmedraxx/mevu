@@ -20,6 +20,8 @@ export interface FrontendTeam {
   buyPrice: number;        // 66 (cents, YES price rounded up)
   sellPrice: number;       // 35 (cents, NO price rounded up)
   score?: number;          // 87 (live games only)
+  tennisScore?: string;    // Raw tennis score: "6-4, 2-6, 1-1"
+  setsWon?: number;        // Number of sets won (0, 1, 2, 3) - for tennis
   quarterScores?: { q1: number; q2: number; q3: number; q4: number; };
 }
 
@@ -45,6 +47,7 @@ export interface FrontendGame {
   sport?: string;            // "nba", "nfl", etc.
   league?: string;           // league identifier
   slug?: string;             // URL slug
+  tennisScore?: string;      // Raw tennis score at game level: "6-4, 2-6, 1-1"
 }
 
 /**
@@ -81,6 +84,83 @@ function parseScore(scoreStr: string | undefined): { home?: number; away?: numbe
     return { away: parts[0], home: parts[1] };
   }
   return {};
+}
+
+/**
+ * Parse tennis score format
+ * Examples:
+ * - "6-7(5-7), 1-2" -> Set 1: 6-7 (tiebreak 5-7), Set 2: 1-2 (current)
+ * - "6-4, 2-5" -> Set 1: 6-4 (player 1 won), Set 2: 2-5 (current)
+ * - "6-4, 6-3" -> Set 1: 6-4, Set 2: 6-3 (match complete)
+ *
+ * Returns current set score + sets won count + raw score string
+ */
+function parseTennisScore(scoreStr: string): { 
+  home: number; 
+  away: number; 
+  setsWon: { home: number; away: number }; 
+  rawScore: string 
+} | null {
+  if (!scoreStr) return null;
+
+  // Split by comma to get individual sets
+  const sets = scoreStr.split(',').map(s => s.trim());
+
+  let homeSetsWon = 0;
+  let awaySetsWon = 0;
+  let currentSetHome = 0;
+  let currentSetAway = 0;
+
+  for (let i = 0; i < sets.length; i++) {
+    const setScore = sets[i];
+
+    // Remove tiebreak notation (e.g., "6-7(5-7)" -> "6-7")
+    const cleanScore = setScore.replace(/\([^)]+\)/, '').trim();
+
+    // Parse the set score
+    const parts = cleanScore.split('-').map(s => parseInt(s.trim(), 10));
+    if (parts.length !== 2 || isNaN(parts[0]) || isNaN(parts[1])) continue;
+
+    const [awayGames, homeGames] = parts;
+
+    // If this is the last set, it's the current set score
+    if (i === sets.length - 1) {
+      currentSetAway = awayGames;
+      currentSetHome = homeGames;
+    }
+
+    // Check if this set is complete (one player reached 6+ games with 2 game lead, or 7 in tiebreak)
+    const isSetComplete =
+      (awayGames >= 6 && awayGames - homeGames >= 2) ||
+      (homeGames >= 6 && homeGames - awayGames >= 2) ||
+      awayGames === 7 || homeGames === 7;
+
+    if (isSetComplete || i < sets.length - 1) {
+      // Completed set - count who won
+      if (awayGames > homeGames) {
+        awaySetsWon++;
+      } else if (homeGames > awayGames) {
+        homeSetsWon++;
+      }
+    }
+  }
+
+  return {
+    away: currentSetAway,
+    home: currentSetHome,
+    setsWon: { home: homeSetsWon, away: awaySetsWon },
+    rawScore: scoreStr,
+  };
+}
+
+/**
+ * Check if a game is a tennis game based on sport/league
+ */
+function isTennisGame(game: LiveGame): boolean {
+  const sport = (game.sport || '').toLowerCase();
+  const league = (game.league || '').toLowerCase();
+  return sport === 'tennis' || sport === 'atp' || sport === 'wta' ||
+         league === 'tennis' || league === 'atp' || league === 'wta';
 }
 
 /**
@@ -395,10 +475,10 @@ interface TeamOutcome {
  * The moneyline market has structuredOutcomes with team names, not Over/Under
  */
 function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: TeamOutcome | null } {
-  // Use game.markets; for UFC, fall back to rawData.markets when game.markets is empty
+  // Use game.markets; fall back to rawData.markets when game.markets is empty (for all sports)
   const markets = game.markets && game.markets.length > 0
     ? game.markets
-    : ((game.sport?.toLowerCase() === 'ufc' || game.league?.toLowerCase() === 'ufc') && (game.rawData as any)?.markets?.length > 0
+    : ((game.rawData as any)?.markets?.length > 0
       ? (game.rawData as any).markets
       : []);
   if (markets.length === 0) {
@@ -980,8 +1060,22 @@ export async function transformToFrontendGame(
     game.ended = false;
   }
   
-  // Parse score
-  const scores = parseScore(game.score);
+  // Detect tennis games for special score handling
+  const isTennisMatch = isTennisGame(game);
+  
+  // Parse score - use tennis parser for tennis games
+  let scores: { home?: number; away?: number } = {};
+  let tennisScoreData: { home: number; away: number; setsWon: { home: number; away: number }; rawScore: string } | null = null;
+  
+  if (isTennisMatch && game.score) {
+    tennisScoreData = parseTennisScore(game.score);
+    if (tennisScoreData) {
+      // For tennis, use the current set games as the "score" for backwards compatibility
+      scores = { home: tennisScoreData.home, away: tennisScoreData.away };
+    }
+  } else {
+    scores = parseScore(game.score);
+  }
   
   // Extract win probabilities (Yes outcome for each team)
   const prices = extractPrices(game);
@@ -993,13 +1087,8 @@ export async function transformToFrontendGame(
   // Extract team names from title if no team data
   let titleTeams = extractTeamsFromTitle(game.title);
   
-  // Detect tennis games where we need to clean tournament prefixes from team names
-  const isTennis =
-    (game.sport && game.sport.toLowerCase() === 'tennis') ||
-    (game.league && game.league.toLowerCase() === 'tennis');
-  
   // Clean tennis team names from title if this is a tennis game
-  if (isTennis) {
+  if (isTennisMatch) {
     if (titleTeams.away) {
       titleTeams.away = cleanTennisTeamName(titleTeams.away) || titleTeams.away;
     }
@@ -1084,7 +1173,7 @@ export async function transformToFrontendGame(
   // For UFC and Tennis, try to parse full participant names from description first (event or market),
   // then fall back to title-derived names or identifiers.
   let descNames: { away?: string; home?: string } = {};
-  if (isUfc || isTennis) {
+  if (isUfc || isTennisMatch) {
     const rawDesc =
       (game.description as string | undefined) ||
       (game.rawData && (game.rawData as any).description as string | undefined) ||
@@ -1139,7 +1228,7 @@ export async function transformToFrontendGame(
           ),
       name: isUfc
         ? (ufcAwayName || descNames.away || titleTeams.away || rawAwayId || awayTeam?.name || 'Away Fighter')
-        : isTennis
+        : isTennisMatch
         ? (descNames.away || cleanTennisTeamName(awayTeam?.name) || cleanTennisTeamName(rawAwayId) || cleanTennisTeamName(titleTeams.away) || 'Away Player')
         : (awayTeam?.name || rawAwayId || titleTeams.away || 'Away Team'),
       record: isUfc
@@ -1149,6 +1238,9 @@ export async function transformToFrontendGame(
       buyPrice: prices.awayBuy,      // YES price rounded up (e.g., 36)
       sellPrice: prices.awaySell,    // NO price rounded up (e.g., 65)
       score: showScores ? scores.away : undefined,
+      // Tennis-specific fields
+      tennisScore: isTennisMatch && tennisScoreData ? tennisScoreData.rawScore : undefined,
+      setsWon: isTennisMatch && tennisScoreData ? tennisScoreData.setsWon.away : undefined,
     },
     homeTeam: {
       abbr: isUfc
@@ -1168,7 +1260,7 @@ export async function transformToFrontendGame(
           ),
       name: isUfc
         ? (ufcHomeName || descNames.home || titleTeams.home || rawHomeId || homeTeam?.name || 'Home Fighter')
-        : isTennis
+        : isTennisMatch
         ? (descNames.home || cleanTennisTeamName(homeTeam?.name) || cleanTennisTeamName(rawHomeId) || cleanTennisTeamName(titleTeams.home) || 'Home Player')
         : (homeTeam?.name || rawHomeId || titleTeams.home || 'Home Team'),
       record: isUfc
@@ -1178,6 +1270,9 @@ export async function transformToFrontendGame(
       buyPrice: prices.homeBuy,      // YES price rounded up (e.g., 65)
       sellPrice: prices.homeSell,    // NO price rounded up (e.g., 36)
       score: showScores ? scores.home : undefined,
+      // Tennis-specific fields
+      tennisScore: isTennisMatch && tennisScoreData ? tennisScoreData.rawScore : undefined,
+      setsWon: isTennisMatch && tennisScoreData ? tennisScoreData.setsWon.home : undefined,
     },
     liquidity: formatLiquidity(game.liquidity),
     chartData,
@@ -1191,6 +1286,8 @@ export async function transformToFrontendGame(
     sport: game.sport,
     league: game.league,
     slug: game.slug,
+    // Tennis-specific: include raw score at game level for easier frontend access
+    tennisScore: isTennisMatch && tennisScoreData ? tennisScoreData.rawScore : undefined,
   };
   
   return frontendGame;

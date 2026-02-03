@@ -7,7 +7,7 @@ import axios from 'axios';
 import { pool } from '../../config/database';
 import { logger } from '../../config/logger';
 import { getUserByPrivyId } from '../privy/user.service';
-import { getAllLiveGames } from '../polymarket/live-games.service';
+import { getAllLiveGamesFromCache } from '../polymarket/live-games.service';
 import {
   PolymarketPosition,
   UserPosition,
@@ -34,15 +34,20 @@ async function buildPriceLookupFromLiveGames(): Promise<{
   const endedAssets = new Set<string>();
   
   try {
-    const games = await getAllLiveGames();
+    const games = await getAllLiveGamesFromCache();
     
     for (const game of games) {
-      if (!game.markets) continue;
-      
+      // Use game.markets, fall back to rawData.markets for sports games (tennis, etc.)
+      const markets = game.markets && game.markets.length > 0
+        ? game.markets
+        : ((game.rawData as any)?.markets?.length > 0 ? (game.rawData as any).markets : []);
+
+      if (markets.length === 0) continue;
+
       // Check if game is ended
       const isEnded = game.ended === true || game.closed === true;
-      
-      for (const market of game.markets) {
+
+      for (const market of markets) {
         const outcomes = market.structuredOutcomes;
         if (!outcomes) continue;
         

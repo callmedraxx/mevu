@@ -15,6 +15,22 @@ import { recordProbabilitySnapshotsBulk, initializeProbabilityHistoryTable } fro
 import type { ProbabilitySnapshot } from './probability-history.service';
 import { upsertFrontendGamesForLiveGames, upsertFrontendGameForLiveGame, bulkUpsertFrontendGamesWithClient, clearFrontendGamesCache } from './frontend-games.service';
 import { transformToFrontendGame } from './frontend-game.transformer';
+import {
+  setGameInCache,
+  setGamesInCacheBatch,
+  getGameFromCache,
+  getAllGamesFromCache,
+  getGameIdBySlug,
+  getEventIdByGameId,
+  getGamesByGameIdFromCache,
+  hasGamesInCache,
+} from './redis-games-cache.service';
+import {
+  publishGamesBroadcast,
+  isRedisGamesBroadcastReady,
+  publishActivityBroadcast,
+} from '../redis-cluster-broadcast.service';
+import { transformToActivityWatcherGame } from './activity-watcher.transformer';
 
 // Build ID may change - we'll need to fetch it dynamically or update periodically
 // Default build ID - will be updated when 404 is encountered
@@ -27,7 +43,7 @@ function getLiveEndpoint(): string {
   return `https://polymarket.com/_next/data/${currentBuildId}/sports/live.json?slug=live`;
 }
 
-const POLLING_INTERVAL = 60 * 60 * 1000; // 20 minutes in milliseconds
+const POLLING_INTERVAL = 20 * 60 * 1000; // 20 minutes - refresh live games frequently to catch new/ended games
 
 /** Callbacks invoked when live_games is refreshed (live or sports pipeline) */
 const onGamesRefreshedCallbacks: Set<() => void> = new Set();
@@ -192,20 +208,17 @@ async function fetchAndUpdateBuildId(): Promise<boolean> {
   }
 }
 
-// In-memory storage for development
+// In-memory storage for development (when not using DB)
 const inMemoryGames: Map<string, LiveGame> = new Map();
 
-// In-memory cache for production (to avoid fetching all games on every update)
-export const gamesCache: Map<string, LiveGame> = new Map();
+async function addGameToCache(game: LiveGame): Promise<void> {
+  await setGameInCache(game as any);
+}
 
-// Map gameId (numeric, from Sports WS) -> eventId (Polymarket id) for fast sports update lookups
-const gameIdToEventId: Map<number, string> = new Map();
-
-function addGameToCache(game: LiveGame): void {
-  gamesCache.set(game.id, game);
-  if (game.gameId != null) {
-    gameIdToEventId.set(game.gameId, game.id);
-  }
+/** Get a single game from shared cache (Redis or in-memory fallback). Use for cross-worker consistency. */
+export async function getGameFromCacheById(id: string): Promise<LiveGame | null> {
+  const game = await getGameFromCache(id);
+  return game as LiveGame | null;
 }
 
 // Single-flight promise to avoid hammering the database with duplicate
@@ -1014,19 +1027,24 @@ export function filterOutEndedLiveGames(games: LiveGame[]): LiveGame[] {
  * Extract probabilities from a game's moneyline market
  */
 function extractGameProbabilities(game: LiveGame): { homeProb: number; awayProb: number; homeBuy: number; awayBuy: number } | null {
-  if (!game.markets || game.markets.length === 0) {
+  // Use game.markets, fall back to rawData.markets for sports games (tennis, etc.)
+  const markets = game.markets && game.markets.length > 0
+    ? game.markets
+    : ((game.rawData as any)?.markets?.length > 0 ? (game.rawData as any).markets : []);
+
+  if (markets.length === 0) {
     return null;
   }
-  
+
   // Find moneyline market (first market with team outcomes, not Over/Under)
-  for (const market of game.markets) {
+  for (const market of markets) {
     const outcomes = market.structuredOutcomes;
     if (!outcomes || outcomes.length !== 2) continue;
     
     const labels = outcomes.map((o: any) => String(o.label || '').toLowerCase());
     
     // Skip Over/Under markets
-    if (labels.some(l => l.includes('over') || l.includes('under') || l.includes('o/u'))) {
+    if (labels.some((l: string) => l.includes('over') || l.includes('under') || l.includes('o/u'))) {
       continue;
     }
     
@@ -1086,9 +1104,6 @@ export async function storeGames(games: LiveGame[], dataSource?: string): Promis
 
   if (isProduction) {
     await storeGamesInDatabase(toStore);
-    for (const game of toStore) {
-      gamesCache.set(game.id, game);
-    }
   } else {
     storeGamesInMemory(toStore);
   }
@@ -1218,9 +1233,7 @@ async function storeGamesInDatabase(games: LiveGame[]): Promise<void> {
 
     await client.query('COMMIT');
 
-    for (const game of games) {
-      addGameToCache(game);
-    }
+    await setGamesInCacheBatch(games as any[]);
 
     // logger.info({ 
     //   message: 'Games stored in database', 
@@ -1262,7 +1275,9 @@ function storeGamesInMemory(games: LiveGame[]): void {
   for (const game of games) {
     inMemoryGames.set(game.id, game);
   }
-  // logger.info({ message: 'Games stored in memory', count: games.length, totalInMemory: inMemoryGames.size });
+  setGamesInCacheBatch(games as any[]).catch((err) =>
+    logger.warn({ message: 'Failed to update games cache from in-memory store', error: err instanceof Error ? err.message : String(err) })
+  );
 }
 
 /** Fast count without loading all rows (for early-exit returns) */
@@ -1295,23 +1310,60 @@ function sortGamesForGetAll(games: LiveGame[]): LiveGame[] {
 }
 
 /** Get cached games for broadcast (avoids DB fetch after storeGames) */
-function getCachedGamesForBroadcast(): LiveGame[] {
+async function getCachedGamesForBroadcast(): Promise<LiveGame[]> {
   const isProduction = process.env.NODE_ENV === 'production';
-  const games = isProduction
-    ? Array.from(gamesCache.values())
-    : Array.from(inMemoryGames.values());
+  let games: LiveGame[];
+  if (isProduction) {
+    games = (await getAllGamesFromCache()) as unknown as LiveGame[];
+  } else {
+    games = Array.from(inMemoryGames.values());
+  }
   games.forEach(ensureLiveEndedConsistency);
   return games;
 }
+
+/** Get all live games from shared cache (Redis or in-memory). For price lookup, etc. */
+export async function getAllLiveGamesFromCache(): Promise<LiveGame[]> {
+  const isProduction = process.env.NODE_ENV === 'production';
+  let games: LiveGame[];
+  if (isProduction) {
+    games = (await getAllGamesFromCache()) as unknown as LiveGame[];
+  } else {
+    games = Array.from(inMemoryGames.values());
+  }
+  games.forEach(ensureLiveEndedConsistency);
+  return sortGamesForGetAll(games);
+}
+
+// Minimum number of games expected in cache - if fewer, force a DB reload
+// This prevents serving stale/incomplete cache data
+const MIN_EXPECTED_CACHE_SIZE = 50;
 
 export async function getAllLiveGames(): Promise<LiveGame[]> {
   const isProduction = process.env.NODE_ENV === 'production';
   
   if (isProduction) {
+    // Cache-first: if shared cache (Redis) has enough games, use it to avoid DB timeout
+    const cachedHasGames = await hasGamesInCache();
+    if (cachedHasGames) {
+      const cachedGames = await getAllLiveGamesFromCache();
+      
+      // If cache has enough games, use it
+      if (cachedGames.length >= MIN_EXPECTED_CACHE_SIZE) {
+        return cachedGames;
+      }
+      
+      // Cache seems incomplete - log and fall through to DB reload
+      logger.warn({
+        message: 'Cache appears incomplete, triggering DB reload',
+        cachedGamesCount: cachedGames.length,
+        minExpected: MIN_EXPECTED_CACHE_SIZE,
+      });
+    }
+
     // If a load is already in progress, wait for it instead of starting
     // another expensive full-table query. This avoids hammering Postgres
-    // when many requests arrive at the same time, but we do NOT cache the
-    // results between calls so we can still observe real DB behavior.
+    // when many requests arrive at the same time.
     if (loadingAllLiveGamesPromise) {
       return loadingAllLiveGamesPromise;
     }
@@ -1320,18 +1372,18 @@ export async function getAllLiveGames(): Promise<LiveGame[]> {
     loadingAllLiveGamesPromise = (async () => {
       try {
         const games = await getAllLiveGamesFromDatabase();
-
-        // Only trigger upstream refresh if truly empty
-        // if (games.length === 0) {
-        //   logger.info({ message: 'Database is empty, fetching live games from API' });
-        //   await refreshLiveGames();
-        //   const refreshed = await getAllLiveGamesFromDatabase();
-        //   return refreshed;
-        // }
-
+        if (games.length > 0) {
+          // Clear stale mappings before repopulating
+          const { clearAllGamesCaches } = await import('./redis-games-cache.service');
+          await clearAllGamesCaches();
+          await setGamesInCacheBatch(games as any[]);
+          logger.info({
+            message: 'Games cache fully refreshed from database',
+            gamesCount: games.length,
+          });
+        }
         return games;
       } finally {
-        // Always clear the single-flight promise so future calls can reload
         loadingAllLiveGamesPromise = null;
       }
     })();
@@ -1357,19 +1409,14 @@ export async function getLiveGameById(id: string): Promise<LiveGame | null> {
   const isProduction = process.env.NODE_ENV === 'production';
   
   if (isProduction) {
-    // Check cache first
-    if (gamesCache.has(id)) {
-      const game = gamesCache.get(id);
-      if (game) {
-        ensureLiveEndedConsistency(game);
-        addGameToCache(game);
-        return game;
-      }
-      return null;
+    const cached = await getGameFromCache(id);
+    if (cached) {
+      ensureLiveEndedConsistency(cached as unknown as LiveGame);
+      return cached as unknown as LiveGame;
     }
     const game = await getLiveGameByIdFromDatabase(id);
     if (game) {
-      addGameToCache(game);
+      await addGameToCache(game);
     }
     return game;
   } else {
@@ -1391,21 +1438,31 @@ export async function getLiveGameBySlug(slug: string): Promise<LiveGame | null> 
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (isProduction) {
-    // Check cache first (avoids DB when game is already cached)
-    for (const game of gamesCache.values()) {
-      const slugMatch = game.slug?.toLowerCase() === target;
-      const tickerMatch = game.ticker?.toLowerCase() === target;
-      const idMatch = game.id?.toLowerCase() === target;
-      const rawSlugMatch = game.rawData?.slug && String(game.rawData.slug).toLowerCase() === target;
-      if (slugMatch || tickerMatch || idMatch || rawSlugMatch) {
-        ensureLiveEndedConsistency(game);
-        return game;
+    const eventId = await getGameIdBySlug(target);
+    if (eventId) {
+      const game = await getGameFromCache(eventId);
+      if (game) {
+        ensureLiveEndedConsistency(game as unknown as LiveGame);
+        return game as unknown as LiveGame;
       }
     }
-    const game = await getLiveGameBySlugFromDatabase(target);
+    const games = await getAllGamesFromCache();
+    const game = games.find((g) => {
+      const slugMatch = (g.slug as string)?.toLowerCase() === target;
+      const tickerMatch = (g as any).ticker?.toLowerCase() === target;
+      const idMatch = g.id?.toLowerCase() === target;
+      const rawSlug = (g as any).rawData?.slug;
+      const rawSlugMatch = rawSlug && String(rawSlug).toLowerCase() === target;
+      return slugMatch || tickerMatch || idMatch || rawSlugMatch;
+    });
     if (game) {
-      gamesCache.set(game.id, game);
-      return game;
+      ensureLiveEndedConsistency(game as unknown as LiveGame);
+      return game as unknown as LiveGame;
+    }
+    const dbGame = await getLiveGameBySlugFromDatabase(target);
+    if (dbGame) {
+      await addGameToCache(dbGame);
+      return dbGame;
     }
     return null;
   }
@@ -1626,13 +1683,13 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
 // }
 
 /**
- * Update game in cache only (for real-time price updates that already wrote to DB)
+ * Update game in shared cache (for real-time price updates that already wrote to DB)
  */
-export function updateGameInCache(gameId: string, updatedGame: LiveGame): void {
-  addGameToCache(updatedGame);
+export async function updateGameInCache(gameId: string, updatedGame: LiveGame): Promise<void> {
+  await addGameToCache(updatedGame);
 }
 
-/** Sports updates queue for batched DB flush (1s interval, one connection) */
+/** Sports updates queue for batched DB flush (1000ms interval, one connection) */
 const sportsGameUpdateQueue = new Map<number, Partial<LiveGame>>();
 let sportsGameUpdateFlushTimer: NodeJS.Timeout | null = null;
 const SPORTS_UPDATE_FLUSH_MS = 1000;
@@ -1674,8 +1731,14 @@ function applySportsUpdateToGame(game: LiveGame, updates: Partial<LiveGame>): Li
 /**
  * Apply sports game update: update cache, broadcast immediately, queue for batched DB flush.
  * Frontend gets real-time updates via WebSocket; DB is written in bulk every 1s.
+ * 
+ * IMPORTANT: When `live` changes to `false`, we flush immediately to ensure the API
+ * reflects the change right away. This prevents a race condition where:
+ * 1. WebSocket broadcasts live=false
+ * 2. User refreshes page
+ * 3. API returns stale live=true data (from batched write delay)
  */
-export function applySportsGameUpdate(gameId: number, updates: Partial<LiveGame>): void {
+export async function applySportsGameUpdate(gameId: number, updates: Partial<LiveGame>): Promise<void> {
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (!isProduction) {
@@ -1683,32 +1746,103 @@ export function applySportsGameUpdate(gameId: number, updates: Partial<LiveGame>
     return;
   }
 
+  // Check if this is a critical status change (any live status change or ended -> true)
+  // These need immediate DB write to keep API in sync with WebSocket
+  // We flush immediately for BOTH live=true AND live=false to avoid race conditions
+  const isCriticalStatusChange = updates.live !== undefined || updates.ended === true;
+
   // Merge into queue (overwrite = keep latest)
   const existing = sportsGameUpdateQueue.get(gameId);
   sportsGameUpdateQueue.set(gameId, { ...existing, ...updates });
 
   // Update cache and broadcast immediately (no DB yet)
-  let eventId = gameIdToEventId.get(gameId);
-  let game = eventId ? gamesCache.get(eventId) : null;
-  if (!game) {
-    for (const g of gamesCache.values()) {
-      if (g.gameId === gameId) {
-        game = g;
-        eventId = g.id;
-        break;
-      }
-    }
-  }
+  const game = await getGamesByGameIdFromCache(gameId);
 
   if (game) {
-    const merged = applySportsUpdateToGame(game, updates);
-    addGameToCache(merged);
-    if (liveGamesService) {
+    const merged = applySportsUpdateToGame(game as unknown as LiveGame, updates);
+    await addGameToCache(merged);
+
+    // Broadcast via Redis to ALL workers (including HTTP workers serving clients)
+    // This is critical for background worker -> HTTP worker communication
+    if (isRedisGamesBroadcastReady()) {
+      try {
+        const frontendGame = await transformToFrontendGame(merged);
+        const activityGame = await transformToActivityWatcherGame(merged);
+
+        // Publish to games channel (for /ws/games clients)
+        publishGamesBroadcast({
+          type: 'game_update',
+          payload: JSON.stringify({
+            type: 'game_update',
+            game: frontendGame,
+            timestamp: new Date().toISOString(),
+          }),
+        });
+
+        // Publish to activity channel (for /ws/activity clients)
+        const slugs = [merged.slug, merged.id].filter(Boolean) as string[];
+        publishActivityBroadcast(slugs, {
+          type: 'game_update',
+          game: activityGame,
+          timestamp: new Date().toISOString(),
+        });
+
+        logger.debug({
+          message: 'Sports update broadcast via Redis',
+          gameId,
+          slug: merged.slug,
+          score: updates.score,
+        });
+      } catch (err) {
+        logger.warn({
+          message: 'Error broadcasting sports update via Redis',
+          gameId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    } else if (liveGamesService) {
+      // Fallback to local callbacks (single-process mode)
       liveGamesService.broadcastPartialUpdate(merged);
     }
+  } else {
+    // This is expected for new games added to Polymarket after our last refresh.
+    // Use debug level to avoid log spam - these games will be picked up on next refresh.
+    logger.debug({
+      message: 'Sports update for unknown game (not in cache/DB yet)',
+      gameId,
+    });
   }
 
-  // Schedule batched flush
+  // For critical status changes (live=false, ended=true), flush immediately
+  // This ensures API stays in sync with WebSocket broadcasts
+  if (isCriticalStatusChange) {
+    // Cancel any pending timer and flush now
+    if (sportsGameUpdateFlushTimer) {
+      clearTimeout(sportsGameUpdateFlushTimer);
+      sportsGameUpdateFlushTimer = null;
+    }
+    
+    logger.info({
+      message: 'Critical status change detected, flushing immediately',
+      gameId,
+      live: updates.live,
+      ended: updates.ended,
+    });
+
+    // Flush immediately and WAIT for completion - ensures DB is in sync with WebSocket broadcast
+    // This prevents race condition where user refreshes and gets stale data from DB
+    try {
+      await flushSportsGameUpdates();
+    } catch (err) {
+      logger.warn({
+        message: 'Error flushing sports game updates (immediate)',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  // Schedule batched flush for non-critical updates (score changes, etc.)
   if (!sportsGameUpdateFlushTimer) {
     sportsGameUpdateFlushTimer = setTimeout(() => {
       sportsGameUpdateFlushTimer = null;
@@ -1739,19 +1873,9 @@ async function flushSportsGameUpdates(): Promise<void> {
   const toWrite: { eventId: string; game: LiveGame }[] = [];
 
   for (const [gameId] of pending) {
-    let eventId = gameIdToEventId.get(gameId);
-    let game = eventId ? gamesCache.get(eventId) : null;
-    if (!game) {
-      for (const g of gamesCache.values()) {
-        if (g.gameId === gameId) {
-          game = g;
-          eventId = g.id;
-          break;
-        }
-      }
-    }
-    if (!game || !eventId) continue;
-    toWrite.push({ eventId, game });
+    const game = await getGamesByGameIdFromCache(gameId);
+    if (!game || !game.id) continue;
+    toWrite.push({ eventId: game.id, game: game as unknown as LiveGame });
   }
 
   if (toWrite.length === 0) return;
@@ -1760,6 +1884,8 @@ async function flushSportsGameUpdates(): Promise<void> {
   toWrite.sort((a, b) => a.eventId.localeCompare(b.eventId));
 
   // 2. Build single bulk UPDATE (VALUES + UPDATE ... FROM)
+  // Only update sports-specific fields, NOT the entire transformed_data
+  // This prevents overwriting CLOB's market/price updates
   const valueRows: string[] = [];
   const allValues: unknown[] = [];
   let paramIndex = 1;
@@ -1773,8 +1899,19 @@ async function flushSportsGameUpdates(): Promise<void> {
     const active = game.active ?? null;
     const closed = game.closed ?? null;
     const periodScores = game.periodScores != null ? JSON.stringify(game.periodScores) : null;
-    const transformedData = JSON.stringify(game);
     const updatedAt = new Date().toISOString();
+    // Build partial JSON with only sports fields (merged into transformed_data, preserving markets)
+    const sportsFieldsJson = JSON.stringify({
+      score: game.score,
+      period: game.period,
+      elapsed: game.elapsed,
+      live: game.live,
+      ended: game.ended,
+      active: game.active,
+      closed: game.closed,
+      periodScores: game.periodScores,
+      updatedAt,
+    });
 
     const placeholders = [
       `$${paramIndex++}`,
@@ -1790,9 +1927,11 @@ async function flushSportsGameUpdates(): Promise<void> {
       `$${paramIndex++}::timestamptz`,
     ].join(', ');
     valueRows.push(`(${placeholders})`);
-    allValues.push(eventId, score, period, elapsed, live, ended, active, closed, periodScores, transformedData, updatedAt);
+    allValues.push(eventId, score, period, elapsed, live, ended, active, closed, periodScores, sportsFieldsJson, updatedAt);
   }
 
+  // Use jsonb || to MERGE sports fields into transformed_data instead of replacing it
+  // This preserves CLOB's market/price updates while updating sports fields
   const bulkUpdateQuery = `
     UPDATE live_games lg SET
       score = COALESCE(v.score, lg.score),
@@ -1803,9 +1942,9 @@ async function flushSportsGameUpdates(): Promise<void> {
       active = COALESCE(v.active, lg.active),
       closed = COALESCE(v.closed, lg.closed),
       period_scores = COALESCE(v.period_scores, lg.period_scores),
-      transformed_data = COALESCE(v.transformed_data, lg.transformed_data),
+      transformed_data = COALESCE(lg.transformed_data, '{}'::jsonb) || v.sports_fields,
       updated_at = v.updated_at
-    FROM (VALUES ${valueRows.join(', ')}) AS v(id, score, period, elapsed, live, ended, active, closed, period_scores, transformed_data, updated_at)
+    FROM (VALUES ${valueRows.join(', ')}) AS v(id, score, period, elapsed, live, ended, active, closed, period_scores, sports_fields, updated_at)
     WHERE lg.id = v.id
   `;
 
@@ -1856,61 +1995,142 @@ async function flushSportsGameUpdates(): Promise<void> {
  * Q1, Q2, Q3, Q4 -> q1, q2, q3, q4
  * P1, P2, P3 -> p1, p2, p3
  * 1H, 2H -> 1h, 2h
+ * S1, S2, S3, S4, S5 -> s1, s2, s3, s4, s5 (Tennis sets)
  * OT -> ot
  */
 function normalizePeriodKey(period: string | undefined): string | null {
   if (!period) return null;
-  
+
   const periodLower = period.toLowerCase().trim();
-  
+
   // Handle "End Q1", "End Q2", etc. - normalize to "q1", "q2", etc.
   if (periodLower.startsWith('end ')) {
     const periodWithoutEnd = periodLower.replace(/^end\s+/, '').trim();
     // Recursively call with the period without "end" prefix
     return normalizePeriodKey(periodWithoutEnd);
   }
-  
+
   // Handle quarters (NBA, NFL)
   if (periodLower === 'q1' || periodLower === '1q' || periodLower === '1st') return 'q1';
   if (periodLower === 'q2' || periodLower === '2q' || periodLower === '2nd') return 'q2';
   if (periodLower === 'q3' || periodLower === '3q' || periodLower === '3rd') return 'q3';
   if (periodLower === 'q4' || periodLower === '4q' || periodLower === '4th') return 'q4';
-  
+
   // Handle periods (NHL)
   if (periodLower === 'p1' || periodLower === '1p' || periodLower === 'period 1') return 'p1';
   if (periodLower === 'p2' || periodLower === '2p' || periodLower === 'period 2') return 'p2';
   if (periodLower === 'p3' || periodLower === '3p' || periodLower === 'period 3') return 'p3';
-  
+
+  // Handle tennis sets (S1, S2, S3, S4, S5)
+  if (periodLower === 's1' || periodLower === 'set 1' || periodLower === 'set1') return 's1';
+  if (periodLower === 's2' || periodLower === 'set 2' || periodLower === 'set2') return 's2';
+  if (periodLower === 's3' || periodLower === 'set 3' || periodLower === 'set3') return 's3';
+  if (periodLower === 's4' || periodLower === 'set 4' || periodLower === 'set4') return 's4';
+  if (periodLower === 's5' || periodLower === 'set 5' || periodLower === 'set5') return 's5';
+
   // Handle halves (Soccer)
   if (periodLower === '1h' || periodLower === '1st half' || periodLower === 'first half') return '1h';
   if (periodLower === '2h' || periodLower === '2nd half' || periodLower === 'second half') return '2h';
-  
+
   // Handle halftime (transition period)
   if (periodLower === 'ht' || periodLower === 'halftime' || periodLower === 'half') return 'ht';
-  
+
   // Handle overtime
   if (periodLower === 'ot' || periodLower === 'overtime') return 'ot';
-  
+
   // Handle final/finished
   if (periodLower === 'final' || periodLower === 'vft' || periodLower === 'finished') return 'final';
-  
+
   // Return lowercase version if no match
   return periodLower;
 }
 
 /**
- * Parse score string (e.g., "0-2") into individual scores
- * Polymarket format: "away-home" (first number is AWAY team score, second is HOME team score)
+ * Parse score string into individual scores
+ *
+ * Traditional sports format: "0-2" (away-home)
+ * Tennis format: "6-7(5-7), 1-2" or "6-4, 2-5" (sets separated by comma)
+ *
+ * For tennis, returns the current set score (last set in the string)
+ * Also returns setsWon for tennis (count of sets won by each player)
  */
-function parseScoreString(scoreStr: string | undefined): { home: number; away: number } | null {
+function parseScoreString(scoreStr: string | undefined, isTennis: boolean = false): { home: number; away: number; setsWon?: { home: number; away: number }; rawScore?: string } | null {
   if (!scoreStr) return null;
-  
+
+  // Tennis score parsing: "6-7(5-7), 1-2" or "6-4, 2-5"
+  if (isTennis || scoreStr.includes(',') || scoreStr.includes('(')) {
+    return parseTennisScore(scoreStr);
+  }
+
+  // Traditional score parsing: "away-home"
   const parts = scoreStr.split('-').map(s => parseInt(s.trim(), 10));
   if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
     // Format is away-home: first number is away, second is home
     return { away: parts[0], home: parts[1] };
   }
   return null;
+}
+
+/**
+ * Parse tennis score format
+ * Examples:
+ * - "6-7(5-7), 1-2" -> Set 1: 6-7 (tiebreak 5-7), Set 2: 1-2 (current)
+ * - "6-4, 2-5" -> Set 1: 6-4 (player 1 won), Set 2: 2-5 (current)
+ * - "6-4, 6-3" -> Set 1: 6-4, Set 2: 6-3 (match complete)
+ *
+ * Returns current set score + sets won count
+ */
+function parseTennisScore(scoreStr: string): { home: number; away: number; setsWon: { home: number; away: number }; rawScore: string } | null {
+  if (!scoreStr) return null;
+
+  // Split by comma to get individual sets
+  const sets = scoreStr.split(',').map(s => s.trim());
+
+  let homeSetsWon = 0;
+  let awaySetsWon = 0;
+  let currentSetHome = 0;
+  let currentSetAway = 0;
+
+  for (let i = 0; i < sets.length; i++) {
+    const setScore = sets[i];
+
+    // Remove tiebreak notation (e.g., "6-7(5-7)" -> "6-7")
+    const cleanScore = setScore.replace(/\([^)]+\)/, '').trim();
+
+    // Parse the set score
+    const parts = cleanScore.split('-').map(s => parseInt(s.trim(), 10));
+    if (parts.length !== 2 || isNaN(parts[0]) || isNaN(parts[1])) continue;
+
+    const [awayGames, homeGames] = parts;
+
+    // If this is the last set, it's the current set score
+    if (i === sets.length - 1) {
+      currentSetAway = awayGames;
+      currentSetHome = homeGames;
+    }
+
+    // Check if this set is complete (one player reached 6+ games with 2 game lead, or 7 in tiebreak)
+    const isSetComplete =
+      (awayGames >= 6 && awayGames - homeGames >= 2) ||
+      (homeGames >= 6 && homeGames - awayGames >= 2) ||
+      awayGames === 7 || homeGames === 7;
+
+    if (isSetComplete || i < sets.length - 1) {
+      // Completed set - count who won
+      if (awayGames > homeGames) {
+        awaySetsWon++;
+      } else if (homeGames > awayGames) {
+        homeSetsWon++;
+      }
+    }
+  }
+
+  return {
+    away: currentSetAway,
+    home: currentSetHome,
+    setsWon: { home: homeSetsWon, away: awaySetsWon },
+    rawScore: scoreStr,
+  };
 }
 
 /**
@@ -2167,7 +2387,7 @@ export async function refreshLiveGames(): Promise<number> {
     // No longer cleanup ended games from database
     // They remain available for fetching by ID/slug
     
-    const allStoredGames = getCachedGamesForBroadcast();
+    const allStoredGames = await getCachedGamesForBroadcast();
     if (liveGamesService) {
       liveGamesService.broadcastUpdate(allStoredGames);
     }

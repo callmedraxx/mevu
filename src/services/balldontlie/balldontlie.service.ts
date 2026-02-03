@@ -10,7 +10,7 @@
 import { BalldontlieAPI } from '@balldontlie/sdk';
 import { logger } from '../../config/logger';
 import { pool } from '../../config/database';
-import { gamesCache } from '../polymarket/live-games.service';
+import { getGameFromCacheById } from '../polymarket/live-games.service';
 import { teamsService } from '../polymarket/teams.service';
 import { getLeagueForSport } from '../polymarket/teams.config';
 
@@ -297,10 +297,10 @@ class BallDontLieClient {
     // Filter out invalid game IDs (e.g., 0, 1, or negative)
     const validGameIds = gameIds.filter(id => id && id > 1);
     if (validGameIds.length === 0) {
-      logger.warn({
-        message: `No valid ${sport.toUpperCase()} game IDs provided`,
-        originalGameIds: gameIds,
-      });
+      // logger.warn({
+      //   message: `No valid ${sport.toUpperCase()} game IDs provided`,
+      //   originalGameIds: gameIds,
+      // });
       return [];
     }
     
@@ -327,11 +327,11 @@ class BallDontLieClient {
           params.append(paramName, id.toString());
         });
 
-        logger.info({
-          message: `Trying ${sport.toUpperCase()} player stats endpoint`,
-          endpoint,
-          gameIds: validGameIds,
-        });
+        // logger.info({
+        //   message: `Trying ${sport.toUpperCase()} player stats endpoint`,
+        //   endpoint,
+        //   gameIds: validGameIds,
+        // });
 
         const response = await axios.get(endpoint, {
         headers: {
@@ -370,22 +370,22 @@ class BallDontLieClient {
     } catch (error: any) {
         // 404 means this endpoint doesn't exist, try next variant
       if (error.response?.status === 404) {
-          logger.debug({
-            message: `${sport.toUpperCase()} endpoint not found, trying next variant`,
-            endpoint,
-            status: 404,
-          });
+          // logger.debug({
+          //   message: `${sport.toUpperCase()} endpoint not found, trying next variant`,
+          //   endpoint,
+          //   status: 404,
+          // });
           continue;
         }
         
         // 403/401 means subscription tier doesn't include this
         if (error.response?.status === 403 || error.response?.status === 401) {
-        logger.warn({
-            message: `${sport.toUpperCase()} player stats not available (subscription tier limit)`,
-            endpoint,
-            status: error.response?.status,
-            note: 'Player stats may require a higher subscription tier',
-          });
+        // logger.warn({
+        //     message: `${sport.toUpperCase()} player stats not available (subscription tier limit)`,
+        //     endpoint,
+        //     status: error.response?.status,
+        //     note: 'Player stats may require a higher subscription tier',
+        //   });
           return [];
         }
         
@@ -400,11 +400,11 @@ class BallDontLieClient {
     }
     
     // No endpoint worked
-    logger.warn({
-      message: `${sport.toUpperCase()} player stats not available from any endpoint`,
-      gameIds: validGameIds,
-      note: 'Player stats may not be available for this league or subscription tier',
-        });
+    // logger.warn({
+    //   message: `${sport.toUpperCase()} player stats not available from any endpoint`,
+    //   gameIds: validGameIds,
+    //   note: 'Player stats may not be available for this league or subscription tier',
+    //     });
         return [];
       }
 
@@ -764,11 +764,11 @@ class BallDontLieClient {
     } catch (error: any) {
       // Handle 404 gracefully - game might not exist or no stats available
       if (error.response?.status === 404) {
-        logger.warn({
-          message: 'NCAAF game not found in Ball Don\'t Lie API (404)',
-          gameIds,
-          note: 'Game may not exist or stats may not be available yet',
-        });
+        // logger.warn({
+        //   message: 'NCAAF game not found in Ball Don\'t Lie API (404)',
+        //   gameIds,
+        //   note: 'Game may not exist or stats may not be available yet',
+        // });
         return [];
       }
       throw error;
@@ -799,11 +799,11 @@ class BallDontLieClient {
     } catch (error: any) {
       // Handle 404 gracefully - game might not exist or no stats available
       if (error.response?.status === 404) {
-        logger.warn({
-          message: 'NCAAB game not found in Ball Don\'t Lie API (404)',
-          gameIds,
-          note: 'Game may not exist or stats may not be available yet',
-        });
+        // logger.warn({
+        //   message: 'NCAAB game not found in Ball Don\'t Lie API (404)',
+        //   gameIds,
+        //   note: 'Game may not exist or stats may not be available yet',
+        // });
         return [];
       }
       throw error;
@@ -831,11 +831,11 @@ class BallDontLieClient {
       return response.data.data || [];
     } catch (error: any) {
       if (error.response?.status === 404) {
-        logger.warn({
-          message: `${league.toUpperCase()} match not found in Ball Don't Lie API (404)`,
-          matchIds,
-          note: 'Match may not exist or stats may not be available yet',
-        });
+        // logger.warn({
+        //   message: `${league.toUpperCase()} match not found in Ball Don't Lie API (404)`,
+        //   matchIds,
+        //   note: 'Match may not exist or stats may not be available yet',
+        // });
         return [];
       }
       throw error;
@@ -1168,13 +1168,13 @@ class BallDontLieClient {
       
       return teamsMap;
     } catch (error: any) {
-      logger.warn({
-        message: `Error fetching ${sport.toUpperCase()} teams`,
-        endpoint,
-        season,
-        error: error.message,
-        status: error.response?.status,
-      });
+      // logger.warn({
+      //   message: `Error fetching ${sport.toUpperCase()} teams`,
+      //   endpoint,
+      //   season,
+      //   error: error.message,
+      //   status: error.response?.status,
+      // });
       return new Map();
     }
   }
@@ -1285,7 +1285,7 @@ export async function storePlayerStats(
   let game: Record<string, any>;
   let gameSlug: string;
 
-  const cachedGame = gamesCache.get(gameId);
+  const cachedGame = await getGameFromCacheById(gameId);
   if (cachedGame) {
     game = cachedGame as unknown as Record<string, any>;
     gameSlug = cachedGame.slug || '';
@@ -2353,6 +2353,22 @@ function lastNameMatch(ourName: string, bdlName: string): boolean {
   return ourLast === bdlLast || ourLast.includes(bdlLast) || bdlLast.includes(ourLast);
 }
 
+/** Transient network errors that warrant a retry */
+const TRANSIENT_ERROR_PATTERNS = [
+  'socket hang up',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'network',
+  'timeout',
+];
+
+function isTransientNetworkError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return TRANSIENT_ERROR_PATTERNS.some((p) => msg.toLowerCase().includes(p.toLowerCase()));
+}
+
 /**
  * Extract team abbreviation from slug
  * Format: sport-away-home-YYYY-MM-DD (e.g., nhl-sea-ana-2025-12-22)
@@ -2419,11 +2435,11 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
           });
           // Continue to remap instead of using invalid ID
         } else {
-          logger.info({
-            message: 'Found existing Ball Don\'t Lie game ID mapping',
-            gameId: game.id,
-            balldontlieGameId: storedGameId,
-          });
+          // logger.info({
+          //   message: 'Found existing Ball Don\'t Lie game ID mapping',
+          //   gameId: game.id,
+          //   balldontlieGameId: storedGameId,
+          // });
           return storedGameId;
         }
       }
@@ -2441,11 +2457,11 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
 
   // If not mapped, try to find the game in Ball Don't Lie API
   if (!game.sport) {
-    logger.warn({
-      message: 'Cannot map game - missing sport',
-      gameId: game.id,
-      sport: game.sport,
-    });
+    // logger.warn({
+    //   message: 'Cannot map game - missing sport',
+    //   gameId: game.id,
+    //   sport: game.sport,
+    // });
     return null;
   }
 
@@ -2478,13 +2494,13 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
     }
     
     if (!dateStr) {
-      logger.warn({
-        message: 'Cannot extract date from slug, endDate, or startDate',
-        gameId: game.id,
-        slug: game.slug,
-        startDate: game.startDate,
-        endDate: game.endDate,
-      });
+      // logger.warn({
+      //   message: 'Cannot extract date from slug, endDate, or startDate',
+      //   gameId: game.id,
+      //   slug: game.slug,
+      //   startDate: game.startDate,
+      //   endDate: game.endDate,
+      // });
       return null;
     }
 
@@ -2602,14 +2618,14 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
 
     // Validate that we found games
     if (balldontlieGames.length === 0) {
-      logger.warn({
-        message: 'No Ball Don\'t Lie games found for date',
-        gameId: game.id,
-        sport: game.sport,
-        dateStr,
-        homeTeamAbbr,
-        awayTeamAbbr,
-      });
+      // logger.warn({
+      //   message: 'No Ball Don\'t Lie games found for date',
+      //   gameId: game.id,
+      //   sport: game.sport,
+      //   dateStr,
+      //   homeTeamAbbr,
+      //   awayTeamAbbr,
+      // });
       return null;
     }
 
@@ -2942,13 +2958,13 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
     if (matchedGame) {
       // Validate game ID before storing
       if (!matchedGame.id || matchedGame.id <= 1) {
-        logger.warn({
-          message: 'Invalid Ball Don\'t Lie game ID found',
-          polymarketGameId: game.id,
-          balldontlieGameId: matchedGame.id,
-          sport: game.sport,
-          note: 'Game ID appears to be invalid, skipping mapping',
-        });
+        // logger.warn({
+        //   message: 'Invalid Ball Don\'t Lie game ID found',
+        //   polymarketGameId: game.id,
+        //   balldontlieGameId: matchedGame.id,
+        //   sport: game.sport,
+        //   note: 'Game ID appears to be invalid, skipping mapping',
+        // });
         return null;
       }
       
@@ -2972,31 +2988,49 @@ export async function findAndMapBalldontlieGameId(game: any): Promise<number | n
         updateClient.release();
       }
     } else {
-      logger.warn({
-        message: 'Could not find matching Ball Don\'t Lie game',
-        polymarketGameId: game.id,
-        sport: game.sport,
-        date: dateStr,
-        homeTeamAbbr,
-        awayTeamAbbr,
-        availableGames: isTennisSport(bdSport)
-          ? balldontlieGames.map((g: any) => ({
-              id: g.id,
-              player1: g.player1?.full_name,
-              player2: g.player2?.full_name,
-            }))
-          : balldontlieGames.map((g: any) => {
-              const awayTeam = g.away_team || g.visitor_team;
-              return {
-                id: g.id,
-                home: g.home_team?.abbreviation || g.home_team?.name,
-                away: awayTeam?.abbreviation || awayTeam?.name,
-              };
-            }),
-      });
+      // logger.warn({
+      //   message: 'Could not find matching Ball Don\'t Lie game',
+      //   polymarketGameId: game.id,
+      //   sport: game.sport,
+      //   date: dateStr,
+      //   homeTeamAbbr,
+      //   awayTeamAbbr,
+      //   availableGames: isTennisSport(bdSport)
+      //     ? balldontlieGames.map((g: any) => ({
+      //         id: g.id,
+      //         player1: g.player1?.full_name,
+      //         player2: g.player2?.full_name,
+      //       }))
+      //     : balldontlieGames.map((g: any) => {
+      //         const awayTeam = g.away_team || g.visitor_team;
+      //         return {
+      //           id: g.id,
+      //           home: g.home_team?.abbreviation || g.home_team?.name,
+      //           away: awayTeam?.abbreviation || awayTeam?.name,
+      //         };
+      //       }),
+      // });
       return null;
     }
   } catch (error) {
+    const retries = (game as any).__bdlRetries ?? 0;
+    if (isTransientNetworkError(error) && retries < 2) {
+      (game as any).__bdlRetries = retries + 1;
+      // logger.warn({
+      //   message: 'Retrying after transient Ball Don\'t Lie API error',
+      //   gameId: game.id,
+      //   sport: game.sport,
+      //   attempt: retries + 1,
+      //   error: error instanceof Error ? error.message : String(error),
+      // });
+      await new Promise((r) => setTimeout(r, 600 * (retries + 1)));
+      try {
+        return await findAndMapBalldontlieGameId(game);
+      } finally {
+        delete (game as any).__bdlRetries;
+      }
+    }
+    delete (game as any).__bdlRetries;
     logger.error({
       message: 'Error finding Ball Don\'t Lie game',
       gameId: game.id,
@@ -3021,24 +3055,24 @@ export async function fetchAndStorePlayerStats(game: any): Promise<any[]> {
 
   // Check if sport is supported
   if (!isSportSupported(effectiveSport)) {
-    logger.warn({
-      message: 'Sport not supported by Ball Don\'t Lie API',
-      gameId: game.id,
-      sport: game.sport,
-      effectiveSport,
-      note: `Ball Don't Lie API supports: NBA, NFL, MLB, NHL, EPL, NCAAF, NCAAB, ATP, WTA.`,
-    });
+    // logger.warn({
+    //   message: 'Sport not supported by Ball Don\'t Lie API',
+    //   gameId: game.id,
+    //   sport: game.sport,
+    //   effectiveSport,
+    //   note: `Ball Don't Lie API supports: NBA, NFL, MLB, NHL, EPL, NCAAF, NCAAB, ATP, WTA.`,
+    // });
     return [];
   }
 
   // For tennis (ATP/WTA), only fetch match stats when game is live
   if (getBalldontlieSport(effectiveSport) === 'atp' || getBalldontlieSport(effectiveSport) === 'wta') {
     if (!game.live) {
-      logger.debug({
-        message: 'Skipping tennis match stats fetch - game is not live',
-        gameId: game.id,
-        sport: effectiveSport,
-      });
+      // logger.debug({
+      //   message: 'Skipping tennis match stats fetch - game is not live',
+      //   gameId: game.id,
+      //   sport: effectiveSport,
+      // });
       return [];
     }
   }

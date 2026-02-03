@@ -405,9 +405,14 @@ class PositionsWebSocketService {
       const games = await getAllLiveGames();
 
       for (const game of games) {
-        if (!game.markets) continue;
+        // Use game.markets, fall back to rawData.markets for sports games (tennis, etc.)
+        const markets = game.markets && game.markets.length > 0
+          ? game.markets
+          : ((game.rawData as any)?.markets?.length > 0 ? (game.rawData as any).markets : []);
 
-        for (const market of game.markets) {
+        if (markets.length === 0) continue;
+
+        for (const market of markets) {
           const outcomes = market.structuredOutcomes;
           if (!outcomes) continue;
 

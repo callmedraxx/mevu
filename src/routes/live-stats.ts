@@ -78,12 +78,12 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
             }
           }
           stats.periodScores = convertedScores;
-          logger.info({
-            message: 'Updated period scores from Ball Don\'t Lie',
-            gameId: game.id,
-            sport,
-            periodScores: convertedScores,
-          });
+          // logger.info({
+          //   message: 'Updated period scores from Ball Don\'t Lie',
+          //   gameId: game.id,
+          //   sport,
+          //   periodScores: convertedScores,
+          // });
         }
       } catch (error) {
         logger.warn({
@@ -100,11 +100,11 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
     // The fetchAndStorePlayerStats function checks if stats are stale (> 5 minutes old)
     // and refreshes them if needed. We should NOT bypass this by just checking if stats exist.
     try {
-      logger.info({
-        message: 'Fetching player stats for game',
-        gameId: game.id,
-        sport: game.sport,
-      });
+      // logger.info({
+      //   message: 'Fetching player stats for game',
+      //   gameId: game.id,
+      //   sport: game.sport,
+      // });
       
       // Use a longer timeout for European soccer leagues (rosters for player names)
       // and for tennis (ATP/WTA match_stats API)
@@ -118,11 +118,11 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
       const statsPromise = fetchAndStorePlayerStats(game);
       const timeoutPromise = new Promise<any[]>((resolve) => 
         setTimeout(() => {
-          logger.warn({
-            message: 'Player stats fetch timed out',
-            gameId: game.id,
-            timeoutMs,
-          });
+          // logger.warn({
+          //   message: 'Player stats fetch timed out',
+          //   gameId: game.id,
+          //   timeoutMs,
+          // });
           resolve([]);
         }, timeoutMs)
       );
@@ -135,20 +135,20 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
         await new Promise(resolve => setTimeout(resolve, 500));
         playerStats = await getPlayerStats(game.id);
         
-        if (playerStats.length > 0) {
-          logger.info({
-            message: 'Found player stats in database after timeout',
-            gameId: game.id,
-            statsCount: playerStats.length,
-          });
-        }
+        // if (playerStats.length > 0) {
+        //   logger.info({
+        //     message: 'Found player stats in database after timeout',
+        //     gameId: game.id,
+        //     statsCount: playerStats.length,
+        //   });
+        // }
       }
       
-      logger.info({
-        message: 'Player stats fetch completed',
-        gameId: game.id,
-        statsCount: playerStats.length,
-      });
+      // logger.info({
+      //   message: 'Player stats fetch completed',
+      //   gameId: game.id,
+      //   statsCount: playerStats.length,
+      // });
       
       if (playerStats.length > 0) {
         stats.playerStats = playerStats;

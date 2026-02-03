@@ -27,8 +27,13 @@ function matchTradeOutcomeToTeam(
   const homeAbbr = game.homeTeam?.abbreviation?.toLowerCase() || '';
   const awayAbbr = game.awayTeam?.abbreviation?.toLowerCase() || '';
 
+  // Use game.markets, fall back to rawData.markets for sports games (tennis, etc.)
+  const markets = game.markets && game.markets.length > 0
+    ? game.markets
+    : ((game.rawData as any)?.markets?.length > 0 ? (game.rawData as any).markets : []);
+
   // Try to find moneyline market to get outcome labels
-  if (!game.markets || game.markets.length === 0) {
+  if (markets.length === 0) {
     // Fallback: try direct name/abbreviation matching
     if (homeTeamName && (normalizedOutcome.includes(homeTeamName) || homeTeamName.includes(normalizedOutcome))) {
       return 'home';
@@ -46,7 +51,7 @@ function matchTradeOutcomeToTeam(
   }
 
   // Look for moneyline market (team vs team market)
-  for (const market of game.markets) {
+  for (const market of markets) {
     // Skip Over/Under markets
     const question = (market.question || '').toLowerCase();
     if (question.includes('over') || question.includes('under') || question.includes('o/u')) {

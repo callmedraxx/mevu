@@ -10,12 +10,12 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - WORKER_COUNT=2
-      - NODE_OPTIONS=--max-old-space-size=3584  # 3.5GB per worker
+      - WORKER_COUNT=4
+      - NODE_OPTIONS=--max-old-space-size=3072  # 3GB per worker (2 background + 2 HTTP + 1 primary = 5 processes)
       - DATABASE_URL=postgresql://user:password@pgbouncer:6432/mevu
       - REDIS_URL=redis://redis:6379
       - SWAGGER_BASE_URL=https://dev.api.mevu.com
-      - UV_THREADPOOL_SIZE=128  # Increase libuv thread pool
+      - UV_THREADPOOL_SIZE=256  # Increase libuv thread pool for 8 vCPUs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -31,9 +31,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 7.5G
+          cpus: '6'
+          memory: 14G
         reservations:
-          memory: 4G
+          cpus: '4'
+          memory: 8G
     ulimits:
       nofile:
         soft: 65536
@@ -51,22 +53,22 @@ services:
       - postgres_data:/var/lib/postgresql/data
     command: >
       postgres
-      -c max_connections=300
-      -c shared_buffers=2GB
-      -c effective_cache_size=6GB
-      -c maintenance_work_mem=512MB
+      -c max_connections=400
+      -c shared_buffers=3GB
+      -c effective_cache_size=9GB
+      -c maintenance_work_mem=1GB
       -c checkpoint_completion_target=0.9
-      -c wal_buffers=16MB
+      -c wal_buffers=64MB
       -c default_statistics_target=100
       -c random_page_cost=1.1
       -c effective_io_concurrency=200
-      -c work_mem=5MB
+      -c work_mem=16MB
       -c min_wal_size=2GB
       -c max_wal_size=8GB
-      -c max_worker_processes=4
-      -c max_parallel_workers_per_gather=2
-      -c max_parallel_workers=4
-      -c max_parallel_maintenance_workers=2
+      -c max_worker_processes=8
+      -c max_parallel_workers_per_gather=4
+      -c max_parallel_workers=8
+      -c max_parallel_maintenance_workers=4
       -c checkpoint_timeout=30min
       -c log_checkpoints=on
       -c log_connections=off
@@ -81,7 +83,7 @@ services:
       -c bgwriter_delay=200ms
       -c bgwriter_lru_maxpages=100
       -c bgwriter_lru_multiplier=2.0
-      -c autovacuum_max_workers=3
+      -c autovacuum_max_workers=4
       -c autovacuum_naptime=10s
       -c autovacuum_vacuum_threshold=50
       -c autovacuum_analyze_threshold=50
@@ -103,13 +105,15 @@ services:
       -c shared_preload_libraries=pg_stat_statements
       -c pg_stat_statements.max=10000
       -c pg_stat_statements.track=all
-    shm_size: 2gb
+    shm_size: 3gb
     deploy:
       resources:
         limits:
-          memory: 7G
+          cpus: '2'
+          memory: 5G
         reservations:
-          memory: 4G
+          cpus: '1'
+          memory: 3G
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U user -d mevu"]
       interval: 5s
@@ -121,12 +125,30 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: redis-server --client-output-buffer-limit "pubsub 256mb 128mb 120"
+    command: >
+      redis-server
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --save ""
+      --tcp-keepalive 60
+      --timeout 0
+      --client-output-buffer-limit "pubsub 128mb 64mb 60"
+      --client-output-buffer-limit "normal 0 0 0"
+      --hz 10
+      --activerehashing yes
+      --io-threads 2
     ports:
       - "6379:6379"
     restart: unless-stopped
     networks:
       - mevu-network
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+        reservations:
+          memory: 768M
 
   pgbouncer:
     image: rmccaffrey/pgbouncer:latest

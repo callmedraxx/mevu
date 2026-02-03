@@ -17,16 +17,32 @@ import {
 const DATA_API_BASE_URL = 'https://data-api.polymarket.com';
 
 /**
+ * Request coalescing: prevents multiple concurrent requests for the same conditionIds
+ * from hammering Polymarket API and hitting rate limits
+ */
+const inFlightHoldersRequests = new Map<string, Promise<PolymarketHolderResponse[]>>();
+
+function getHoldersRequestKey(conditionIds: string[]): string {
+  // Sort to ensure same set of IDs produces same key
+  return conditionIds.slice().sort().join(',');
+}
+
+/**
  * Extract all market conditionIds from a game
  */
 export function extractAllMarketConditionIds(game: LiveGame): string[] {
-  if (!game.markets || game.markets.length === 0) {
+  // Use game.markets, fall back to rawData.markets for sports games (tennis, etc.)
+  const markets = game.markets && game.markets.length > 0
+    ? game.markets
+    : ((game.rawData as any)?.markets?.length > 0 ? (game.rawData as any).markets : []);
+
+  if (markets.length === 0) {
     return [];
   }
 
   const conditionIds: string[] = [];
 
-  for (const market of game.markets) {
+  for (const market of markets) {
     if (market.conditionId) {
       conditionIds.push(market.conditionId);
     }
@@ -38,6 +54,7 @@ export function extractAllMarketConditionIds(game: LiveGame): string[] {
 /**
  * Fetch holders from Polymarket data API
  * Builds query string with multiple market parameters
+ * Uses request coalescing to prevent rate limiting under concurrent load
  */
 export async function fetchHoldersFromPolymarket(
   conditionIds: string[]
@@ -46,6 +63,40 @@ export async function fetchHoldersFromPolymarket(
     return [];
   }
 
+  const requestKey = getHoldersRequestKey(conditionIds);
+  
+  // Check if there's already an in-flight request for these conditionIds
+  const existingRequest = inFlightHoldersRequests.get(requestKey);
+  if (existingRequest) {
+    logger.debug({
+      message: 'Request coalescing: reusing in-flight Polymarket holders request',
+      conditionIdsCount: conditionIds.length,
+    });
+    return existingRequest;
+  }
+
+  // Create the actual fetch promise
+  const fetchPromise = doFetchHoldersFromPolymarket(conditionIds);
+  
+  // Store it so other concurrent requests can reuse it
+  inFlightHoldersRequests.set(requestKey, fetchPromise);
+  
+  try {
+    const result = await fetchPromise;
+    return result;
+  } finally {
+    // Always clean up after the request completes (success or failure)
+    inFlightHoldersRequests.delete(requestKey);
+  }
+}
+
+/**
+ * Internal implementation of Polymarket holders fetch
+ * This is called only once per conditionIds set even if multiple requests come in concurrently
+ */
+async function doFetchHoldersFromPolymarket(
+  conditionIds: string[]
+): Promise<PolymarketHolderResponse[]> {
   try {
     const url = `${DATA_API_BASE_URL}/holders`;
     

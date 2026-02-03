@@ -20,7 +20,8 @@ import { gamesWebSocketService } from './services/polymarket/games-websocket.ser
 import { activityWatcherWebSocketService } from './services/polymarket/activity-watcher-websocket.service';
 import { clobPriceUpdateService } from './services/polymarket/clob-price-update.service';
 import { positionsWebSocketService } from './services/positions/positions-websocket.service';
-import { shutdownRedisGamesBroadcast } from './services/redis-games-broadcast.service';
+import { initRedisGamesBroadcast, shutdownRedisGamesBroadcast } from './services/redis-games-broadcast.service';
+import { initRedisGamesCache, shutdownRedisGamesCache } from './services/polymarket/redis-games-cache.service';
 import { initializeProbabilityHistoryTable, cleanupOldProbabilityHistory } from './services/polymarket/probability-history.service';
 import { logger } from './config/logger';
 import { runMigrations } from './scripts/run-migrations';
@@ -33,6 +34,29 @@ import { depositProgressService } from './services/privy/deposit-progress.servic
 
 // Load environment variables
 dotenv.config();
+
+// Global error handlers to prevent worker crashes
+process.on('uncaughtException', (error) => {
+  logger.error({
+    message: 'Uncaught exception - worker will continue',
+    error: error.message,
+    stack: error.stack,
+    pid: process.pid,
+    workerId: cluster.isWorker ? cluster.worker?.id : 'primary',
+  });
+  // Don't exit - let the worker continue
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error({
+    message: 'Unhandled promise rejection - worker will continue',
+    reason: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+    pid: process.pid,
+    workerId: cluster.isWorker ? cluster.worker?.id : 'primary',
+  });
+  // Don't exit - let the worker continue
+});
 
 // Initialize logo mapping service
 logoMappingService.initialize().catch((error) => {
@@ -54,6 +78,14 @@ app.use(cors({
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Add worker ID to response headers for load balancing verification
+app.use((req, res, next) => {
+  const workerId = cluster.isWorker ? `worker-${cluster.worker?.id}` : 'primary';
+  res.setHeader('X-Worker-Id', workerId);
+  res.setHeader('X-Process-Id', process.pid.toString());
+  next();
+});
 
 // Global request logging for debugging
 app.use((req, res, next) => {
@@ -118,8 +150,8 @@ app.get('/ws/health', (req, res) => {
 // API routes
 app.use('/api', apiRouter);
 
-// Initialize services on startup
-async function initializeServices() {
+// Initialize SPORTS services only (for sports background worker)
+async function initializeSportsServices() {
   try {
     // Run database migrations first
     const nodeEnv = process.env.NODE_ENV || 'development';
@@ -128,53 +160,38 @@ async function initializeServices() {
       await runMigrations();
       logger.info({ message: 'Database migrations completed' });
     }
-    
-    // Privy is initialized in startHttpServer() (all workers) before listen.
 
     // Stagger database-dependent service initialization to prevent connection pool exhaustion
     // Initialize users table
     logger.info({ message: 'Initializing users table...' });
     await initializeUsersTable();
-    
+
     // Small delay to allow previous connection to complete
     await new Promise(resolve => setTimeout(resolve, 500));
-    
+
     // Initialize probability history table
-    // logger.info({ message: 'Initializing probability history table...' });
     await initializeProbabilityHistoryTable();
-    
+
     // Longer delay before starting services that make immediate DB connections
-    // This prevents connection pool exhaustion
     await new Promise(resolve => setTimeout(resolve, 1000));
 
     // Sync series IDs from Gamma so we don't have to hardcode seasonal series_id changes
-    // (especially important for CBB/CFB). Also refreshes daily.
     await seriesIdSyncService.start();
-    
-    // Start live games polling service (delayed initial refresh built into service)
-    // logger.info({ message: 'Starting live games service...' });
+
+    // Start live games polling service
     liveGamesService.start();
-    
-    // Additional delay before starting sports games service
+
     await new Promise(resolve => setTimeout(resolve, 500));
-    
-    // Start sports games polling service (fetches upcoming games from Polymarket series API)
-    // This service fetches games by series_id (e.g., NFL, NBA) which includes upcoming games
-    // that may not appear in the live games endpoint yet
+
+    // Start sports games polling service
     logger.info({ message: 'Starting sports games service...' });
     sportsGamesService.start();
-    
-    // Additional delay before starting teams refresh service
+
     await new Promise(resolve => setTimeout(resolve, 500));
-    
-    // Start teams refresh service (delayed initial refresh built into service)
-    // logger.info({ message: 'Starting teams refresh service...' });
+
+    // Start teams refresh service
     teamsRefreshService.start();
-    
-    // DEPRECATED: Old WebSocket balance watcher - replaced by Alchemy webhooks
-    // The polygonUsdcBalanceService is no longer used for balance tracking
-    // Alchemy webhooks provide more reliable, push-based balance updates
-    
+
     // Initialize Alchemy webhook service for USDC balance notifications
     try {
       logger.info({ message: 'Initializing Alchemy webhook service...' });
@@ -185,10 +202,9 @@ async function initializeServices() {
         message: 'Failed to initialize Alchemy webhook service',
         error: alchemyError instanceof Error ? alchemyError.message : String(alchemyError),
       });
-      // Don't fail startup if Alchemy webhook fails
     }
-    
-    // Initialize embedded wallet balance service (listens to Alchemy webhook events)
+
+    // Initialize embedded wallet balance service
     try {
       logger.info({ message: 'Initializing embedded wallet balance service...' });
       await embeddedWalletBalanceService.initialize();
@@ -199,8 +215,8 @@ async function initializeServices() {
         error: balanceServiceError instanceof Error ? balanceServiceError.message : String(balanceServiceError),
       });
     }
-    
-    // Initialize auto-transfer service (listens to embedded wallet balance events)
+
+    // Initialize auto-transfer service
     try {
       logger.info({ message: 'Initializing auto-transfer service...' });
       autoTransferService.initialize();
@@ -211,7 +227,7 @@ async function initializeServices() {
         error: autoTransferError instanceof Error ? autoTransferError.message : String(autoTransferError),
       });
     }
-    
+
     // Load any pending deposits from database for progress tracking
     try {
       logger.info({ message: 'Loading pending deposits for progress tracking...' });
@@ -223,7 +239,7 @@ async function initializeServices() {
         error: depositProgressError instanceof Error ? depositProgressError.message : String(depositProgressError),
       });
     }
-    
+
     // Start sports WebSocket for live game score updates
     logger.info({ message: 'Starting sports WebSocket service...' });
     sportsWebSocketService.connect().catch((error) => {
@@ -232,26 +248,46 @@ async function initializeServices() {
         error: error instanceof Error ? error.message : String(error),
       });
     });
-    
-    // Initialize CLOB price update service for real-time odds/probability updates
-    logger.info({ message: 'Initializing CLOB price update service...' });
-    clobPriceUpdateService.initialize().catch((error) => {
-      logger.error({
-        message: 'Failed to initialize CLOB price update service',
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
-    
+
     // Set up periodic cleanup of old probability history (every 6 hours)
     setInterval(() => {
-      cleanupOldProbabilityHistory(7).catch((error) => {
-        // logger.error({
-        //   message: 'Error cleaning up probability history',
-        //   error: error instanceof Error ? error.message : String(error),
-        // });
-      });
+      cleanupOldProbabilityHistory(7).catch(() => {});
     }, 6 * 60 * 60 * 1000);
-    
+
+    // Set up periodic cache sync and stale mapping cleanup (every 5 minutes)
+    const { cleanupStaleMappings, getCacheStats } = await import('./services/polymarket/redis-games-cache.service');
+
+    // Initial cleanup after 30 seconds
+    setTimeout(async () => {
+      try {
+        const stats = await getCacheStats();
+        logger.info({
+          message: 'Initial cache stats',
+          gamesCount: stats.gamesCount,
+          gidMappingsCount: stats.gidMappingsCount,
+          slugMappingsCount: stats.slugMappingsCount,
+        });
+        await cleanupStaleMappings();
+      } catch (error) {
+        logger.warn({
+          message: 'Error in initial cache cleanup',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }, 30 * 1000);
+
+    // Periodic cleanup every 5 minutes
+    setInterval(async () => {
+      try {
+        await cleanupStaleMappings();
+      } catch (error) {
+        logger.warn({
+          message: 'Error in periodic cache cleanup',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }, 5 * 60 * 1000);
+
     // Set up periodic fee retry job (every 5 minutes)
     if (nodeEnv === 'production') {
       setInterval(async () => {
@@ -264,73 +300,199 @@ async function initializeServices() {
             error: error instanceof Error ? error.message : String(error),
           });
         }
-      }, 5 * 60 * 1000); // 5 minutes
-      
+      }, 5 * 60 * 1000);
+
       logger.info({ message: 'Fee retry background job started (runs every 5 minutes)' });
     }
-    
-    // Balance tracking is now handled by Alchemy webhooks
-    // No need to manually restore - webhooks are synced on startup
-    
-    // logger.info({ message: 'Services initialized successfully' });
+
+    logger.info({ message: 'Sports services initialized successfully' });
   } catch (error) {
     logger.error({
-      message: 'Error initializing services',
+      message: 'Error initializing sports services',
       error: error instanceof Error ? error.message : String(error),
     });
   }
 }
 
+// Initialize CLOB services only (for CLOB background worker)
+async function initializeClobServices() {
+  try {
+    // Wait a bit for sports worker to populate games cache first
+    logger.info({ message: 'CLOB worker waiting for games cache to populate...' });
+    await new Promise(resolve => setTimeout(resolve, 10000)); // 10 second delay
+
+    // Initialize CLOB price update service for real-time odds/probability updates
+    logger.info({ message: 'Initializing CLOB price update service...' });
+    await clobPriceUpdateService.initialize();
+
+    logger.info({ message: 'CLOB services initialized successfully' });
+  } catch (error) {
+    logger.error({
+      message: 'Error initializing CLOB services',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// Initialize ALL services (for development mode - single process)
+async function initializeServices() {
+  await initializeSportsServices();
+  await initializeClobServices();
+}
+
 let server: http.Server | null = null;
 
-function startHttpServer() {
-  // Initialize Privy in this process before accepting any requests.
-  // Required in cluster mode: only the leader runs initializeServices(), but every
-  // worker handles API traffic (including redemption/signing). Each worker must
-  // have Privy initialized or "Privy service not initialized" occurs on sign.
+/**
+ * Start the SPORTS background worker that handles:
+ * - Polling services (live games, sports games, teams refresh)
+ * - Sports WebSocket for live scores
+ * - Database flush operations for game data
+ * - Alchemy webhooks, wallet balance, auto-transfer services
+ *
+ * This worker does NOT serve HTTP requests or handle CLOB price updates.
+ */
+function startSportsBackgroundWorker() {
+  logger.info({
+    message: 'Starting SPORTS background worker (no HTTP, no CLOB)',
+    pid: process.pid,
+    workerId: cluster.isWorker ? cluster.worker?.id : 'primary',
+  });
+
+  // Initialize Redis games cache (required for sharing data with HTTP workers)
+  const redisInitialized = initRedisGamesCache();
+  if (redisInitialized) {
+    logger.info({ message: 'Redis games cache initialized for sports worker' });
+  } else {
+    logger.error({ message: 'Redis games cache REQUIRED for sports worker but failed to initialize!' });
+  }
+
+  // Initialize Redis broadcast (required for pushing updates to HTTP workers)
+  const broadcastInitialized = initRedisGamesBroadcast();
+  if (broadcastInitialized) {
+    logger.info({ message: 'Redis broadcast initialized for sports worker' });
+  } else {
+    logger.error({ message: 'Redis broadcast REQUIRED for sports worker but failed to initialize!' });
+  }
+
+  // Initialize Privy (needed for some background operations like fee collection)
   privyService.initialize();
 
-  // Create HTTP server (needed for WebSocket)
+  // Start sports-specific services (NOT CLOB)
+  initializeSportsServices();
+
+  // Graceful shutdown for sports worker
+  const shutdownSports = () => {
+    logger.info({ message: 'Sports worker shutting down gracefully' });
+    sportsWebSocketService.disconnect();
+    shutdownRedisGamesBroadcast().catch(() => {});
+    shutdownRedisGamesCache().catch(() => {});
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', shutdownSports);
+  process.on('SIGINT', shutdownSports);
+}
+
+/**
+ * Start the CLOB background worker that handles:
+ * - CLOB WebSocket connection for real-time price updates
+ * - Price update broadcasting to HTTP workers
+ *
+ * This worker is lightweight and focused only on high-frequency price updates.
+ */
+function startClobBackgroundWorker() {
+  logger.info({
+    message: 'Starting CLOB background worker (prices only)',
+    pid: process.pid,
+    workerId: cluster.isWorker ? cluster.worker?.id : 'primary',
+  });
+
+  // Initialize Redis games cache (required for reading game data)
+  const redisInitialized = initRedisGamesCache();
+  if (redisInitialized) {
+    logger.info({ message: 'Redis games cache initialized for CLOB worker' });
+  } else {
+    logger.error({ message: 'Redis games cache REQUIRED for CLOB worker but failed to initialize!' });
+  }
+
+  // Initialize Redis broadcast (required for pushing price updates to HTTP workers)
+  const broadcastInitialized = initRedisGamesBroadcast();
+  if (broadcastInitialized) {
+    logger.info({ message: 'Redis broadcast initialized for CLOB worker' });
+  } else {
+    logger.error({ message: 'Redis broadcast REQUIRED for CLOB worker but failed to initialize!' });
+  }
+
+  // Start CLOB price update service only
+  initializeClobServices();
+
+  // Graceful shutdown for CLOB worker
+  const shutdownClob = () => {
+    logger.info({ message: 'CLOB worker shutting down gracefully' });
+    clobPriceUpdateService.shutdown();
+    shutdownRedisGamesBroadcast().catch(() => {});
+    shutdownRedisGamesCache().catch(() => {});
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', shutdownClob);
+  process.on('SIGINT', shutdownClob);
+}
+
+/**
+ * Start an HTTP worker that handles:
+ * - HTTP API requests
+ * - WebSocket connections FROM clients (games updates, activity watcher, positions)
+ *
+ * This worker does NOT run background services - it reads data from Redis cache.
+ */
+function startHttpWorker() {
+  logger.info({
+    message: 'Starting HTTP worker',
+    pid: process.pid,
+    workerId: cluster.isWorker ? cluster.worker?.id : 'primary',
+  });
+
+  // Initialize Privy for API requests (signing, verification, etc.)
+  privyService.initialize();
+
+  // Initialize Redis games cache (reads data written by background worker)
+  const redisInitialized = initRedisGamesCache();
+  if (redisInitialized) {
+    logger.info({ message: 'Redis games cache initialized for HTTP worker' });
+  } else {
+    logger.warn({ message: 'Redis games cache not available - API may return stale data' });
+  }
+
+  // Initialize frontend games cache sync (subscribes to Redis for cache invalidation)
+  // This ensures all HTTP workers clear their local cache when the DB is updated
+  import('./services/polymarket/frontend-games.service').then(({ initFrontendGamesCacheSync }) => {
+    initFrontendGamesCacheSync();
+  }).catch((err) => {
+    logger.warn({ message: 'Failed to init frontend games cache sync', error: err.message });
+  });
+
+  // Create HTTP server
   server = http.createServer(app);
 
-  // Initialize WebSocket services BEFORE server starts listening
-  // These services handle their own upgrade requests with noServer mode
+  // Initialize client-facing WebSocket services
   gamesWebSocketService.initialize(server, '/ws/games');
   activityWatcherWebSocketService.initialize(server, '/ws/activity');
   positionsWebSocketService.initialize(server);
 
   // Start server
   server.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT} (pid=${process.pid})`);
-    console.log(`Swagger documentation available at http://localhost:${PORT}/api-docs`);
-    console.log(`WebSocket endpoints:`);
-    console.log(`  - Games updates: ws://localhost:${PORT}/ws/games`);
-    console.log(`  - Activity watcher: ws://localhost:${PORT}/ws/activity`);
-
-    // Initialize other services after server starts
-    const nodeEnv = process.env.NODE_ENV || 'development';
-    const isClusterWorker = cluster.isWorker && nodeEnv === 'production';
-    const isLeaderWorker = isClusterWorker ? cluster.worker?.id === 1 : true;
-
-    if (isLeaderWorker) {
-      initializeServices();
-    } else {
-      logger.info({
-        message: 'HTTP worker started without background services',
-        pid: process.pid,
-        workerId: cluster.isWorker ? cluster.worker?.id : null,
-      });
-    }
+    console.log(`HTTP worker running on port ${PORT} (pid=${process.pid})`);
+    console.log(`Swagger: http://localhost:${PORT}/api-docs`);
   });
 
-  // Graceful shutdown
-  process.on('SIGTERM', () => {
-    logger.info({ message: 'SIGTERM received, shutting down gracefully' });
+  // Graceful shutdown for HTTP worker
+  const shutdownHttp = () => {
+    logger.info({ message: 'HTTP worker shutting down gracefully' });
     gamesWebSocketService.shutdown();
     activityWatcherWebSocketService.shutdown();
     positionsWebSocketService.shutdown();
-    clobPriceUpdateService.shutdown();
-    shutdownRedisGamesBroadcast().catch(() => {});
+    shutdownRedisGamesCache().catch(() => {});
     if (server) {
       server.close(() => {
         logger.info({ message: 'HTTP server closed' });
@@ -339,53 +501,112 @@ function startHttpServer() {
     } else {
       process.exit(0);
     }
+  };
+
+  process.on('SIGTERM', shutdownHttp);
+  process.on('SIGINT', shutdownHttp);
+}
+
+/**
+ * Start in development mode (single process handles everything)
+ */
+function startDevelopmentServer() {
+  privyService.initialize();
+  initRedisGamesCache();
+
+  server = http.createServer(app);
+  gamesWebSocketService.initialize(server, '/ws/games');
+  activityWatcherWebSocketService.initialize(server, '/ws/activity');
+  positionsWebSocketService.initialize(server);
+
+  server.listen(PORT, () => {
+    console.log(`Development server running on port ${PORT}`);
+    console.log(`Swagger: http://localhost:${PORT}/api-docs`);
+    initializeServices();
   });
 
-  process.on('SIGINT', () => {
-    logger.info({ message: 'SIGINT received, shutting down gracefully' });
-    gamesWebSocketService.shutdown();
-    activityWatcherWebSocketService.shutdown();
-    positionsWebSocketService.shutdown();
-    clobPriceUpdateService.shutdown();
-    shutdownRedisGamesBroadcast().catch(() => {});
-    if (server) {
-      server.close(() => {
-        logger.info({ message: 'HTTP server closed' });
-        process.exit(0);
-      });
-    } else {
-      process.exit(0);
-    }
-  });
+  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGINT', () => process.exit(0));
 }
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 
 if (nodeEnv === 'production' && cluster.isPrimary) {
-  const numWorkers = Number(process.env.WORKER_COUNT) || 4;
+  // Total workers = 2 background (sports + CLOB) + N HTTP workers
+  // With WORKER_COUNT=4: 2 background + 2 HTTP = 4 workers + 1 primary = 5 processes
+  const totalWorkers = Number(process.env.WORKER_COUNT) || 4;
+  const httpWorkerCount = Math.max(1, totalWorkers - 2); // At least 1 HTTP worker, 2 slots for background
+
   logger.info({
     message: 'Starting cluster master',
     pid: process.pid,
-    workers: numWorkers,
+    totalWorkers,
+    backgroundWorkers: 2,
+    httpWorkers: httpWorkerCount,
   });
 
-  for (let i = 0; i < numWorkers; i++) {
-    cluster.fork();
+  // Track which workers are background workers
+  let sportsWorkerId: number | null = null;
+  let clobWorkerId: number | null = null;
+
+  // Fork 1 dedicated SPORTS background worker (games, teams, scores)
+  const sportsWorker = cluster.fork({ WORKER_TYPE: 'sports' });
+  sportsWorkerId = sportsWorker.id;
+  logger.info({ message: 'SPORTS background worker started', workerId: sportsWorker.id });
+
+  // Fork 1 dedicated CLOB background worker (price updates only)
+  const clobWorker = cluster.fork({ WORKER_TYPE: 'clob' });
+  clobWorkerId = clobWorker.id;
+  logger.info({ message: 'CLOB background worker started', workerId: clobWorker.id });
+
+  // Fork HTTP workers
+  for (let i = 0; i < httpWorkerCount; i++) {
+    const worker = cluster.fork({ WORKER_TYPE: 'http' });
+    logger.info({ message: 'HTTP worker started', workerId: worker.id });
   }
 
   cluster.on('exit', (worker, code, signal) => {
+    let workerType = 'http';
+    if (worker.id === sportsWorkerId) {
+      workerType = 'sports';
+    } else if (worker.id === clobWorkerId) {
+      workerType = 'clob';
+    }
+
     logger.error({
-      message: 'Worker exited, forking a new one',
+      message: `${workerType.toUpperCase()} worker exited, forking replacement`,
       workerId: worker.id,
       pid: worker.process.pid,
       code,
       signal,
     });
-    cluster.fork();
+
+    // Fork a replacement worker of the same type
+    const newWorker = cluster.fork({ WORKER_TYPE: workerType });
+    if (workerType === 'sports') {
+      sportsWorkerId = newWorker.id;
+      logger.info({ message: 'New SPORTS worker started', workerId: newWorker.id });
+    } else if (workerType === 'clob') {
+      clobWorkerId = newWorker.id;
+      logger.info({ message: 'New CLOB worker started', workerId: newWorker.id });
+    } else {
+      logger.info({ message: 'New HTTP worker started', workerId: newWorker.id });
+    }
   });
+} else if (nodeEnv === 'production' && cluster.isWorker) {
+  // Cluster worker - check type and start appropriate mode
+  const workerType = process.env.WORKER_TYPE || 'http';
+
+  if (workerType === 'sports') {
+    startSportsBackgroundWorker();
+  } else if (workerType === 'clob') {
+    startClobBackgroundWorker();
+  } else {
+    startHttpWorker();
+  }
 } else {
-  // Single-process (development) or cluster worker (production)
-  startHttpServer();
+  // Development mode - single process handles everything
+  startDevelopmentServer();
 }
 
 export default app;

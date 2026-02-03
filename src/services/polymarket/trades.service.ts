@@ -16,8 +16,19 @@ const DATA_API_BASE_URL = 'https://data-api.polymarket.com';
 const TRADES_CACHE_TTL_MS = 10_000; // 10 seconds
 const tradesCache = new Map<string, { data: StoredTrade[]; expires: number }>();
 
+/**
+ * Request coalescing: prevents multiple concurrent requests for the same conditionIds
+ * from hammering Polymarket API and hitting rate limits
+ */
+const inFlightPolymarketRequests = new Map<string, Promise<PolymarketTrade[]>>();
+
 function getTradesCacheKey(gameId: string, limit: number): string {
   return `trades:${gameId}:${limit}`;
+}
+
+function getPolymarketRequestKey(conditionIds: string[]): string {
+  // Sort to ensure same set of IDs produces same key
+  return conditionIds.slice().sort().join(',');
 }
 
 function invalidateTradesCacheForGame(gameId: string): void {
@@ -31,13 +42,18 @@ function invalidateTradesCacheForGame(gameId: string): void {
  * Similar to holders.service.ts extractAllMarketConditionIds()
  */
 export function extractAllMarketConditionIds(game: LiveGame): string[] {
-  if (!game.markets || game.markets.length === 0) {
+  // Use game.markets, fall back to rawData.markets for sports games (tennis, etc.)
+  const markets = game.markets && game.markets.length > 0
+    ? game.markets
+    : ((game.rawData as any)?.markets?.length > 0 ? (game.rawData as any).markets : []);
+
+  if (markets.length === 0) {
     return [];
   }
 
   const conditionIds: string[] = [];
 
-  for (const market of game.markets) {
+  for (const market of markets) {
     if (market.conditionId) {
       conditionIds.push(market.conditionId);
     }
@@ -49,12 +65,45 @@ export function extractAllMarketConditionIds(game: LiveGame): string[] {
 /**
  * Fetch trades from Polymarket data API
  * Builds query string with multiple market parameters (similar to holders service)
+ * Uses request coalescing to prevent rate limiting under concurrent load
  */
 export async function fetchTradesFromPolymarket(conditionIds: string[]): Promise<PolymarketTrade[]> {
   if (conditionIds.length === 0) {
     return [];
   }
 
+  const requestKey = getPolymarketRequestKey(conditionIds);
+  
+  // Check if there's already an in-flight request for these conditionIds
+  const existingRequest = inFlightPolymarketRequests.get(requestKey);
+  if (existingRequest) {
+    logger.debug({
+      message: 'Request coalescing: reusing in-flight Polymarket trades request',
+      conditionIdsCount: conditionIds.length,
+    });
+    return existingRequest;
+  }
+
+  // Create the actual fetch promise
+  const fetchPromise = doFetchTradesFromPolymarket(conditionIds);
+  
+  // Store it so other concurrent requests can reuse it
+  inFlightPolymarketRequests.set(requestKey, fetchPromise);
+  
+  try {
+    const result = await fetchPromise;
+    return result;
+  } finally {
+    // Always clean up after the request completes (success or failure)
+    inFlightPolymarketRequests.delete(requestKey);
+  }
+}
+
+/**
+ * Internal implementation of Polymarket trades fetch
+ * This is called only once per conditionIds set even if multiple requests come in concurrently
+ */
+async function doFetchTradesFromPolymarket(conditionIds: string[]): Promise<PolymarketTrade[]> {
   try {
     const url = `${DATA_API_BASE_URL}/trades`;
     const allTrades: PolymarketTrade[] = [];

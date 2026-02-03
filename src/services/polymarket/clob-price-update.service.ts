@@ -8,13 +8,16 @@ import { logger } from '../../config/logger';
 import { clobWebSocketService } from './clob-websocket.service';
 import { ClobPriceChangeUpdate, ClobPriceChange } from './polymarket.types';
 import { getAllLiveGames, updateGameInCache, LiveGame, registerOnGamesRefreshed, registerOnRefreshStarting, registerOnRefreshEnded, acquireLiveGamesWriteLock, releaseLiveGamesWriteLock } from './live-games.service';
-import { gamesWebSocketService } from './games-websocket.service';
-import { activityWatcherWebSocketService } from './activity-watcher-websocket.service';
 import { positionsWebSocketService } from '../positions/positions-websocket.service';
 import { connectWithRetry } from '../../config/database';
 import { transformToFrontendGame, FrontendGame } from './frontend-game.transformer';
 import { transformToActivityWatcherGame, ActivityWatcherGame } from './activity-watcher.transformer';
 import { bulkUpsertFrontendGamesWithClient, clearFrontendGamesCache } from './frontend-games.service';
+import {
+  publishGamesBroadcast,
+  publishActivityBroadcast,
+  isRedisGamesBroadcastReady,
+} from '../redis-cluster-broadcast.service';
 
 // Cache for probability changes per game (avoids DB lookup during hot path)
 interface CachedProbabilityChange {
@@ -47,13 +50,21 @@ export class ClobPriceUpdateService {
   private writeFlushTimer: NodeJS.Timeout | null = null;
   private writeFlushInterval: number = 1000; // Flush every 1s; real-time updates go via WebSocket
   private isFlushingWrites: boolean = false;
+  private readonly MAX_PENDING_WRITES = 500; // Prevent unbounded memory growth on flush failures
 
   // Cache for probability changes per game (avoids DB lookup during hot path broadcasts)
   private probabilityChangeCache: Map<string, CachedProbabilityChange> = new Map();
+  private probabilityCacheCleanupTimer: NodeJS.Timeout | null = null;
+  private readonly PROB_CACHE_CLEANUP_INTERVAL = 10 * 60 * 1000; // Clean every 10 minutes
+  private readonly MAX_PROB_CACHE_SIZE = 500; // Max entries before forced cleanup (reduced for memory efficiency)
 
   // Local games cache - avoids getAllLiveGames in hot path. Filled on first use / subscribeToAllGames.
   // Updated with merged results after each price update so next event reuses fresh data.
   private gamesByIdCache: Map<string, LiveGame> = new Map();
+
+  // Throttle: track last processed time per game to avoid processing too many updates
+  private lastProcessedTime: Map<string, number> = new Map();
+  private readonly THROTTLE_INTERVAL_MS = 250; // Only process one update per game every 250ms (4 updates/sec max per game)
 
   /**
    * Initialize the service and start subscribing to price updates
@@ -85,15 +96,10 @@ export class ClobPriceUpdateService {
     // Set up price change handler
     this.setupPriceChangeHandler();
 
-    // Wait for games to be loaded from database/API before subscribing
-    // The live games service starts with a 2-second delay, so we wait 5 seconds
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
-    // Subscribe once on init (getAllLiveGames fills cache, subscribes to CLOB assets)
-    await this.subscribeToAllGames();
-
-    // Re-subscribe only when live games or sports games refresh (no periodic timer)
+    // IMPORTANT: Register callbacks FIRST before waiting for games
+    // This ensures we catch notifyGamesRefreshed() even if it fires during the wait
     this.unregisterOnGamesRefreshed = registerOnGamesRefreshed(() => {
+      logger.info({ message: 'Games refreshed - re-subscribing to CLOB assets' });
       this.subscribeToAllGames().catch((error) => {
         logger.error({
           message: 'Error re-subscribing after games refresh',
@@ -119,8 +125,126 @@ export class ClobPriceUpdateService {
       }
     });
 
+    // Wait for games to be loaded from database/API before initial subscription
+    // The live games service starts with a 2-second delay, sports games also loads
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    // Subscribe once on init (getAllLiveGames fills cache, subscribes to CLOB assets)
+    await this.subscribeToAllGames();
+
+    // Start periodic cache cleanup to prevent memory leaks
+    this.startCacheCleanup();
+
     logger.info({ message: 'CLOB price update service initialized' });
   }
+
+  /**
+   * Start periodic cache cleanup to prevent memory leaks
+   */
+  private startCacheCleanup(): void {
+    if (this.probabilityCacheCleanupTimer) {
+      clearInterval(this.probabilityCacheCleanupTimer);
+    }
+
+    this.probabilityCacheCleanupTimer = setInterval(() => {
+      this.cleanupExpiredCacheEntries();
+    }, this.PROB_CACHE_CLEANUP_INTERVAL);
+
+    logger.info({ message: 'CLOB cache cleanup timer started', intervalMs: this.PROB_CACHE_CLEANUP_INTERVAL });
+  }
+
+  /**
+   * Clean up expired entries from probability change cache and games cache
+   */
+  private cleanupExpiredCacheEntries(): void {
+    const now = Date.now();
+    let probCacheRemoved = 0;
+    let gamesCacheRemoved = 0;
+
+    // Remove expired probability cache entries
+    for (const [gameId, cached] of this.probabilityChangeCache) {
+      if (now - cached.timestamp > PROB_CHANGE_CACHE_TTL) {
+        this.probabilityChangeCache.delete(gameId);
+        probCacheRemoved++;
+      }
+    }
+
+    // If probability cache is still too large, remove oldest entries
+    if (this.probabilityChangeCache.size > this.MAX_PROB_CACHE_SIZE) {
+      const entries = Array.from(this.probabilityChangeCache.entries())
+        .sort((a, b) => a[1].timestamp - b[1].timestamp);
+
+      const toRemove = entries.slice(0, entries.length - this.MAX_PROB_CACHE_SIZE);
+      for (const [gameId] of toRemove) {
+        this.probabilityChangeCache.delete(gameId);
+        probCacheRemoved++;
+      }
+    }
+
+    // Clean up games cache - remove ended games older than 6 hours
+    const sixHoursAgo = now - 6 * 60 * 60 * 1000;
+    for (const [gameId, game] of this.gamesByIdCache) {
+      // Remove if game ended and end date is more than 6 hours ago
+      if (game.ended === true) {
+        const endDateStr = game.endDate || (game.rawData as any)?.endDate;
+        if (endDateStr) {
+          const endDate = new Date(endDateStr).getTime();
+          if (!isNaN(endDate) && endDate < sixHoursAgo) {
+            this.gamesByIdCache.delete(gameId);
+            this.assetToGameMap.forEach((mapping, assetId) => {
+              if (mapping.gameId === gameId) {
+                this.assetToGameMap.delete(assetId);
+              }
+            });
+            gamesCacheRemoved++;
+          }
+        }
+      }
+    }
+
+    // Cap games cache size to prevent unbounded growth
+    const MAX_GAMES_CACHE_SIZE = 2000;
+    if (this.gamesByIdCache.size > MAX_GAMES_CACHE_SIZE) {
+      // Remove oldest games (by updatedAt)
+      const gamesWithDates = Array.from(this.gamesByIdCache.entries())
+        .map(([id, game]) => ({
+          id,
+          updatedAt: game.updatedAt?.getTime() || 0,
+        }))
+        .sort((a, b) => a.updatedAt - b.updatedAt);
+
+      const toRemove = gamesWithDates.slice(0, gamesWithDates.length - MAX_GAMES_CACHE_SIZE);
+      for (const { id } of toRemove) {
+        this.gamesByIdCache.delete(id);
+        gamesCacheRemoved++;
+      }
+    }
+
+    // Clean up old throttle entries (older than 1 minute)
+    const oneMinuteAgo = now - 60 * 1000;
+    let throttleEntriesRemoved = 0;
+    for (const [gameId, timestamp] of this.lastProcessedTime) {
+      if (timestamp < oneMinuteAgo) {
+        this.lastProcessedTime.delete(gameId);
+        throttleEntriesRemoved++;
+      }
+    }
+
+    if (probCacheRemoved > 0 || gamesCacheRemoved > 0) {
+      logger.info({
+        message: 'CLOB cache cleanup completed',
+        probCacheRemoved,
+        gamesCacheRemoved,
+        probCacheSize: this.probabilityChangeCache.size,
+        gamesCacheSize: this.gamesByIdCache.size,
+        assetMapSize: this.assetToGameMap.size,
+      });
+    }
+  }
+
+  // Counter for logging price updates periodically
+  private priceUpdateCount: number = 0;
+  private lastPriceLogTime: number = 0;
 
   /**
    * Set up handler for price change events
@@ -132,6 +256,18 @@ export class ClobPriceUpdateService {
       for (const update of updates) {
         // Check if this is a price_change event
         if (update.event_type === 'price_change' && update.price_changes) {
+          this.priceUpdateCount++;
+          // Log every 100 updates or every 30 seconds
+          // const now = Date.now();
+          // if (this.priceUpdateCount % 100 === 0 || now - this.lastPriceLogTime > 30000) {
+          //   logger.info({
+          //     message: 'CLOB price updates received',
+          //     totalUpdates: this.priceUpdateCount,
+          //     currentBatchChanges: update.price_changes?.length || 0,
+          //   });
+          //   this.lastPriceLogTime = now;
+          // }
+
           this.handlePriceChangeEvent(update as ClobPriceChangeUpdate).catch((error) => {
             logger.error({
               message: 'Error processing price change event',
@@ -142,8 +278,8 @@ export class ClobPriceUpdateService {
         }
       }
     });
-    
-    //logger.info({ message: 'Price change handler registered' });
+
+    logger.info({ message: 'CLOB price change handler registered' });
   }
 
   /**
@@ -270,15 +406,75 @@ export class ClobPriceUpdateService {
       });
     }
 
-    // Apply updates to each game
+    // Apply updates to each game (with throttling to prevent memory explosion)
+    const now = Date.now();
     for (const [gameId, { game, updates }] of gamesToUpdate) {
+      // Throttle: skip if we processed this game recently
+      const lastProcessed = this.lastProcessedTime.get(gameId) || 0;
+      if (now - lastProcessed < this.THROTTLE_INTERVAL_MS) {
+        continue; // Skip this game, we just processed it
+      }
+      this.lastProcessedTime.set(gameId, now);
+
       try {
+        // Get markets from game.markets or rawData.markets (for sports games like tennis)
+        const sourceMarkets = game.markets && game.markets.length > 0
+          ? game.markets
+          : ((game.rawData as any)?.markets?.length > 0 ? (game.rawData as any).markets : []);
+
+        if (sourceMarkets.length === 0) {
+          continue;
+        }
+
         // Update all affected markets
-        const updatedMarkets = game.markets.map(market => {
-          if (!market.structuredOutcomes) return market;
+        const updatedMarkets = sourceMarkets.map((market: any) => {
+          // Get or build structuredOutcomes (for rawData.markets, parse from JSON strings)
+          let structuredOutcomes = market.structuredOutcomes;
+          let outcomePrices = market.outcomePrices;
+
+          if (!structuredOutcomes || structuredOutcomes.length === 0) {
+            // Parse clobTokenIds and outcomes from JSON strings if needed
+            let clobTokenIds: string[] = [];
+            let outcomeLabels: string[] = [];
+
+            if (market.clobTokenIds) {
+              if (typeof market.clobTokenIds === 'string') {
+                try { clobTokenIds = JSON.parse(market.clobTokenIds); } catch {}
+              } else if (Array.isArray(market.clobTokenIds)) {
+                clobTokenIds = market.clobTokenIds;
+              }
+            }
+
+            if (market.outcomes) {
+              if (typeof market.outcomes === 'string') {
+                try { outcomeLabels = JSON.parse(market.outcomes); } catch {}
+              } else if (Array.isArray(market.outcomes)) {
+                outcomeLabels = market.outcomes;
+              }
+            }
+
+            // Parse outcomePrices from JSON string if needed
+            if (market.outcomePrices) {
+              if (typeof market.outcomePrices === 'string') {
+                try { outcomePrices = JSON.parse(market.outcomePrices); } catch {}
+              } else if (Array.isArray(market.outcomePrices)) {
+                outcomePrices = market.outcomePrices;
+              }
+            }
+
+            if (clobTokenIds.length > 0) {
+              structuredOutcomes = clobTokenIds.map((tokenId: string, idx: number) => ({
+                clobTokenId: tokenId,
+                label: outcomeLabels[idx] || 'Unknown',
+                price: outcomePrices?.[idx] ? String(parseFloat(outcomePrices[idx]) * 100) : '50',
+              }));
+            }
+          }
+
+          if (!structuredOutcomes || structuredOutcomes.length === 0) return market;
 
           let hasChanges = false;
-          const updatedOutcomes = market.structuredOutcomes.map((outcome, index) => {
+          const updatedOutcomes = structuredOutcomes.map((outcome: any, index: number) => {
             if (!outcome.clobTokenId) return outcome;
 
             const update = updates.get(outcome.clobTokenId);
@@ -300,23 +496,21 @@ export class ClobPriceUpdateService {
 
           if (hasChanges) {
             // Also update outcomePrices array (raw data) since frontend transformer uses this
-            // This uses the probability for the raw outcomePrices
-            let updatedOutcomePrices = market.outcomePrices;
-            if (market.outcomePrices && Array.isArray(market.outcomePrices)) {
-              updatedOutcomePrices = [...market.outcomePrices];
+            let updatedOutcomePrices = Array.isArray(outcomePrices) ? [...outcomePrices] : [];
+            if (updatedOutcomePrices.length > 0) {
               for (const [assetId, update] of updates) {
                 // Find which index this asset corresponds to
-                const outcomeIdx = market.structuredOutcomes?.findIndex(o => o.clobTokenId === assetId);
-                if (outcomeIdx !== undefined && outcomeIdx >= 0 && outcomeIdx < updatedOutcomePrices.length) {
+                const outcomeIdx = structuredOutcomes.findIndex((o: any) => o.clobTokenId === assetId);
+                if (outcomeIdx >= 0 && outcomeIdx < updatedOutcomePrices.length) {
                   // Convert probability back to decimal (e.g., 57 -> "0.57")
                   updatedOutcomePrices[outcomeIdx] = (update.probability / 100).toFixed(2);
                 }
               }
             }
-            
+
             // Get prices from first update for market-level data
             const firstUpdate = Array.from(updates.values())[0];
-            
+
             return {
               ...market,
               structuredOutcomes: updatedOutcomes,
@@ -329,8 +523,17 @@ export class ClobPriceUpdateService {
         });
 
         // Update both caches so next event reuses fresh data (no DB call)
-        const updatedGame = { ...game, markets: updatedMarkets, updatedAt: new Date() };
-        updateGameInCache(gameId, updatedGame);
+        // Also update rawData.markets for sports games so frontend transformer can find updated prices
+        const updatedRawData = game.rawData
+          ? { ...(game.rawData as any), markets: updatedMarkets }
+          : undefined;
+        const updatedGame = {
+          ...game,
+          markets: updatedMarkets,
+          rawData: updatedRawData,
+          updatedAt: new Date(),
+        };
+        updateGameInCache(gameId, updatedGame).catch(() => {});
         this.gamesByIdCache.set(gameId, updatedGame);
 
         // Get cached probability change or use defaults (skip DB lookup)
@@ -351,16 +554,32 @@ export class ClobPriceUpdateService {
           throw err;
         }
 
-        // Broadcast to BOTH WebSockets in parallel using fire-and-forget (no await)
-        // These are synchronous sends after transformation - ultra low latency
-        gamesWebSocketService.broadcastFrontendGame(frontendGame, 'price_update');
-        activityWatcherWebSocketService.broadcastActivityWatcherGame(activityWatcherGame);
+        // Broadcast via Redis to ALL workers (background worker -> HTTP workers)
+        if (isRedisGamesBroadcastReady()) {
+          // Publish to games channel (for /ws/games clients)
+          publishGamesBroadcast({
+            type: 'price_update',
+            payload: JSON.stringify({
+              type: 'price_update',
+              game: frontendGame,
+              timestamp: new Date().toISOString(),
+            }),
+          });
+
+          // Publish to activity channel (for /ws/activity clients)
+          const slugs = [updatedGame.slug, updatedGame.id].filter(Boolean) as string[];
+          publishActivityBroadcast(slugs, {
+            type: 'price_update',
+            game: activityWatcherGame,
+            timestamp: new Date().toISOString(),
+          });
+        }
 
         // Queue both live_games and frontend_games writes (batched in same transaction)
         this.queueDatabaseWrite(gameId, updatedMarkets, frontendGame);
 
         logger.debug({
-          message: 'Game prices updated and broadcast (optimized path)',
+          message: 'CLOB price update broadcast via Redis',
           gameId,
           updatesApplied: updates.size,
         });
@@ -407,6 +626,14 @@ export class ClobPriceUpdateService {
    * This reduces connection pressure by batching multiple updates
    */
   private queueDatabaseWrite(gameId: string, markets: any[], frontendGame?: FrontendGame): void {
+    // Prevent unbounded memory growth - drop oldest writes if queue is full
+    if (this.pendingWrites.size >= this.MAX_PENDING_WRITES && !this.pendingWrites.has(gameId)) {
+      // Drop oldest entry (first in Map iteration order)
+      const oldestKey = this.pendingWrites.keys().next().value;
+      if (oldestKey) {
+        this.pendingWrites.delete(oldestKey);
+      }
+    }
     this.pendingWrites.set(gameId, { markets, timestamp: new Date(), frontendGame });
     
     // Start flush timer if not already running and not paused during refresh
@@ -495,7 +722,16 @@ export class ClobPriceUpdateService {
         pendingCount: writesToFlush.size,
       });
 
+      // Re-add failed writes, but respect the cap to prevent memory leaks
       for (const [gameId, data] of writesToFlush) {
+        if (this.pendingWrites.size >= this.MAX_PENDING_WRITES) {
+          logger.warn({
+            message: 'Dropping failed writes due to queue overflow',
+            droppedCount: writesToFlush.size - this.pendingWrites.size,
+            maxSize: this.MAX_PENDING_WRITES,
+          });
+          break;
+        }
         if (!this.pendingWrites.has(gameId)) {
           this.pendingWrites.set(gameId, data);
         }
@@ -522,36 +758,121 @@ export class ClobPriceUpdateService {
   }
 
   /**
-   * Subscribe to ALL games and ALL their clobTokenIds
+   * Check if a game is eligible for CLOB subscription
+   * Only subscribe to games that are live or starting within the next 48 hours
+   */
+  private isGameEligibleForSubscription(game: LiveGame): boolean {
+    // Skip ended games
+    if (game.ended === true) return false;
+
+    // Always include live games
+    if (game.live === true) return true;
+
+    // Check start date - only include games starting within 48 hours
+    const now = Date.now();
+    const fortyEightHours = 48 * 60 * 60 * 1000;
+
+    // Check rawData for dates if not on game object
+    const startDateStr = game.startDate || (game.rawData as any)?.startDate;
+    if (startDateStr) {
+      const startDate = new Date(startDateStr).getTime();
+      if (!isNaN(startDate)) {
+        // Include if starting within 48 hours (past or future)
+        if (Math.abs(startDate - now) < fortyEightHours) {
+          return true;
+        }
+        // Exclude if starting more than 48 hours in the future
+        if (startDate > now + fortyEightHours) {
+          return false;
+        }
+      }
+    }
+
+    // Check end date - exclude if ended more than 3 hours ago
+    const endDateStr = game.endDate || (game.rawData as any)?.endDate;
+    if (endDateStr) {
+      const endDate = new Date(endDateStr).getTime();
+      if (!isNaN(endDate)) {
+        const threeHours = 3 * 60 * 60 * 1000;
+        if (endDate + threeHours < now) {
+          return false; // Game ended more than 3 hours ago
+        }
+      }
+    }
+
+    // Default: include if we can't determine
+    return true;
+  }
+
+  /**
+   * Subscribe to active games with MONEYLINE markets only
+   * Filters aggressively to prevent memory issues from too many subscriptions
    */
   async subscribeToAllGames(): Promise<void> {
     try {
-      //logger.info({ message: 'Subscribing to all games for price updates' });
-
-      const games = await getAllLiveGames();
+      const allGames = await getAllLiveGames();
       const assetIds: string[] = [];
       const newAssetMap = new Map<string, AssetGameMapping>();
 
-      // Pre-warm local games cache so handlePriceChangeEvent avoids DB on first events
+      // Pre-warm local games cache (all games for lookup during price updates)
       this.gamesByIdCache.clear();
-      for (const g of games) {
+      for (const g of allGames) {
         this.gamesByIdCache.set(g.id, g);
       }
 
-      // Extract ALL asset IDs from ALL markets (not just moneyline)
-      for (const game of games) {
-        if (!game.markets || game.markets.length === 0) {
-          continue;
-        }
+      // Filter games for subscription eligibility
+      const eligibleGames = allGames.filter(g => this.isGameEligibleForSubscription(g));
 
-        for (const market of game.markets) {
-          if (!market.structuredOutcomes || market.structuredOutcomes.length === 0) {
-            continue;
+      logger.info({
+        message: 'Filtering games for CLOB subscription',
+        totalGames: allGames.length,
+        eligibleGames: eligibleGames.length,
+      });
+
+      // Extract ALL asset IDs from ALL markets for eligible games
+      for (const game of eligibleGames) {
+        const markets = game.markets && game.markets.length > 0
+          ? game.markets
+          : ((game.rawData as any)?.markets?.length > 0 ? (game.rawData as any).markets : []);
+
+        if (markets.length === 0) continue;
+
+        for (const market of markets) {
+          let structuredOutcomes = market.structuredOutcomes;
+
+          if (!structuredOutcomes || structuredOutcomes.length === 0) {
+            let clobTokenIds: string[] = [];
+            let outcomeLabels: string[] = [];
+
+            if (market.clobTokenIds) {
+              if (typeof market.clobTokenIds === 'string') {
+                try { clobTokenIds = JSON.parse(market.clobTokenIds); } catch {}
+              } else if (Array.isArray(market.clobTokenIds)) {
+                clobTokenIds = market.clobTokenIds;
+              }
+            }
+
+            if (market.outcomes) {
+              if (typeof market.outcomes === 'string') {
+                try { outcomeLabels = JSON.parse(market.outcomes); } catch {}
+              } else if (Array.isArray(market.outcomes)) {
+                outcomeLabels = market.outcomes;
+              }
+            }
+
+            if (clobTokenIds.length > 0) {
+              structuredOutcomes = clobTokenIds.map((tokenId: string, idx: number) => ({
+                clobTokenId: tokenId,
+                label: outcomeLabels[idx] || 'Unknown',
+              }));
+            }
           }
 
-          // Extract asset IDs from ALL outcomes
-          for (let i = 0; i < market.structuredOutcomes.length; i++) {
-            const outcome = market.structuredOutcomes[i];
+          if (!structuredOutcomes || structuredOutcomes.length === 0) continue;
+
+          // Subscribe to ALL outcomes for this market
+          for (let i = 0; i < structuredOutcomes.length; i++) {
+            const outcome = structuredOutcomes[i];
             if (outcome.clobTokenId) {
               assetIds.push(outcome.clobTokenId);
               newAssetMap.set(outcome.clobTokenId, {
@@ -573,15 +894,16 @@ export class ClobPriceUpdateService {
         return;
       }
 
-      // Subscribe to all assets at once
+      // Subscribe to filtered assets
       clobWebSocketService.subscribeToAssets(assetIds);
-      
+
       this.isSubscribed = true;
-      // logger.info({
-      //   message: 'Subscribed to all games for price updates',
-      //   totalGames: games.length,
-      //   totalAssets: assetIds.length,
-      // });
+      logger.info({
+        message: 'Subscribed to CLOB price updates (filtered by eligibility)',
+        totalGames: allGames.length,
+        eligibleGames: eligibleGames.length,
+        totalAssets: assetIds.length,
+      });
     } catch (error) {
       logger.error({
         message: 'Error subscribing to games',
@@ -621,7 +943,14 @@ export class ClobPriceUpdateService {
       this.unregisterOnRefreshEnded();
       this.unregisterOnRefreshEnded = null;
     }
+    if (this.probabilityCacheCleanupTimer) {
+      clearInterval(this.probabilityCacheCleanupTimer);
+      this.probabilityCacheCleanupTimer = null;
+    }
     this.assetToGameMap.clear();
+    this.probabilityChangeCache.clear();
+    this.gamesByIdCache.clear();
+    this.pendingWrites.clear();
     this.isSubscribed = false;
     logger.info({ message: 'CLOB price update service shut down' });
   }

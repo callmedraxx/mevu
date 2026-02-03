@@ -6,6 +6,7 @@
 import WebSocket from 'ws';
 import { logger } from '../../config/logger';
 import { SportsGameUpdate } from './polymarket.types';
+import { applySportsGameUpdate } from './live-games.service';
 
 const SPORTS_WS_URL = 'wss://sports-api.polymarket.com/ws';
 
@@ -24,9 +25,10 @@ export class SportsWebSocketService {
   private messageHistory: SportsWebSocketMessage[] = [];
   private gameUpdates: Map<number, SportsGameUpdate> = new Map(); // gameId -> latest update
   private maxHistorySize: number = 100;
+  private maxGameUpdatesSize: number = 500; // Max games to track (prevents memory leak)
 
-  private maxReconnectAttempts: number = 5;
-  private reconnectDelay: number = 3000;
+  private maxReconnectAttempts: number = 10;
+  private reconnectDelay: number = 5000;
 
   /**
    * Connect to the Sports WebSocket endpoint
@@ -217,19 +219,32 @@ export class SportsWebSocketService {
     if ('gameId' in message && 'score' in message) {
       const gameUpdate = message as SportsGameUpdate;
 
-      // logger.info({
-      //   message: 'Sports game update received',
-      //   gameId: gameUpdate.gameId,
-      //   league: gameUpdate.leagueAbbreviation,
-      //   score: gameUpdate.score,
-      //   period: gameUpdate.period,
-      //   elapsed: gameUpdate.elapsed,
-      //   live: gameUpdate.live,
-      //   ended: gameUpdate.ended,
-      // });
+      // Log WTA/ATP updates to debug tennis
+      const league = gameUpdate.leagueAbbreviation?.toLowerCase() || '';
+      if (league === 'wta' || league === 'atp' || league.includes('tennis')) {
+        logger.info({
+          message: 'Tennis (WTA/ATP) game update received',
+          gameId: gameUpdate.gameId,
+          league: gameUpdate.leagueAbbreviation,
+          score: gameUpdate.score,
+          period: gameUpdate.period,
+          live: gameUpdate.live,
+        });
+      }
 
-      // Store/update game data
+      // Store/update game data (with size limit to prevent memory leak)
       this.gameUpdates.set(gameUpdate.gameId, gameUpdate);
+      
+      // Clean up old ended games if map grows too large
+      if (this.gameUpdates.size > this.maxGameUpdatesSize) {
+        // Remove ended/closed games first
+        for (const [gid, update] of this.gameUpdates) {
+          if (update.ended || !update.live) {
+            this.gameUpdates.delete(gid);
+            if (this.gameUpdates.size <= this.maxGameUpdatesSize * 0.8) break;
+          }
+        }
+      }
 
       // Also store in general message history
       this.messageHistory.push(message as any);
@@ -237,21 +252,16 @@ export class SportsWebSocketService {
         this.messageHistory.shift();
       }
 
-      // Update cache + broadcast immediately; DB flush every 1s (batched)
-      try {
-        const { applySportsGameUpdate } = await import('./live-games.service');
-        applySportsGameUpdate(gameUpdate.gameId, {
-          score: gameUpdate.score,
-          period: gameUpdate.period,
-          elapsed: gameUpdate.elapsed,
-          live: gameUpdate.live,
-          ended: gameUpdate.ended,
-          active: gameUpdate.live && !gameUpdate.ended,
-          closed: gameUpdate.ended,
-        });
-      } catch {
-        // ignore
-      }
+      // Update cache + broadcast immediately; DB flush every 300ms (batched)
+      applySportsGameUpdate(gameUpdate.gameId, {
+        score: gameUpdate.score,
+        period: gameUpdate.period,
+        elapsed: gameUpdate.elapsed,
+        live: gameUpdate.live,
+        ended: gameUpdate.ended,
+        active: gameUpdate.live && !gameUpdate.ended,
+        closed: gameUpdate.ended,
+      }).catch(() => {});
 
       return;
     }
@@ -265,13 +275,14 @@ export class SportsWebSocketService {
       this.messageHistory.shift();
     }
 
-    // Log the message
-    // logger.info({
-    //   message: 'Sports WebSocket message received',
-    //   messageType: msg.type || msg.event || msg.action || 'unknown',
-    //   fullMessage: msg,
-    //   messageKeys: Object.keys(msg),
-    // });
+    // Log non-ping messages to debug what the websocket is sending
+    if (msg.type !== 'ping') {
+      logger.info({
+        message: 'Sports WebSocket message received',
+        messageType: msg.type || msg.event || msg.action || 'unknown',
+        messageKeys: Object.keys(msg),
+      });
+    }
   }
 
   /**

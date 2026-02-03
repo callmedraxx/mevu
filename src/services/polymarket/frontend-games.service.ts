@@ -4,6 +4,7 @@ import { logger } from '../../config/logger';
 import { LiveGame } from './live-games.service';
 import { FrontendGame, transformToFrontendGame } from './frontend-game.transformer';
 import { loadFromDatabase as loadUfcFighterRecords } from '../ufc/ufc-fighter-records.service';
+import { publishCacheInvalidation, subscribeToGamesBroadcast, initRedisClusterBroadcast } from '../redis-cluster-broadcast.service';
 
 // In-memory cache for frontend games to handle burst traffic
 // Cache key: JSON stringified options
@@ -156,6 +157,30 @@ export async function upsertFrontendGame(frontendGame: FrontendGame): Promise<vo
 /** Clear the frontend games API cache (e.g. after batch upserts). */
 export function clearFrontendGamesCache(): void {
   frontendGamesCache.clear();
+  // Notify other workers to clear their caches too (Redis pub/sub)
+  publishCacheInvalidation('frontend_games').catch(() => {});
+}
+
+/** Clear only local cache (called by Redis subscriber to avoid infinite loop) */
+function clearLocalFrontendGamesCache(): void {
+  frontendGamesCache.clear();
+}
+
+/**
+ * Initialize Redis subscription for cache invalidation messages.
+ * Call this once during app startup on all HTTP workers.
+ */
+export function initFrontendGamesCacheSync(): void {
+  if (!initRedisClusterBroadcast()) return;
+  
+  subscribeToGamesBroadcast((msg) => {
+    if ((msg as { type?: string }).type === 'cache_invalidate') {
+      clearLocalFrontendGamesCache();
+      logger.debug({ message: 'Frontend games cache cleared via Redis broadcast' });
+    }
+  });
+  
+  logger.info({ message: 'Frontend games cache sync initialized' });
 }
 
 /**
@@ -379,6 +404,56 @@ export interface PaginatedGamesResult {
   page: number;
   limit: number;
   hasMore: boolean;
+}
+
+/**
+ * Get a single frontend game by ID from the frontend_games table.
+ * Returns null if not found.
+ */
+export async function getFrontendGameByIdFromDatabase(id: string): Promise<FrontendGame | null> {
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  if (nodeEnv !== 'production') {
+    return null;
+  }
+
+  const client = await connectWithRetry();
+  try {
+    const result = await client.query(
+      `SELECT frontend_data FROM frontend_games WHERE id = $1`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return null;
+    }
+    return result.rows[0].frontend_data as FrontendGame;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get a single frontend game by slug from the frontend_games table.
+ * Returns null if not found.
+ */
+export async function getFrontendGameBySlugFromDatabase(slug: string): Promise<FrontendGame | null> {
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  if (nodeEnv !== 'production') {
+    return null;
+  }
+
+  const client = await connectWithRetry();
+  try {
+    const result = await client.query(
+      `SELECT frontend_data FROM frontend_games WHERE LOWER(slug) = LOWER($1)`,
+      [slug]
+    );
+    if (result.rows.length === 0) {
+      return null;
+    }
+    return result.rows[0].frontend_data as FrontendGame;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getFrontendGamesFromDatabase(options: {

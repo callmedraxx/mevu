@@ -21,7 +21,7 @@ import {
 
 const API_BASE_URL = 'https://gamma-api.polymarket.com';
 const TIMEOUT_MS = 30000; // 30 seconds per request
-const POLLING_INTERVAL = 45 * 60 * 1000; // 45 minutes
+const POLLING_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours - upcoming games don't change often
 
 /**
  * Sports Games API Response - can be array or wrapped object

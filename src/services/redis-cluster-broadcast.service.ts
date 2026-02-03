@@ -38,14 +38,23 @@ export function initRedisClusterBroadcast(): boolean {
   if (redisPub && redisSub) return true;
 
   try {
-    redisPub = new Redis(redisUrl, {
+    const redisOptions = {
       maxRetriesPerRequest: 3,
-      retryStrategy: (times) => (times > 5 ? null : Math.min(times * 500, 3000)),
-    });
-    redisSub = new Redis(redisUrl, {
-      maxRetriesPerRequest: 3,
-      retryStrategy: (times) => (times > 5 ? null : Math.min(times * 500, 3000)),
-    });
+      connectTimeout: 10000,
+      commandTimeout: 15000,  // Increased from 5s to 15s for high throughput
+      enableOfflineQueue: true,  // Queue commands when disconnected
+      retryStrategy: (times: number) => {
+        if (times > 10) return null;
+        return Math.min(times * 500, 5000);
+      },
+      reconnectOnError: (err: Error) => {
+        const targetErrors = ['READONLY', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'];
+        return targetErrors.some((e) => err.message.includes(e));
+      },
+    };
+
+    redisPub = new Redis(redisUrl, redisOptions);
+    redisSub = new Redis(redisUrl, redisOptions);
 
     redisPub.on('error', (err) =>
       logger.warn({ message: 'Redis cluster broadcast (pub) error', error: err.message })
@@ -54,7 +63,10 @@ export function initRedisClusterBroadcast(): boolean {
       logger.warn({ message: 'Redis cluster broadcast (sub) error', error: err.message })
     );
     redisPub.on('ready', () =>
-      logger.info({ message: 'Redis cluster broadcast ready', workerId: cluster.worker?.id })
+      logger.info({ message: 'Redis cluster broadcast (pub) ready', workerId: cluster.worker?.id })
+    );
+    redisSub.on('ready', () =>
+      logger.info({ message: 'Redis cluster broadcast (sub) ready', workerId: cluster.worker?.id })
     );
 
     redisSub.on('message', (channel: string, message: string) => {
@@ -91,6 +103,10 @@ export function initRedisClusterBroadcast(): boolean {
 
 function publish(channel: string, payload: unknown): void {
   if (!redisPub) return;
+  // Skip if Redis is not ready (connecting, reconnecting, etc.)
+  if (redisPub.status !== 'ready') {
+    return;
+  }
   redisPub.publish(channel, JSON.stringify(payload)).catch((err) =>
     logger.warn({ message: 'Redis cluster broadcast publish failed', channel, error: err.message })
   );
@@ -102,8 +118,8 @@ export interface GamesBroadcastMessage {
   payload: string;
 }
 
-/** Batch games messages to reduce Redis publish rate and prevent ENOBUFS */
-const GAMES_BATCH_DELAY_MS = 100;
+/** Batch games messages to reduce Redis publish rate and prevent ENOBUFS (50ms = imperceptible) */
+const GAMES_BATCH_DELAY_MS = 50;
 let gamesBatchTimer: NodeJS.Timeout | null = null;
 const gamesPendingByKey = new Map<string, GamesBroadcastMessage>();
 
@@ -152,20 +168,70 @@ export function isRedisGamesBroadcastReady(): boolean {
   return redisPub !== null;
 }
 
+/**
+ * Publish a cache invalidation message to all workers.
+ * Used when frontend_games table is updated so all HTTP workers clear their local cache.
+ */
+export async function publishCacheInvalidation(cacheType: 'frontend_games'): Promise<void> {
+  if (!redisPub) return;
+  // Publish immediately (no batching for cache invalidation - it's critical)
+  await publish(GAMES_CHANNEL, { type: 'cache_invalidate', payload: cacheType });
+}
+
 // --- Activity watcher WebSocket ---
 export interface ActivityBroadcastMessage {
   slugs: string[];
   message: { type: string; game: unknown; timestamp: string };
 }
 
+/** Batch activity messages to reduce Redis publish rate (50ms = imperceptible to humans) */
+const ACTIVITY_BATCH_DELAY_MS = 50;
+let activityBatchTimer: NodeJS.Timeout | null = null;
+// Key by game ID to dedupe rapid updates for the same game
+const activityPendingByGameId = new Map<string, ActivityBroadcastMessage>();
+
+function flushActivityBatch(): void {
+  activityBatchTimer = null;
+  if (activityPendingByGameId.size === 0) return;
+  const messages = Array.from(activityPendingByGameId.values());
+  activityPendingByGameId.clear();
+
+  if (messages.length === 1) {
+    publish(ACTIVITY_CHANNEL, messages[0]);
+  } else {
+    // Send as batch - receiver will unpack
+    publish(ACTIVITY_CHANNEL, { type: 'batch', items: messages });
+  }
+}
+
+function scheduleActivityFlush(): void {
+  if (activityBatchTimer) return;
+  activityBatchTimer = setTimeout(flushActivityBatch, ACTIVITY_BATCH_DELAY_MS);
+}
+
 export function subscribeToActivityBroadcast(callback: (msg: ActivityBroadcastMessage) => void): () => void {
-  const wrapped = (msg: unknown) => callback(msg as ActivityBroadcastMessage);
+  const wrapped = (msg: unknown) => {
+    const m = msg as any;
+    if (m.type === 'batch' && Array.isArray(m.items)) {
+      // Unpack batch
+      for (const item of m.items) {
+        callback(item as ActivityBroadcastMessage);
+      }
+    } else {
+      callback(msg as ActivityBroadcastMessage);
+    }
+  };
   activityCallbacks.add(wrapped);
   return () => activityCallbacks.delete(wrapped);
 }
 
 export function publishActivityBroadcast(slugs: string[], message: { type: string; game: unknown; timestamp: string }): void {
-  publish(ACTIVITY_CHANNEL, { slugs, message });
+  if (!redisPub) return;
+
+  // Extract game ID for deduplication
+  const gameId = (message.game as any)?.id ?? slugs[0] ?? `_activity_${Date.now()}`;
+  activityPendingByGameId.set(gameId, { slugs, message });
+  scheduleActivityFlush();
 }
 
 // --- Deposits progress (depositProgressService) ---
