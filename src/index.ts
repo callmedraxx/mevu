@@ -31,6 +31,8 @@ import { alchemyWebhookService } from './services/alchemy/alchemy-webhook.servic
 import { embeddedWalletBalanceService } from './services/privy/embedded-wallet-balance.service';
 import { autoTransferService } from './services/privy/auto-transfer.service';
 import { depositProgressService } from './services/privy/deposit-progress.service';
+import { kalshiService } from './services/kalshi';
+import { registerOnGamesRefreshed } from './services/polymarket/live-games.service';
 
 // Load environment variables
 dotenv.config();
@@ -191,6 +193,24 @@ async function initializeSportsServices() {
 
     // Start teams refresh service
     teamsRefreshService.start();
+
+    // Initialize Kalshi service - runs in parallel with live games refresh
+    logger.info({ message: 'Initializing Kalshi service...' });
+    registerOnGamesRefreshed(async () => {
+      try {
+        await kalshiService.refreshKalshiMarkets();
+      } catch (error) {
+        logger.error({
+          message: 'Error refreshing Kalshi markets',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+    // Initial Kalshi fetch (non-blocking)
+    kalshiService.refreshKalshiMarkets().catch(err => {
+      logger.warn({ message: 'Initial Kalshi fetch failed', error: err instanceof Error ? err.message : String(err) });
+    });
+    logger.info({ message: 'Kalshi service initialized' });
 
     // Initialize Alchemy webhook service for USDC balance notifications
     try {

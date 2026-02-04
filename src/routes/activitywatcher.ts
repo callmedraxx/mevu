@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { logger } from '../config/logger';
 import { transformToActivityWatcherGame } from '../services/polymarket/activity-watcher.transformer';
 import { getLiveGameBySlug, liveGamesService, LiveGame } from '../services/polymarket/live-games.service';
+import { kalshiActivityService } from '../services/kalshi';
 
 const router = Router();
 
@@ -86,6 +87,13 @@ liveGamesService.addSSEPartialBroadcastCallback(handlePartialBroadcast);
  *         schema:
  *           type: string
  *         description: Game slug or id
+ *       - in: query
+ *         name: platform
+ *         schema:
+ *           type: string
+ *           enum: [polymarket, kalshi]
+ *           default: polymarket
+ *         description: Market platform to fetch prices from. 'polymarket' (default) or 'kalshi'
  *     responses:
  *       200:
  *         description: Activity watcher game payload
@@ -106,6 +114,18 @@ liveGamesService.addSSEPartialBroadcastCallback(handlePartialBroadcast);
 router.get('/:slug', async (req: Request, res: Response) => {
   try {
     const { slug } = req.params;
+    const platform = (req.query.platform as string) || 'polymarket';
+
+    // If Kalshi platform requested, use Kalshi activity service
+    if (platform === 'kalshi') {
+      const kalshiGame = await kalshiActivityService.getActivityForSlug(slug);
+      if (!kalshiGame) {
+        return res.status(404).json({ success: false, error: 'Game not found' });
+      }
+      return res.json({ success: true, game: kalshiGame });
+    }
+
+    // Default: Polymarket activity
     const game = await getLiveGameBySlug(slug);
 
     if (!game) {
@@ -118,6 +138,7 @@ router.get('/:slug', async (req: Request, res: Response) => {
     logger.error({
       message: 'Error fetching activity watcher game',
       slug: req.params.slug,
+      platform: req.query.platform,
       error: error instanceof Error ? error.message : String(error),
     });
     return res.status(500).json({ success: false, error: 'Failed to fetch game' });

@@ -23,6 +23,9 @@ export interface FrontendTeam {
   tennisScore?: string;    // Raw tennis score: "6-4, 2-6, 1-1"
   setsWon?: number;        // Number of sets won (0, 1, 2, 3) - for tennis
   quarterScores?: { q1: number; q2: number; q3: number; q4: number; };
+  // Kalshi prices (optional, present when Kalshi market is matched)
+  kalshiBuyPrice?: number;   // Kalshi buy price (cents)
+  kalshiSellPrice?: number;  // Kalshi sell price (cents)
 }
 
 /**
@@ -48,6 +51,7 @@ export interface FrontendGame {
   league?: string;           // league identifier
   slug?: string;             // URL slug
   tennisScore?: string;      // Raw tennis score at game level: "6-4, 2-6, 1-1"
+  kalshiTicker?: string;     // Kalshi market ticker (when matched)
 }
 
 /**
