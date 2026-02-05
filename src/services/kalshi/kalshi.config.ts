@@ -6,14 +6,15 @@
 // Map our sports to Kalshi series_ticker patterns
 // Kalshi uses series_ticker like "KXNBA" for NBA
 export const KALSHI_SPORT_SERIES: Record<string, string[]> = {
-  nba: ['KXNBA'],
-  nfl: ['KXNFL'],
-  nhl: ['KXNHL'],
-  epl: ['KXEPL', 'KXPREM'],
-  lal: ['KXLALIGA'],
-  tennis: ['KXATP', 'KXWTA'],
-  cbb: ['KXNCAAB', 'KXCBB'],
-  cfb: ['KXCFB', 'KXNCAAF'],
+  nba: ['KXNBAGAME', 'KXNBASPREAD', 'KXNBATOTAL', 'KXNBATEAMTOTAL'],
+  nfl: ['KXNFLGAME', 'KXNFLSPREAD', 'KXNFLTOTAL', 'KXSB'],  // KXSB = Super Bowl
+  nhl: ['KXNHLGAME', 'KXNHLSPREAD', 'KXNHLTOTAL'],
+  epl: ['KXEPLGAME'],
+  lal: ['KXLALIGAGAME'],
+  ufc: ['KXUFCFIGHT'],
+  tennis: ['KXATPMATCH', 'KXWTAMATCH'],
+  cbb: ['KXNCAAMBGAME', 'KXNCAAWBGAME'],
+  // Note: CFB does not have individual game markets on Kalshi
 };
 
 // Reverse mapping: series ticker -> our sport identifier

@@ -649,14 +649,29 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     const rawPrices = parsePricesArray(market.outcomePrices);
 
     if (rawOutcomes.length === 2 && rawPrices.length === 2) {
+      // Check if market is closed/resolved - if so, use isWinner flag for prices
+      const isMarketClosed = market.closed === true;
+
       outcomes = rawOutcomes.map((label: string, i: number) => {
         const rawPrice = rawPrices[i];
         const pricePct = typeof rawPrice === 'number' && rawPrice <= 1 ? rawPrice * 100 : rawPrice;
+        const calculatedPrice = typeof pricePct === 'number' && !isNaN(pricePct) ? pricePct : parseFloat(String(rawPrice)) * 100;
+
+        // For closed markets, use isWinner flag to determine final price (100 for winner, 0 for loser)
+        const isWinner = structuredOutcomes[i]?.isWinner === true;
+        const finalPrice = isMarketClosed && structuredOutcomes.some((o: any) => o.isWinner)
+          ? (isWinner ? 100 : 0)
+          : calculatedPrice;
+
         return {
           label,
-          price: typeof pricePct === 'number' && !isNaN(pricePct) ? pricePct : parseFloat(String(rawPrice)) * 100,
-          buyPrice: structuredOutcomes[i]?.buyPrice,
-          sellPrice: structuredOutcomes[i]?.sellPrice,
+          price: finalPrice,
+          buyPrice: isMarketClosed && structuredOutcomes.some((o: any) => o.isWinner)
+            ? (isWinner ? 100 : 0)
+            : structuredOutcomes[i]?.buyPrice,
+          sellPrice: isMarketClosed && structuredOutcomes.some((o: any) => o.isWinner)
+            ? (isWinner ? 100 : 0)
+            : structuredOutcomes[i]?.sellPrice,
         };
       });
     }
@@ -787,14 +802,21 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       );
       if (isSpreadMarket || isTotalsMarket || hasNonMoneyline) continue;
       const structuredOutcomes = m.structuredOutcomes || [];
+      const isMarketClosed = m.closed === true;
+      const hasWinner = structuredOutcomes.some((o: any) => o.isWinner === true);
+
       const outcomes = rawOutcomes.map((label: string, i: number) => {
         const rawPrice = rawPrices[i];
         const pricePct = typeof rawPrice === 'number' && rawPrice <= 1 ? rawPrice * 100 : rawPrice;
+        const calculatedPrice = typeof pricePct === 'number' && !isNaN(pricePct) ? pricePct : parseFloat(String(rawPrice)) * 100;
+        const isWinner = structuredOutcomes[i]?.isWinner === true;
+        const finalPrice = isMarketClosed && hasWinner ? (isWinner ? 100 : 0) : calculatedPrice;
+
         return {
           label,
-          price: typeof pricePct === 'number' && !isNaN(pricePct) ? pricePct : parseFloat(String(rawPrice)) * 100,
-          buyPrice: structuredOutcomes[i]?.buyPrice,
-          sellPrice: structuredOutcomes[i]?.sellPrice,
+          price: finalPrice,
+          buyPrice: isMarketClosed && hasWinner ? (isWinner ? 100 : 0) : structuredOutcomes[i]?.buyPrice,
+          sellPrice: isMarketClosed && hasWinner ? (isWinner ? 100 : 0) : structuredOutcomes[i]?.sellPrice,
         };
       });
       // Slug convention: away-home, so outcome[0]=away, outcome[1]=home
@@ -929,13 +951,13 @@ function calculateSpread(buyPrice: number, sellPrice: number): string {
  * - game.ended is true
  * - game.closed is true
  * - All markets are closed
- * - endDate + 3 hours has passed (fallback)
+ * - endDate + 5 hours has passed (fallback)
  */
 function isGameEnded(game: LiveGame): boolean {
   // End-date override first (handles occasional stale live=true flags)
   if (game.endDate) {
     const endDate = new Date(game.endDate);
-    const graceTime = 3 * 60 * 60 * 1000; // 3 hours in ms
+    const graceTime = 5 * 60 * 60 * 1000; // 5 hours in ms
     if ((endDate.getTime() + graceTime) < Date.now()) {
       return true;
     }
@@ -1050,13 +1072,26 @@ export function getUfcFighterNamesFromGame(
 }
 
 /**
+ * Kalshi price data for a matched game
+ */
+export interface KalshiPriceData {
+  yesBid: number;   // Best bid for YES = away sell price
+  yesAsk: number;   // Best ask for YES = away buy price
+  noBid: number;    // Best bid for NO = home sell price
+  noAsk: number;    // Best ask for NO = home buy price
+  ticker: string;   // Kalshi market ticker
+}
+
+/**
  * Transform a LiveGame to FrontendGame format
  * @param game - The LiveGame to transform
  * @param historicalChange - Optional pre-calculated probability change (for batch processing)
+ * @param kalshiData - Optional Kalshi price data (for matched games)
  */
 export async function transformToFrontendGame(
   game: LiveGame,
-  historicalChange?: { homePercentChange: number; awayPercentChange: number }
+  historicalChange?: { homePercentChange: number; awayPercentChange: number },
+  kalshiData?: KalshiPriceData
 ): Promise<FrontendGame> {
   // Ensure consistency: if game is live, it cannot be ended
   // This is a safety check in case the game object wasn't properly normalized
@@ -1245,6 +1280,9 @@ export async function transformToFrontendGame(
       // Tennis-specific fields
       tennisScore: isTennisMatch && tennisScoreData ? tennisScoreData.rawScore : undefined,
       setsWon: isTennisMatch && tennisScoreData ? tennisScoreData.setsWon.away : undefined,
+      // Kalshi prices (YES = away team wins)
+      kalshiBuyPrice: kalshiData?.yesAsk,
+      kalshiSellPrice: kalshiData?.yesBid,
     },
     homeTeam: {
       abbr: isUfc
@@ -1277,6 +1315,9 @@ export async function transformToFrontendGame(
       // Tennis-specific fields
       tennisScore: isTennisMatch && tennisScoreData ? tennisScoreData.rawScore : undefined,
       setsWon: isTennisMatch && tennisScoreData ? tennisScoreData.setsWon.home : undefined,
+      // Kalshi prices (NO = home team wins)
+      kalshiBuyPrice: kalshiData?.noAsk,
+      kalshiSellPrice: kalshiData?.noBid,
     },
     liquidity: formatLiquidity(game.liquidity),
     chartData,
@@ -1292,8 +1333,10 @@ export async function transformToFrontendGame(
     slug: game.slug,
     // Tennis-specific: include raw score at game level for easier frontend access
     tennisScore: isTennisMatch && tennisScoreData ? tennisScoreData.rawScore : undefined,
+    // Kalshi market ticker (when matched)
+    kalshiTicker: kalshiData?.ticker,
   };
-  
+
   return frontendGame;
 }
 

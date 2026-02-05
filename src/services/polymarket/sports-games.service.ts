@@ -64,7 +64,7 @@ async function fetchWithTimeout(url: string, timeout: number = TIMEOUT_MS): Prom
  */
 function isUpcomingGame(event: any): boolean {
   const now = Date.now();
-  const gracePeriod = 3 * 60 * 60 * 1000; // 3 hours grace period
+  const gracePeriod = 5 * 60 * 60 * 1000; // 5 hours grace period
   const recentWindow = 7 * 24 * 60 * 60 * 1000; // 7 days - store recent past games
   
   // Resolved (game finished)
@@ -243,7 +243,7 @@ async function fetchSportsGamesForSport(sport: string, seriesId: string): Promis
     const limit = 200;
     const maxPages = sport === 'cbb' ? 25 : sport === 'ufc' ? 20 : 5; // CBB and UFC need more pages
     const now = Date.now();
-    const gracePeriod = 3 * 60 * 60 * 1000; // 3 hours
+    const gracePeriod = 5 * 60 * 60 * 1000; // 5 hours
     const recentWindow = 7 * 24 * 60 * 60 * 1000; // 7 days
     const oldestAllowed = now - recentWindow - gracePeriod;
 

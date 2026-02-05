@@ -3,7 +3,7 @@
  * Tests market transformation and service functionality
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { kalshiService } from './kalshi.service';
 import { KalshiMarket } from './kalshi.types';
 

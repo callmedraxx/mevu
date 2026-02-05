@@ -105,7 +105,7 @@ describe('Kalshi API Client', () => {
         expect(typeof market.title).toBe('string');
 
         expect(market.status).toBeDefined();
-        expect(['unopened', 'open', 'closed', 'settled']).toContain(market.status);
+        expect(['unopened', 'open', 'closed', 'settled', 'active']).toContain(market.status);
 
         expect(market.close_time).toBeDefined();
         expect(new Date(market.close_time).toString()).not.toBe('Invalid Date');

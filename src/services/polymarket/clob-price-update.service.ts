@@ -10,9 +10,10 @@ import { ClobPriceChangeUpdate, ClobPriceChange } from './polymarket.types';
 import { getAllLiveGames, updateGameInCache, LiveGame, registerOnGamesRefreshed, registerOnRefreshStarting, registerOnRefreshEnded, acquireLiveGamesWriteLock, releaseLiveGamesWriteLock } from './live-games.service';
 import { positionsWebSocketService } from '../positions/positions-websocket.service';
 import { connectWithRetry } from '../../config/database';
-import { transformToFrontendGame, FrontendGame } from './frontend-game.transformer';
+import { transformToFrontendGame, FrontendGame, KalshiPriceData } from './frontend-game.transformer';
 import { transformToActivityWatcherGame, ActivityWatcherGame } from './activity-watcher.transformer';
 import { bulkUpsertFrontendGamesWithClient, clearFrontendGamesCache } from './frontend-games.service';
+import { kalshiService } from '../kalshi/kalshi.service';
 import {
   publishGamesBroadcast,
   publishActivityBroadcast,
@@ -539,12 +540,26 @@ export class ClobPriceUpdateService {
         // Get cached probability change or use defaults (skip DB lookup)
         const cachedProbChange = this.getCachedProbabilityChange(gameId);
         
+        // Fetch Kalshi prices to preserve them during CLOB price updates
+        let kalshiData: KalshiPriceData | undefined;
+        try {
+          const kalshiPricesMap = await kalshiService.getKalshiPricesForGames([gameId]);
+          kalshiData = kalshiPricesMap.get(gameId);
+        } catch (err) {
+          // Continue without Kalshi data if fetch fails (non-blocking)
+          logger.debug({
+            message: 'Failed to fetch Kalshi prices during CLOB update',
+            gameId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        
         // Pre-transform ONCE for both broadcasts (avoid double transformation)
         // Pass cached historical change to skip DB lookup in transformer
         let frontendGame: FrontendGame;
         let activityWatcherGame: ActivityWatcherGame;
         try {
-          frontendGame = await transformToFrontendGame(updatedGame, cachedProbChange);
+          frontendGame = await transformToFrontendGame(updatedGame, cachedProbChange, kalshiData);
           activityWatcherGame = await transformToActivityWatcherGame(updatedGame);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -788,14 +803,14 @@ export class ClobPriceUpdateService {
       }
     }
 
-    // Check end date - exclude if ended more than 3 hours ago
+    // Check end date - exclude if ended more than 5 hours ago
     const endDateStr = game.endDate || (game.rawData as any)?.endDate;
     if (endDateStr) {
       const endDate = new Date(endDateStr).getTime();
       if (!isNaN(endDate)) {
-        const threeHours = 3 * 60 * 60 * 1000;
-        if (endDate + threeHours < now) {
-          return false; // Game ended more than 3 hours ago
+        const fiveHours = 5 * 60 * 60 * 1000;
+        if (endDate + fiveHours < now) {
+          return false; // Game ended more than 5 hours ago
         }
       }
     }

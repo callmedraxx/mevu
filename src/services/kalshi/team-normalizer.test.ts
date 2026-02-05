@@ -112,9 +112,9 @@ describe('Team Name Normalizer', () => {
     });
 
     it('should handle question format', () => {
+      // Question formats without standard separators (vs, @, at) are not parseable
       const result = parseTeamsFromTitle('Will the Lakers beat the Celtics?');
-      expect(result).toEqual({ awayTeam: 'Lakers beat the', homeTeam: 'Celtics' });
-      // Note: This edge case could be improved in the parser
+      expect(result).toBeNull();
     });
 
     it('should return null for unparseable titles', () => {

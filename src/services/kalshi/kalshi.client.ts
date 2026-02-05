@@ -11,6 +11,23 @@ import { KalshiMarketsResponse } from './kalshi.types';
 const KALSHI_BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2';
 const REQUEST_TIMEOUT = 30000; // 30 seconds
 
+// Rate limiting: space requests 150ms apart (~6-7 req/sec)
+const RATE_LIMIT_DELAY_MS = 150;
+let requestQueue: Promise<void> = Promise.resolve();
+
+async function rateLimitedRequest<T>(fn: () => Promise<T>): Promise<T> {
+  // Chain onto the queue to ensure sequential execution
+  const execute = requestQueue.then(async () => {
+    await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
+    return fn();
+  });
+
+  // Update queue to wait for this request
+  requestQueue = execute.then(() => {}, () => {});
+
+  return execute;
+}
+
 export interface FetchMarketsParams {
   seriesTicker?: string;
   status?: string;
@@ -42,13 +59,15 @@ export async function fetchKalshiMarkets(params: FetchMarketsParams): Promise<Ka
   }
 
   try {
-    const response = await axios.get<KalshiMarketsResponse>(url.toString(), {
-      timeout: REQUEST_TIMEOUT,
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'mevu-backend/1.0',
-      },
-    });
+    const response = await rateLimitedRequest(() =>
+      axios.get<KalshiMarketsResponse>(url.toString(), {
+        timeout: REQUEST_TIMEOUT,
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'mevu-backend/1.0',
+        },
+      })
+    );
 
     return {
       markets: response.data.markets || [],

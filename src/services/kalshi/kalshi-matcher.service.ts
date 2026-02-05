@@ -15,6 +15,10 @@ class KalshiMatcherService {
    * 2. Same normalized team names (home/away)
    * 3. Same game date (within tolerance)
    *
+   * Special handling for Super Bowl (KXSB) markets:
+   * - Each team has its own market (KXSB-26-SEA, KXSB-26-NE)
+   * - Match by team being either home or away in the game
+   *
    * All matching logic runs in PostgreSQL for efficiency
    * @returns Number of markets matched
    */
@@ -27,59 +31,46 @@ class KalshiMatcherService {
 
     const client = await pool.connect();
     try {
-      // Single SQL query does all matching - let Postgres do the work
-      // We match on:
-      // 1. Sport must match
-      // 2. Game date must match (DATE comparison)
-      // 3. Team names must match (using normalized columns or abbreviations)
-      const result = await client.query(`
-        WITH matches AS (
+      // Match regular game markets (KXNBAGAME, etc.)
+      const regularResult = await client.query(`
+        WITH slug_parsed AS (
+          SELECT
+            lg.id,
+            lg.slug,
+            lg.sport,
+            lg.ended,
+            lg.closed,
+            -- Extract away_abbr (2nd part of slug)
+            LOWER(SPLIT_PART(lg.slug, '-', 2)) as slug_away_abbr,
+            -- Extract home_abbr (3rd part of slug)
+            LOWER(SPLIT_PART(lg.slug, '-', 3)) as slug_home_abbr,
+            -- Extract date from slug (last 3 parts: YYYY-MM-DD)
+            (SPLIT_PART(lg.slug, '-', 4) || '-' ||
+             SPLIT_PART(lg.slug, '-', 5) || '-' ||
+             SPLIT_PART(lg.slug, '-', 6))::date as slug_date
+          FROM live_games lg
+          WHERE lg.slug ~ '^[a-z]+-[a-z]+-[a-z]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        ),
+        matches AS (
           SELECT DISTINCT ON (k.ticker)
             k.ticker,
-            lg.id as live_game_id
+            sp.id as live_game_id
           FROM kalshi_markets k
-          JOIN live_games lg ON (
+          JOIN slug_parsed sp ON (
             -- Sport must match
-            LOWER(k.sport) = LOWER(lg.sport)
-            -- Date must match (compare just the date portion)
-            AND k.game_date = DATE(lg.start_date)
-            AND (
-              -- Try normalized name match
-              (
-                LOWER(k.home_team) = LOWER(COALESCE(lg.home_team_normalized, ''))
-                AND LOWER(k.away_team) = LOWER(COALESCE(lg.away_team_normalized, ''))
-              )
-              OR
-              -- Try abbreviation match
-              (
-                UPPER(k.home_team_abbr) = UPPER(COALESCE(lg.home_abbr, ''))
-                AND UPPER(k.away_team_abbr) = UPPER(COALESCE(lg.away_abbr, ''))
-                AND k.home_team_abbr IS NOT NULL
-                AND k.away_team_abbr IS NOT NULL
-                AND lg.home_abbr IS NOT NULL
-                AND lg.away_abbr IS NOT NULL
-              )
-              OR
-              -- Fuzzy match: team name contains normalized or vice versa
-              (
-                (
-                  LOWER(k.home_team) LIKE '%' || LOWER(COALESCE(lg.home_team_normalized, 'NOMATCH')) || '%'
-                  OR LOWER(COALESCE(lg.home_team_normalized, '')) LIKE '%' || LOWER(k.home_team) || '%'
-                )
-                AND (
-                  LOWER(k.away_team) LIKE '%' || LOWER(COALESCE(lg.away_team_normalized, 'NOMATCH')) || '%'
-                  OR LOWER(COALESCE(lg.away_team_normalized, '')) LIKE '%' || LOWER(k.away_team) || '%'
-                )
-                AND LENGTH(k.home_team) >= 4
-                AND LENGTH(k.away_team) >= 4
-              )
-            )
+            LOWER(k.sport) = LOWER(sp.sport)
+            -- Date must match
+            AND k.game_date = sp.slug_date
+            -- Team abbreviations must match (from Kalshi abbr to slug abbr)
+            AND LOWER(k.home_team_abbr) = sp.slug_home_abbr
+            AND LOWER(k.away_team_abbr) = sp.slug_away_abbr
           )
           WHERE k.live_game_id IS NULL
-            AND k.status = 'open'
-            AND lg.ended = false
-            AND (lg.closed IS NULL OR lg.closed = false)
-          ORDER BY k.ticker, lg.updated_at DESC
+            AND k.status = 'active'
+            AND UPPER(k.ticker) NOT LIKE 'KXSB-%'  -- Exclude Super Bowl (handled separately)
+            AND sp.ended = false
+            AND (sp.closed IS NULL OR sp.closed = false)
+          ORDER BY k.ticker
         )
         UPDATE kalshi_markets k
         SET live_game_id = m.live_game_id, updated_at = NOW()
@@ -88,16 +79,73 @@ class KalshiMatcherService {
         RETURNING k.ticker
       `);
 
-      const matchCount = result.rowCount || 0;
+      const regularMatchCount = regularResult.rowCount || 0;
 
-      if (matchCount > 0) {
+      // Match Super Bowl markets (KXSB-YY-TEAM format)
+      // These are per-team markets, so match if the team is either home or away
+      const sbResult = await client.query(`
+        WITH slug_parsed AS (
+          SELECT
+            lg.id,
+            lg.slug,
+            lg.sport,
+            lg.ended,
+            lg.closed,
+            -- Extract away_abbr (2nd part of slug)
+            LOWER(SPLIT_PART(lg.slug, '-', 2)) as slug_away_abbr,
+            -- Extract home_abbr (3rd part of slug)
+            LOWER(SPLIT_PART(lg.slug, '-', 3)) as slug_home_abbr,
+            -- Extract date from slug (last 3 parts: YYYY-MM-DD)
+            (SPLIT_PART(lg.slug, '-', 4) || '-' ||
+             SPLIT_PART(lg.slug, '-', 5) || '-' ||
+             SPLIT_PART(lg.slug, '-', 6))::date as slug_date
+          FROM live_games lg
+          WHERE lg.sport = 'nfl'
+            AND lg.slug ~ '^[a-z]+-[a-z]+-[a-z]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        ),
+        sb_matches AS (
+          SELECT DISTINCT ON (k.ticker)
+            k.ticker,
+            sp.id as live_game_id
+          FROM kalshi_markets k
+          JOIN slug_parsed sp ON (
+            -- Super Bowl is NFL
+            LOWER(k.sport) = 'nfl'
+            -- Date must match
+            AND k.game_date = sp.slug_date
+            -- Team must be either home or away in the game
+            AND (
+              LOWER(k.away_team_abbr) = sp.slug_home_abbr
+              OR LOWER(k.away_team_abbr) = sp.slug_away_abbr
+            )
+          )
+          WHERE k.live_game_id IS NULL
+            AND k.status = 'active'
+            AND UPPER(k.ticker) LIKE 'KXSB-%'  -- Only Super Bowl markets
+            AND sp.ended = false
+            AND (sp.closed IS NULL OR sp.closed = false)
+          ORDER BY k.ticker
+        )
+        UPDATE kalshi_markets k
+        SET live_game_id = m.live_game_id, updated_at = NOW()
+        FROM sb_matches m
+        WHERE k.ticker = m.ticker
+        RETURNING k.ticker
+      `);
+
+      const sbMatchCount = sbResult.rowCount || 0;
+      const totalMatchCount = regularMatchCount + sbMatchCount;
+
+      if (totalMatchCount > 0) {
         logger.info({
           message: 'Kalshi markets matched to live games',
-          matchedCount: matchCount,
+          matchedCount: totalMatchCount,
+          regularMatches: regularMatchCount,
+          superBowlMatches: sbMatchCount,
         });
       }
 
-      return matchCount;
+      return totalMatchCount;
     } catch (error) {
       logger.error({
         message: 'Error matching Kalshi markets',
@@ -168,7 +216,7 @@ class KalshiMatcherService {
             AND (lg.ended = true OR lg.closed = true)
           )) as stale
         FROM kalshi_markets
-        WHERE status = 'open'
+        WHERE status = 'active'
       `);
 
       const row = result.rows[0];

@@ -14,7 +14,8 @@ import { PolymarketEvent, TransformedEvent } from './polymarket.types';
 import { recordProbabilitySnapshotsBulk, initializeProbabilityHistoryTable } from './probability-history.service';
 import type { ProbabilitySnapshot } from './probability-history.service';
 import { upsertFrontendGamesForLiveGames, upsertFrontendGameForLiveGame, bulkUpsertFrontendGamesWithClient, clearFrontendGamesCache } from './frontend-games.service';
-import { transformToFrontendGame } from './frontend-game.transformer';
+import { transformToFrontendGame, KalshiPriceData } from './frontend-game.transformer';
+import { kalshiService } from '../kalshi/kalshi.service';
 import {
   setGameInCache,
   setGamesInCacheBatch,
@@ -756,7 +757,7 @@ function hasEndDateGracePassed(endDate: string | undefined): boolean {
   if (!endDate) return false;
   const t = new Date(endDate).getTime();
   if (Number.isNaN(t)) return false;
-  const graceTime = 3 * 60 * 60 * 1000; // 3 hours
+  const graceTime = 5 * 60 * 60 * 1000; // 5 hours
   return (t + graceTime) < Date.now();
 }
 
@@ -887,11 +888,11 @@ function isGameEnded(game: LiveGameEvent): boolean {
     if (allMarketsClosed) return true;
   }
 
-  // Check if end_date + 3 hour grace period has passed
+  // Check if end_date + 5 hour grace period has passed
   if (game.endDate) {
     const endDate = new Date(game.endDate);
     const now = new Date();
-    const graceTime = 3 * 60 * 60 * 1000; // 3 hours
+    const graceTime = 5 * 60 * 60 * 1000; // 5 hours
     if ((endDate.getTime() + graceTime) < now.getTime()) return true;
   }
 
@@ -940,10 +941,10 @@ export function isLiveGameEnded(game: LiveGame): boolean {
     if (allMarketsClosed) return true;
   }
 
-  // Check if end_date + 3 hour grace period has passed
+  // Check if end_date + 5 hour grace period has passed
   if (game.endDate) {
     const endDate = new Date(game.endDate);
-    const graceTime = 3 * 60 * 60 * 1000; // 3 hours
+    const graceTime = 5 * 60 * 60 * 1000; // 5 hours
     if ((endDate.getTime() + graceTime) < Date.now()) {
       return true;
     }
@@ -1499,13 +1500,13 @@ async function getLiveGameBySlugFromDatabase(slug: string): Promise<LiveGame | n
         ) as game_data,
         period_scores,
         balldontlie_game_id,
-        CASE 
-          WHEN end_date IS NOT NULL 
-            AND end_date + INTERVAL '3 hours' < NOW() 
-          THEN true 
-          ELSE false 
+        CASE
+          WHEN end_date IS NOT NULL
+            AND end_date + INTERVAL '5 hours' < NOW()
+          THEN true
+          ELSE false
         END as grace_passed
-       FROM live_games 
+       FROM live_games
        WHERE LOWER(slug) = $1 OR LOWER(ticker) = $1 OR LOWER(id) = $1
        LIMIT 1`,
       [slug]
@@ -1563,13 +1564,13 @@ async function getLiveGameByIdFromDatabase(id: string): Promise<LiveGame | null>
         ) as game_data,
         period_scores,
         balldontlie_game_id,
-        CASE 
-          WHEN end_date IS NOT NULL 
-            AND end_date + INTERVAL '3 hours' < NOW() 
-          THEN true 
-          ELSE false 
+        CASE
+          WHEN end_date IS NOT NULL
+            AND end_date + INTERVAL '5 hours' < NOW()
+          THEN true
+          ELSE false
         END as grace_passed
-       FROM live_games 
+       FROM live_games
        WHERE id = $1`,
       [id]
     );
@@ -1621,11 +1622,11 @@ async function getAllLiveGamesFromDatabase(): Promise<LiveGame[]> {
         period_scores,
         balldontlie_game_id,
         -- Pre-calculate the grace period check in SQL
-        CASE 
-          WHEN end_date IS NOT NULL 
-            AND end_date + INTERVAL '3 hours' < NOW() 
-          THEN true 
-          ELSE false 
+        CASE
+          WHEN end_date IS NOT NULL
+            AND end_date + INTERVAL '5 hours' < NOW()
+          THEN true
+          ELSE false
         END as grace_passed
       FROM live_games
       ORDER BY 
@@ -1948,12 +1949,28 @@ async function flushSportsGameUpdates(): Promise<void> {
     WHERE lg.id = v.id
   `;
 
-  // 3. Transform to frontend games BEFORE connect (uses pool internally for prob history)
+  // 3. Fetch Kalshi prices for all games in batch to preserve during sports updates
+  const gameIds = toWrite.map(({ game }) => game.id);
+  let kalshiPricesMap = new Map<string, KalshiPriceData>();
+  try {
+    kalshiPricesMap = await kalshiService.getKalshiPricesForGames(gameIds);
+  } catch (error) {
+    // Continue without Kalshi data if fetch fails
+    logger.debug({
+      message: 'Failed to fetch Kalshi prices for sports updates batch',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // 4. Transform to frontend games BEFORE connect (uses pool internally for prob history)
   const frontendGames = await Promise.all(
-    toWrite.map(({ game }) => transformToFrontendGame(game))
+    toWrite.map(({ game }) => {
+      const kalshiData = kalshiPricesMap.get(game.id);
+      return transformToFrontendGame(game, undefined, kalshiData);
+    })
   );
 
-  // 4. Acquire write lock (serializes with CLOB flush - prevents deadlock)
+  // 5. Acquire write lock (serializes with CLOB flush - prevents deadlock)
   await acquireLiveGamesWriteLock();
   const client = await pool.connect();
 

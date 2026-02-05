@@ -2,9 +2,10 @@ import { PoolClient } from 'pg';
 import { pool, connectWithRetry } from '../../config/database';
 import { logger } from '../../config/logger';
 import { LiveGame } from './live-games.service';
-import { FrontendGame, transformToFrontendGame } from './frontend-game.transformer';
+import { FrontendGame, transformToFrontendGame, KalshiPriceData } from './frontend-game.transformer';
 import { loadFromDatabase as loadUfcFighterRecords } from '../ufc/ufc-fighter-records.service';
 import { publishCacheInvalidation, subscribeToGamesBroadcast, initRedisClusterBroadcast } from '../redis-cluster-broadcast.service';
+import { kalshiService } from '../kalshi';
 
 // In-memory cache for frontend games to handle burst traffic
 // Cache key: JSON stringified options
@@ -269,10 +270,25 @@ export async function upsertFrontendGameWithClient(
 /**
  * Upsert a single LiveGame to frontend_games (transforms first).
  * Used when Sports WebSocket sends live/ended/score/period updates.
+ * Fetches Kalshi data to preserve pricing info during live updates.
  */
 export async function upsertFrontendGameForLiveGame(liveGame: LiveGame): Promise<void> {
   try {
-    const frontendGame = await transformToFrontendGame(liveGame);
+    // Fetch Kalshi prices for this game to preserve pricing during live updates
+    let kalshiData: KalshiPriceData | undefined;
+    try {
+      const kalshiPricesMap = await kalshiService.getKalshiPricesForGames([liveGame.id]);
+      kalshiData = kalshiPricesMap.get(liveGame.id);
+    } catch (error) {
+      // Continue without Kalshi data if fetch fails
+      logger.debug({
+        message: 'Failed to fetch Kalshi prices for single game update',
+        gameId: liveGame.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    
+    const frontendGame = await transformToFrontendGame(liveGame, undefined, kalshiData);
     await upsertFrontendGame(frontendGame);
   } catch (error) {
     logger.error({
@@ -320,11 +336,31 @@ export async function upsertFrontendGamesForLiveGames(games: LiveGame[]): Promis
     await loadUfcFighterRecords();
   }
 
-  // Transform all games (no connection held)
+  // Batch-fetch Kalshi prices for all games (single DB query)
+  const gameIds = games.map(g => g.id);
+  let kalshiPricesMap: Map<string, KalshiPriceData> = new Map();
+  try {
+    kalshiPricesMap = await kalshiService.getKalshiPricesForGames(gameIds);
+    if (kalshiPricesMap.size > 0) {
+      logger.debug({
+        message: 'Fetched Kalshi prices for games batch',
+        matchedCount: kalshiPricesMap.size,
+        totalGames: games.length,
+      });
+    }
+  } catch (error) {
+    logger.warn({
+      message: 'Error fetching Kalshi prices for games (continuing without)',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // Transform all games with Kalshi data (no connection held)
   const transformed: FrontendGame[] = [];
   for (const game of games) {
     try {
-      const fg = await transformToFrontendGame(game);
+      const kalshiData = kalshiPricesMap.get(game.id);
+      const fg = await transformToFrontendGame(game, undefined, kalshiData);
       transformed.push(fg);
     } catch (error) {
       logger.error({
@@ -523,10 +559,10 @@ export async function getFrontendGamesFromDatabase(options: {
     if (includeEnded !== 'true') {
       // Default: exclude ended games (stored ended flag + past endDate+grace so stale rows are excluded)
       where.push(`(ended = false OR ended IS NULL)`);
-      // Exclude games past endDate + 3h grace (handles stale ended=false, e.g. tennis games not yet updated)
+      // Exclude games past endDate + 5h grace (handles stale ended=false, e.g. tennis games not yet updated)
       where.push(`(
         frontend_data->>'endDate' IS NULL
-        OR (frontend_data->>'endDate')::timestamptz + interval '3 hours' >= now()
+        OR (frontend_data->>'endDate')::timestamptz + interval '5 hours' >= now()
       )`);
     }
 
