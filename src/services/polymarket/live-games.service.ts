@@ -364,6 +364,8 @@ function extractSportFromGame(game: LiveGameEvent): string | null {
     // Tennis games are listed under ATP/WTA tours in Polymarket slugs.
     // We normalize both into a single "tennis" sport internally.
     tennis: ['tennis', 'atp', 'wta'],
+    // Men's Winter Olympics Hockey: slugs start with "mwoh-"
+    mwoh: ['mwoh', 'winter olympics hockey', 'mens winter olympics hockey'],
   };
   
   // First, check if first slug part matches any sport's indicators
@@ -414,6 +416,7 @@ const STANDARD_LEAGUES = new Set([
   'tennis',
   'atp',
   'wta',
+  'mwoh',
 ]);
 
 function extractLeagueFromSlug(slug: string): string | null {
@@ -1823,12 +1826,12 @@ export async function applySportsGameUpdate(gameId: number, updates: Partial<Liv
       sportsGameUpdateFlushTimer = null;
     }
     
-    logger.info({
-      message: 'Critical status change detected, flushing immediately',
-      gameId,
-      live: updates.live,
-      ended: updates.ended,
-    });
+    // logger.info({
+    //   message: 'Critical status change detected, flushing immediately',
+    //   gameId,
+    //   live: updates.live,
+    //   ended: updates.ended,
+    // });
 
     // Flush immediately and WAIT for completion - ensures DB is in sync with WebSocket broadcast
     // This prevents race condition where user refreshes and gets stale data from DB

@@ -10,6 +10,8 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
+      # Debug ingest: from inside Docker, use host so Cursor on the host receives logs (optional)
+      - DEBUG_INGEST_URL=http://host.docker.internal:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263
       - WORKER_COUNT=4
       - NODE_OPTIONS=--max-old-space-size=3072  # 3GB per worker (2 background + 2 HTTP + 1 primary = 5 processes)
       - DATABASE_URL=postgresql://user:password@pgbouncer:6432/mevu

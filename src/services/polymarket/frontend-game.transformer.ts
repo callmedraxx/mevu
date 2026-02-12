@@ -16,9 +16,9 @@ export interface FrontendTeam {
   abbr: string;            // "WAS"
   name: string;            // "Wizards"
   record: string;          // "3-18"
-  probability: number;     // 65.5 (% chance to win, YES outcome)
-  buyPrice: number;        // 66 (cents, YES price rounded up)
-  sellPrice: number;       // 35 (cents, NO price rounded up)
+  probability: number;     // 66 (% chance to win as integer, YES outcome)
+  buyPrice: number;        // 65.5 (cents with decimal precision, YES price)
+  sellPrice: number;       // 35.5 (cents with decimal precision, NO price)
   score?: number;          // 87 (live games only)
   tennisScore?: string;    // Raw tennis score: "6-4, 2-6, 1-1"
   setsWon?: number;        // Number of sets won (0, 1, 2, 3) - for tennis
@@ -254,29 +254,63 @@ function formatQuarter(period: string | undefined): string | undefined {
 }
 
 /**
- * Clean tennis team names by removing tournament prefixes like "Australian Open Men's", "American Open Women's", etc.
+ * Clean tennis team names by removing tournament prefixes like "Australian Open Men's", "Qatar Total Open, Qualification:", etc.
+ * Returns just the player name (e.g., "Anastasia Zakharova" from "Qatar Total Open, Qualification: Anastasia Zakharova")
  */
 function cleanTennisTeamName(name: string | undefined | null): string | undefined {
   if (!name) return undefined;
   
   let cleaned = name.trim();
   
-  // Remove tournament prefixes (case-insensitive, with optional apostrophe variations)
-  // Pattern: [Tournament Name] [Men's/Women's]: [Player Name]
+  // Generic pattern: anything before a colon is likely a tournament/qualification prefix
+  // e.g., "Qatar Total Open, Qualification: Anastasia Zakharova" -> "Anastasia Zakharova"
+  // e.g., "Australian Open Men's: Novak Djokovic" -> "Novak Djokovic"
+  const colonIndex = cleaned.indexOf(':');
+  if (colonIndex !== -1) {
+    const afterColon = cleaned.slice(colonIndex + 1).trim();
+    if (afterColon.length > 0) {
+      cleaned = afterColon;
+    }
+  }
+  
+  // Also handle specific patterns without colons (older format or partial matches)
+  // These patterns handle cases where the colon might be missing or the name format differs
   const tournamentPrefixes = [
-    /^Australian\s+Open\s+Men'?s?\s*:\s*/i,
-    /^Australian\s+Open\s+Women'?s?\s*:\s*/i,
-    /^American\s+Open\s+Men'?s?\s*:\s*/i,
-    /^American\s+Open\s+Women'?s?\s*:\s*/i,
-    /^US\s+Open\s+Men'?s?\s*:\s*/i,
-    /^US\s+Open\s+Women'?s?\s*:\s*/i,
-    /^French\s+Open\s+Men'?s?\s*:\s*/i,
-    /^French\s+Open\s+Women'?s?\s*:\s*/i,
-    /^Wimbledon\s+Men'?s?\s*:\s*/i,
-    /^Wimbledon\s+Women'?s?\s*:\s*/i,
-    // Generic patterns
-    /^[A-Z][a-z]+\s+Open\s+Men'?s?\s*:\s*/i,
-    /^[A-Z][a-z]+\s+Open\s+Women'?s?\s*:\s*/i,
+    // Grand Slams
+    /^Australian\s+Open[\s,]*(Men'?s?|Women'?s?)?\s*/i,
+    /^US\s+Open[\s,]*(Men'?s?|Women'?s?)?\s*/i,
+    /^French\s+Open[\s,]*(Men'?s?|Women'?s?)?\s*/i,
+    /^Wimbledon[\s,]*(Men'?s?|Women'?s?)?\s*/i,
+    /^Roland\s+Garros[\s,]*(Men'?s?|Women'?s?)?\s*/i,
+    // WTA/ATP Tours
+    /^Qatar\s+Total\s+Open[\s,]*(Qualification)?\s*/i,
+    /^Transylvania\s+Open[\s,]*(Qualification)?\s*/i,
+    /^Open\s+Sud\s+de\s+France[\s,]*(Qualification)?\s*/i,
+    /^Ostrava\s+Open[\s,]*(Qualification)?\s*/i,
+    /^Mubadala\s+Abu\s+Dhabi\s+Open[\s,]*(Qualification)?\s*/i,
+    /^Dubai\s+(Tennis\s+)?Championships?[\s,]*\s*/i,
+    /^Indian\s+Wells[\s,]*(Masters)?\s*/i,
+    /^Miami\s+Open[\s,]*\s*/i,
+    /^Madrid\s+Open[\s,]*\s*/i,
+    /^Italian\s+Open[\s,]*\s*/i,
+    /^Rome\s+Masters[\s,]*\s*/i,
+    /^Cincinnati\s+(Masters|Open)[\s,]*\s*/i,
+    /^Shanghai\s+Masters[\s,]*\s*/i,
+    /^Paris\s+Masters[\s,]*\s*/i,
+    /^Monte[\s-]?Carlo\s+Masters[\s,]*\s*/i,
+    /^Canada\s+(Masters|Open)[\s,]*\s*/i,
+    /^Stuttgart\s+Open[\s,]*\s*/i,
+    /^Brisbane\s+International[\s,]*\s*/i,
+    /^Adelaide\s+International[\s,]*\s*/i,
+    /^Auckland\s+Open[\s,]*\s*/i,
+    // Generic patterns (catch-all for other tournaments)
+    /^[A-Z][a-z]+(\s+[A-Z][a-z]+)*\s+Open[\s,]*(Qualification)?\s*/i,
+    /^[A-Z][a-z]+(\s+[A-Z][a-z]+)*\s+Masters[\s,]*\s*/i,
+    /^[A-Z][a-z]+(\s+[A-Z][a-z]+)*\s+International[\s,]*\s*/i,
+    /^[A-Z][a-z]+(\s+[A-Z][a-z]+)*\s+Championships?[\s,]*\s*/i,
+    // Tour prefixes
+    /^WTA\s+/i,
+    /^ATP\s+/i,
   ];
   
   for (const pattern of tournamentPrefixes) {
@@ -395,6 +429,7 @@ function extractAbbrevsFromSlug(slug: string | undefined, gameSport?: string): {
     'tennis',
     'atp',
     'wta',
+    'mwoh',
   ]);
 
   const firstPartLower = slugParts[0]?.toLowerCase() || '';
@@ -499,6 +534,16 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
   const stripUfcPrefix = (s: string) => s.replace(/^ufc[^:]*:\s*/i, '').replace(/\s*\([^)]*\)\s*$/, '').trim();
   if (homeTeamName) homeTeamName = stripUfcPrefix(homeTeamName);
   if (awayTeamName) awayTeamName = stripUfcPrefix(awayTeamName);
+
+  // Tennis: normalize tournament prefixes like "Qatar Total Open, Qualification: Player Name" -> "Player Name"
+  // This allows matching market outcome labels like "Zakharova" to team names
+  const isTennis = isTennisGame(game);
+  if (isTennis) {
+    const cleanedHome = cleanTennisTeamName(homeTeamName);
+    const cleanedAway = cleanTennisTeamName(awayTeamName);
+    if (cleanedHome) homeTeamName = cleanedHome.toLowerCase();
+    if (cleanedAway) awayTeamName = cleanedAway.toLowerCase();
+  }
   
   // Fallback: Extract team names from title if teams aren't enriched
   if (!homeTeamName && !awayTeamName && game.title) {
@@ -691,14 +736,34 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
                            questionLower.includes('(-') || 
                            questionLower.includes('(+') ||
                            questionLower.includes('handicap');
+    // Check for totals markets - be careful not to match tournament names like "Qatar Total Open"
+    // Only match "total" when followed by a sports term (points, sets, games, etc.)
+    const hasTotalsKeyword = questionLower.includes('total points') || 
+                             questionLower.includes('total sets') || 
+                             questionLower.includes('total games') ||
+                             questionLower.includes('total score') ||
+                             questionLower.includes('total goals') ||
+                             questionLower.includes('total runs') ||
+                             questionLower.includes('total corners') ||
+                             questionLower.includes('total cards');
     const isTotalsMarket = questionLower.includes('o/u') || 
                            questionLower.includes('over/under') ||
-                           questionLower.includes('total');
+                           hasTotalsKeyword;
     const isPropsMarket = questionLower.includes('both teams') ||
                           questionLower.includes('first goal') ||
                           questionLower.includes('clean sheet') ||
                           questionLower.includes('corner') ||
                           questionLower.includes('card');
+    // Tennis-specific: skip set/game winner props (not match winner)
+    const isTennisSetProp = questionLower.includes('set 1') ||
+                            questionLower.includes('set 2') ||
+                            questionLower.includes('set 3') ||
+                            questionLower.includes('1st set') ||
+                            questionLower.includes('2nd set') ||
+                            questionLower.includes('3rd set') ||
+                            questionLower.includes('set winner') ||
+                            questionLower.includes('games o/u') ||
+                            questionLower.includes('match o/u');
     
     // Skip Over/Under outcomes, Points, Rebounds, etc.
     // Use exact match or word boundary to avoid false positives (e.g., "thunder" contains "under")
@@ -709,7 +774,7 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
       l.includes('points') || l.includes('rebounds') || l.includes('assists')
     );
     
-    const shouldSkip = isSpreadMarket || isTotalsMarket || isPropsMarket || hasNonMoneylineOutcomes;
+    const shouldSkip = isSpreadMarket || isTotalsMarket || isPropsMarket || isTennisSetProp || hasNonMoneylineOutcomes;
     
     // Debug logging for specific game
     if (game.id === '117348') {
@@ -912,22 +977,25 @@ function extractPrices(game: LiveGame): {
     
     // buyPrice from CLOB best_ask (what you pay to BUY)
     // sellPrice from CLOB best_bid (what you get when you SELL)
+    // Prices preserve decimal precision (e.g., 99.5 not 100)
     if (moneyline.home.buyPrice !== undefined) {
       homeBuy = moneyline.home.buyPrice;
       // Use actual sellPrice from best_bid if available, otherwise fallback to calculation
-      homeSell = moneyline.home.sellPrice !== undefined ? moneyline.home.sellPrice : Math.ceil(100 - homeBuy);
+      homeSell = moneyline.home.sellPrice !== undefined ? moneyline.home.sellPrice : Math.round((100 - homeBuy) * 10) / 10;
     } else {
-      homeBuy = Math.ceil(homeYesPrice);
-      homeSell = Math.ceil(100 - homeYesPrice);
+      // Fallback: use price with 1 decimal precision
+      homeBuy = Math.round(homeYesPrice * 10) / 10;
+      homeSell = Math.round((100 - homeYesPrice) * 10) / 10;
     }
     
     if (moneyline.away.buyPrice !== undefined) {
       awayBuy = moneyline.away.buyPrice;
       // Use actual sellPrice from best_bid if available, otherwise fallback to calculation
-      awaySell = moneyline.away.sellPrice !== undefined ? moneyline.away.sellPrice : Math.ceil(100 - awayBuy);
+      awaySell = moneyline.away.sellPrice !== undefined ? moneyline.away.sellPrice : Math.round((100 - awayBuy) * 10) / 10;
     } else {
-      awayBuy = Math.ceil(awayYesPrice);
-      awaySell = Math.ceil(100 - awayYesPrice);
+      // Fallback: use price with 1 decimal precision
+      awayBuy = Math.round(awayYesPrice * 10) / 10;
+      awaySell = Math.round((100 - awayYesPrice) * 10) / 10;
     }
   }
   
@@ -937,12 +1005,17 @@ function extractPrices(game: LiveGame): {
 /**
  * Calculate spread string (difference between buy and sell for same team)
  * This represents the bid-ask spread
+ * Handles decimal prices (e.g., 99.5 - 98.5 = 1)
  */
 function calculateSpread(buyPrice: number, sellPrice: number): string {
   if (buyPrice === NO_PRICE || sellPrice === NO_PRICE) return '—';
   const spread = Math.abs(buyPrice - sellPrice);
-  if (spread <= 1) return '1¢';
-  return `1-${spread}¢`;
+  // Round to 1 decimal for display
+  const spreadRounded = Math.round(spread * 10) / 10;
+  if (spreadRounded <= 1) return '1¢';
+  // Show decimal if present, otherwise integer
+  const spreadDisplay = spreadRounded % 1 === 0 ? spreadRounded.toString() : spreadRounded.toFixed(1);
+  return `1-${spreadDisplay}¢`;
 }
 
 /**
@@ -1146,7 +1219,7 @@ export async function transformToFrontendGame(
     const finalHomeAbbr = homeTeam?.abbreviation || slugAbbrevs.home || game.teamIdentifiers?.home?.substring(0, 3).toUpperCase() || titleTeams.home?.substring(0, 3).toUpperCase() || 'HME';
     
     // Check if slug-extracted abbreviations match sport identifiers (common mistake)
-    const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls']);
+    const sportIdentifiers = new Set(['nhl', 'nba', 'nfl', 'mlb', 'epl', 'cbb', 'cfb', 'lal', 'ser', 'bund', 'lig1', 'mls', 'mwoh']);
     if (sportIdentifiers.has(finalAwayAbbr.toLowerCase()) || sportIdentifiers.has(finalHomeAbbr.toLowerCase())) {
       // logger.warn({
       //   message: 'Team abbreviation matches sport identifier - likely slug parsing error',

@@ -154,7 +154,8 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
     const result = await client.query(
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
               proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
-              ctf_approval_enabled, onboarding_completed, created_at, updated_at
+              ctf_approval_enabled, onboarding_completed, created_at, updated_at,
+              trading_region, solana_wallet_address, kalshi_onboarding_completed, kalshi_usdc_balance
        FROM users WHERE privy_user_id = $1`,
       [privyUserId]
     );
@@ -162,7 +163,7 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
     if (result.rows.length === 0) return null;
 
     const row = result.rows[0];
-    return {
+    const user: UserProfile = {
       id: row.id,
       privyUserId: row.privy_user_id,
       username: row.username,
@@ -175,6 +176,11 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
+    if (row.trading_region != null) user.tradingRegion = row.trading_region;
+    if (row.solana_wallet_address != null) user.solanaWalletAddress = row.solana_wallet_address;
+    if (row.kalshi_onboarding_completed != null) user.kalshiOnboardingCompleted = row.kalshi_onboarding_completed;
+    if (row.kalshi_usdc_balance != null) user.kalshiUsdcBalance = String(row.kalshi_usdc_balance);
+    return user;
   } finally {
     client.release();
   }

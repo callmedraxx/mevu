@@ -16,15 +16,23 @@ import {
   publishGamesBroadcast,
   isRedisGamesBroadcastReady,
 } from '../redis-games-broadcast.service';
+import {
+  subscribeToKalshiPriceBroadcast,
+  KalshiPriceBroadcastMessage,
+} from '../redis-cluster-broadcast.service';
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'initial' | 'games_update' | 'game_update' | 'price_update' | 'heartbeat' | 'error' | 'subscribed';
+  type: 'initial' | 'games_update' | 'game_update' | 'price_update' | 'kalshi_price_update' | 'heartbeat' | 'error' | 'subscribed';
   games?: FrontendGame[];
   game?: FrontendGame;
   timestamp?: string;
   message?: string;
   clientCount?: number;
+  // Kalshi price update fields
+  gameId?: string;
+  awayTeam?: { kalshiBuyPrice: number; kalshiSellPrice: number };
+  homeTeam?: { kalshiBuyPrice: number; kalshiSellPrice: number };
 }
 
 /**
@@ -37,6 +45,7 @@ export class GamesWebSocketService {
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private isInitialized: boolean = false;
   private redisUnsubscribe: (() => void) | null = null;
+  private kalshiRedisUnsubscribe: (() => void) | null = null;
 
   private wsPath: string = '/ws/games';
   
@@ -118,6 +127,57 @@ export class GamesWebSocketService {
         });
       }
     });
+    
+    // Subscribe to Kalshi price broadcasts for real-time Kalshi price updates
+    this.setupKalshiPriceBroadcast();
+  }
+  
+  /**
+   * Subscribe to Kalshi price broadcasts and forward to WebSocket clients
+   */
+  private setupKalshiPriceBroadcast(): void {
+    this.kalshiRedisUnsubscribe = subscribeToKalshiPriceBroadcast((msg: KalshiPriceBroadcastMessage) => {
+      try {
+        const clientCount = this.clients.size;
+        logger.info({
+          message: '[Kalshi broadcast] Games WebSocket received kalshi_price_update, sending to frontend',
+          gameId: msg.gameId,
+          ticker: msg.ticker,
+          clientCount,
+        });
+
+        const payload: WSMessage = {
+          type: 'kalshi_price_update',
+          gameId: msg.gameId,
+          awayTeam: {
+            kalshiBuyPrice: msg.awayTeam.kalshiBuyPrice,
+            kalshiSellPrice: msg.awayTeam.kalshiSellPrice,
+          },
+          homeTeam: {
+            kalshiBuyPrice: msg.homeTeam.kalshiBuyPrice,
+            kalshiSellPrice: msg.homeTeam.kalshiSellPrice,
+          },
+          timestamp: new Date().toISOString(),
+          ...(msg.updatedSides?.length && { updatedSides: msg.updatedSides }),
+        };
+        this.broadcast(payload);
+        const sent = Array.from(this.clients).filter((c) => c.readyState === 1).length;
+        if (sent > 0) {
+          logger.info({
+            message: '[Kalshi broadcast] Games WebSocket sent kalshi_price_update to client(s)',
+            gameId: msg.gameId,
+            sentToCount: sent,
+          });
+        }
+      } catch (err) {
+        logger.warn({
+          message: 'Failed to broadcast Kalshi price update',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    });
+    
+    logger.info({ message: 'Kalshi price broadcast subscription initialized' });
   }
 
   /**
@@ -452,6 +512,11 @@ export class GamesWebSocketService {
     if (this.redisUnsubscribe) {
       this.redisUnsubscribe();
       this.redisUnsubscribe = null;
+    }
+    
+    if (this.kalshiRedisUnsubscribe) {
+      this.kalshiRedisUnsubscribe();
+      this.kalshiRedisUnsubscribe = null;
     }
 
     // Notify clients of shutdown

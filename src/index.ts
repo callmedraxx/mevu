@@ -31,7 +31,7 @@ import { alchemyWebhookService } from './services/alchemy/alchemy-webhook.servic
 import { embeddedWalletBalanceService } from './services/privy/embedded-wallet-balance.service';
 import { autoTransferService } from './services/privy/auto-transfer.service';
 import { depositProgressService } from './services/privy/deposit-progress.service';
-import { kalshiService } from './services/kalshi';
+import { kalshiService, kalshiPriceUpdateService } from './services/kalshi';
 import { registerOnGamesRefreshed } from './services/polymarket/live-games.service';
 
 // Load environment variables
@@ -345,6 +345,30 @@ async function initializeClobServices() {
     logger.info({ message: 'Initializing CLOB price update service...' });
     await clobPriceUpdateService.initialize();
 
+    // Initialize Kalshi WebSocket price update service
+    // Uses leader election - only one worker will maintain the WebSocket connection
+    const kalshiWsEnabled = process.env.KALSHI_WS_ENABLED !== 'false';
+    if (kalshiWsEnabled) {
+      logger.info({ message: 'Initializing Kalshi WebSocket price update service...' });
+      try {
+        await kalshiPriceUpdateService.initialize();
+        const status = kalshiPriceUpdateService.getStatus();
+        logger.info({
+          message: 'Kalshi WebSocket price update service initialized',
+          isLeader: status.isLeader,
+          tickerCount: status.mapperStats?.tickerCount || 0,
+        });
+      } catch (kalshiError) {
+        // Non-fatal: Kalshi WS is optional, REST polling will still work
+        logger.warn({
+          message: 'Kalshi WebSocket service failed to initialize (falling back to REST)',
+          error: kalshiError instanceof Error ? kalshiError.message : String(kalshiError),
+        });
+      }
+    } else {
+      logger.info({ message: 'Kalshi WebSocket disabled via KALSHI_WS_ENABLED=false' });
+    }
+
     logger.info({ message: 'CLOB services initialized successfully' });
   } catch (error) {
     logger.error({
@@ -447,11 +471,12 @@ function startClobBackgroundWorker() {
   initializeClobServices();
 
   // Graceful shutdown for CLOB worker
-  const shutdownClob = () => {
+  const shutdownClob = async () => {
     logger.info({ message: 'CLOB worker shutting down gracefully' });
     clobPriceUpdateService.shutdown();
-    shutdownRedisGamesBroadcast().catch(() => {});
-    shutdownRedisGamesCache().catch(() => {});
+    await kalshiPriceUpdateService.shutdown().catch(() => {});
+    await shutdownRedisGamesBroadcast().catch(() => {});
+    await shutdownRedisGamesCache().catch(() => {});
     process.exit(0);
   };
 

@@ -96,6 +96,8 @@ async function flushPendingUpserts(): Promise<void> {
         sortTs
       );
     });
+    // ALWAYS preserve existing Kalshi prices by merging them into new data
+    // The COALESCE ensures we keep existing Kalshi prices if new data doesn't have them
     const query = `
       INSERT INTO frontend_games (id, sport, league, slug, live, ended, updated_at, frontend_data, sort_timestamp)
       VALUES ${valuesClauses.join(', ')}
@@ -106,7 +108,35 @@ async function flushPendingUpserts(): Promise<void> {
         live = EXCLUDED.live,
         ended = EXCLUDED.ended,
         updated_at = CURRENT_TIMESTAMP,
-        frontend_data = EXCLUDED.frontend_data,
+        frontend_data = jsonb_set(
+          jsonb_set(
+            EXCLUDED.frontend_data,
+            '{awayTeam}',
+            COALESCE(EXCLUDED.frontend_data->'awayTeam', '{}'::jsonb) || 
+              jsonb_build_object(
+                'kalshiBuyPrice', COALESCE(
+                  EXCLUDED.frontend_data->'awayTeam'->'kalshiBuyPrice',
+                  frontend_games.frontend_data->'awayTeam'->'kalshiBuyPrice'
+                ),
+                'kalshiSellPrice', COALESCE(
+                  EXCLUDED.frontend_data->'awayTeam'->'kalshiSellPrice',
+                  frontend_games.frontend_data->'awayTeam'->'kalshiSellPrice'
+                )
+              )
+          ),
+          '{homeTeam}',
+          COALESCE(EXCLUDED.frontend_data->'homeTeam', '{}'::jsonb) || 
+            jsonb_build_object(
+              'kalshiBuyPrice', COALESCE(
+                EXCLUDED.frontend_data->'homeTeam'->'kalshiBuyPrice',
+                frontend_games.frontend_data->'homeTeam'->'kalshiBuyPrice'
+              ),
+              'kalshiSellPrice', COALESCE(
+                EXCLUDED.frontend_data->'homeTeam'->'kalshiSellPrice',
+                frontend_games.frontend_data->'homeTeam'->'kalshiSellPrice'
+              )
+            )
+        ),
         sort_timestamp = EXCLUDED.sort_timestamp
     `;
     chunks.push({ query, values });
@@ -216,6 +246,9 @@ export async function bulkUpsertFrontendGamesWithClient(
         sortTs
       );
     });
+    // Merge frontend_data to preserve existing Kalshi prices that aren't in the new data
+    // EXCLUDED.frontend_data is the new data, frontend_games.frontend_data is existing
+    // We use jsonb || to merge, with special handling for nested team objects
     const query = `
       INSERT INTO frontend_games (id, sport, league, slug, live, ended, updated_at, frontend_data, sort_timestamp)
       VALUES ${valuesClauses.join(', ')}
@@ -226,7 +259,29 @@ export async function bulkUpsertFrontendGamesWithClient(
         live = EXCLUDED.live,
         ended = EXCLUDED.ended,
         updated_at = CURRENT_TIMESTAMP,
-        frontend_data = EXCLUDED.frontend_data,
+        frontend_data = CASE
+          -- If existing has Kalshi prices but new data doesn't, preserve them
+          WHEN (frontend_games.frontend_data->'awayTeam'->>'kalshiBuyPrice') IS NOT NULL 
+               AND (EXCLUDED.frontend_data->'awayTeam'->>'kalshiBuyPrice') IS NULL
+          THEN jsonb_set(
+            jsonb_set(
+              EXCLUDED.frontend_data,
+              '{awayTeam}',
+              (EXCLUDED.frontend_data->'awayTeam') || 
+                jsonb_build_object(
+                  'kalshiBuyPrice', frontend_games.frontend_data->'awayTeam'->'kalshiBuyPrice',
+                  'kalshiSellPrice', frontend_games.frontend_data->'awayTeam'->'kalshiSellPrice'
+                )
+            ),
+            '{homeTeam}',
+            (EXCLUDED.frontend_data->'homeTeam') || 
+              jsonb_build_object(
+                'kalshiBuyPrice', frontend_games.frontend_data->'homeTeam'->'kalshiBuyPrice',
+                'kalshiSellPrice', frontend_games.frontend_data->'homeTeam'->'kalshiSellPrice'
+              )
+          )
+          ELSE EXCLUDED.frontend_data
+        END,
         sort_timestamp = EXCLUDED.sort_timestamp
     `;
     await client.query(query, values);
@@ -242,6 +297,7 @@ export async function upsertFrontendGameWithClient(
   frontendGame: FrontendGame
 ): Promise<void> {
   const sortTs = computeSortTimestamp(frontendGame) ?? new Date('2099-12-31T23:59:59.999Z');
+  // ALWAYS preserve existing Kalshi prices by merging them into new data
   await client.query(
     `INSERT INTO frontend_games (id, sport, league, slug, live, ended, updated_at, frontend_data, sort_timestamp)
      VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, $7, $8)
@@ -252,7 +308,35 @@ export async function upsertFrontendGameWithClient(
        live           = EXCLUDED.live,
        ended          = EXCLUDED.ended,
        updated_at     = CURRENT_TIMESTAMP,
-       frontend_data  = EXCLUDED.frontend_data,
+       frontend_data  = jsonb_set(
+         jsonb_set(
+           EXCLUDED.frontend_data,
+           '{awayTeam}',
+           COALESCE(EXCLUDED.frontend_data->'awayTeam', '{}'::jsonb) || 
+             jsonb_build_object(
+               'kalshiBuyPrice', COALESCE(
+                 EXCLUDED.frontend_data->'awayTeam'->'kalshiBuyPrice',
+                 frontend_games.frontend_data->'awayTeam'->'kalshiBuyPrice'
+               ),
+               'kalshiSellPrice', COALESCE(
+                 EXCLUDED.frontend_data->'awayTeam'->'kalshiSellPrice',
+                 frontend_games.frontend_data->'awayTeam'->'kalshiSellPrice'
+               )
+             )
+         ),
+         '{homeTeam}',
+         COALESCE(EXCLUDED.frontend_data->'homeTeam', '{}'::jsonb) || 
+           jsonb_build_object(
+             'kalshiBuyPrice', COALESCE(
+               EXCLUDED.frontend_data->'homeTeam'->'kalshiBuyPrice',
+               frontend_games.frontend_data->'homeTeam'->'kalshiBuyPrice'
+             ),
+             'kalshiSellPrice', COALESCE(
+               EXCLUDED.frontend_data->'homeTeam'->'kalshiSellPrice',
+               frontend_games.frontend_data->'homeTeam'->'kalshiSellPrice'
+             )
+           )
+       ),
        sort_timestamp = EXCLUDED.sort_timestamp`,
     [
       frontendGame.id,
@@ -302,6 +386,7 @@ export async function upsertFrontendGameForLiveGame(liveGame: LiveGame): Promise
 /** 8 params/row × 500 = 4k params, well under 65k limit */
 const BULK_UPSERT_CHUNK_SIZE = 500;
 
+// ALWAYS preserve existing Kalshi prices by merging them into new data using COALESCE
 const FRONTEND_UPSERT_QUERY = `
   INSERT INTO frontend_games (id, sport, league, slug, live, ended, updated_at, frontend_data, sort_timestamp)
   VALUES %PLACEHOLDERS%
@@ -312,7 +397,23 @@ const FRONTEND_UPSERT_QUERY = `
     live = EXCLUDED.live,
     ended = EXCLUDED.ended,
     updated_at = CURRENT_TIMESTAMP,
-    frontend_data = EXCLUDED.frontend_data,
+    frontend_data = jsonb_set(
+      jsonb_set(
+        EXCLUDED.frontend_data,
+        '{awayTeam}',
+        COALESCE(EXCLUDED.frontend_data->'awayTeam', '{}'::jsonb) || 
+          jsonb_build_object(
+            'kalshiBuyPrice', COALESCE(EXCLUDED.frontend_data->'awayTeam'->'kalshiBuyPrice', frontend_games.frontend_data->'awayTeam'->'kalshiBuyPrice'),
+            'kalshiSellPrice', COALESCE(EXCLUDED.frontend_data->'awayTeam'->'kalshiSellPrice', frontend_games.frontend_data->'awayTeam'->'kalshiSellPrice')
+          )
+      ),
+      '{homeTeam}',
+      COALESCE(EXCLUDED.frontend_data->'homeTeam', '{}'::jsonb) || 
+        jsonb_build_object(
+          'kalshiBuyPrice', COALESCE(EXCLUDED.frontend_data->'homeTeam'->'kalshiBuyPrice', frontend_games.frontend_data->'homeTeam'->'kalshiBuyPrice'),
+          'kalshiSellPrice', COALESCE(EXCLUDED.frontend_data->'homeTeam'->'kalshiSellPrice', frontend_games.frontend_data->'homeTeam'->'kalshiSellPrice')
+        )
+    ),
     sort_timestamp = EXCLUDED.sort_timestamp
 `;
 

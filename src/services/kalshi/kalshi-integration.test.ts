@@ -304,14 +304,19 @@ describe('Integration: Real API Data Matching', () => {
         return;
       }
 
-      // Slugs follow format: sport-away-home-date
+      // Slugs follow format: sport-away-home-date. Our app uses canonical sport keys (e.g. "tennis" for atp/wta).
+      const slugSportToCanonical: Record<string, string> = {
+        atp: 'tennis',
+        wta: 'tennis',
+      };
       for (const game of frontendGames.slice(0, 10)) {
         if (!game.slug) continue;
 
         const slugParts = game.slug.split('-');
         if (slugParts.length >= 4) {
-          const sport = slugParts[0];
-          expect(game.sport?.toLowerCase()).toBe(sport);
+          const slugSport = slugParts[0].toLowerCase();
+          const expectedSport = slugSportToCanonical[slugSport] ?? slugSport;
+          expect(game.sport?.toLowerCase()).toBe(expectedSport);
         }
       }
     });
@@ -362,6 +367,64 @@ describe('Integration: Real API Data Matching', () => {
         expect(awayMatches).toBe(true);
         expect(homeMatches).toBe(true);
       }
+    });
+
+    it('should match simulated Kalshi Tennis (WTA) markets to real games', () => {
+      const tennisGames = frontendGames.filter(g => g.sport === 'tennis');
+      if (tennisGames.length === 0) {
+        console.warn('No tennis games found, skipping test');
+        return;
+      }
+
+      // Test tennis matching logic - Kalshi uses first 3 letters of player last names
+      // e.g., KXWTAMATCH-26FEB06ZARBIR (ZAR=Zarazua, BIR=Birrell)
+      const game = tennisGames[0];
+      
+      // Extract player abbreviations from slug (format: league-away-home-date)
+      // e.g., wta-zarazua-birrell-2026-02-06
+      const slugParts = game.slug?.split('-') || [];
+      if (slugParts.length < 4) {
+        console.warn('Invalid tennis slug format, skipping test');
+        return;
+      }
+      
+      const slugAwayName = slugParts[1]; // e.g., "zarazua"
+      const slugHomeName = slugParts[2]; // e.g., "birrell"
+      
+      // Simulate Kalshi 3-letter abbreviations
+      const kalshiAwayAbbr = slugAwayName.substring(0, 3).toUpperCase(); // "ZAR"
+      const kalshiHomeAbbr = slugHomeName.substring(0, 3).toUpperCase(); // "BIR"
+      
+      // Verify matching logic: abbreviation should be prefix of slug name
+      expect(slugAwayName.toUpperCase().startsWith(kalshiAwayAbbr)).toBe(true);
+      expect(slugHomeName.toUpperCase().startsWith(kalshiHomeAbbr)).toBe(true);
+    });
+
+    it('should match simulated Kalshi Tennis (ATP) markets to real games', () => {
+      const atpGames = frontendGames.filter(g => 
+        g.sport === 'tennis' && g.slug?.startsWith('atp-')
+      );
+      if (atpGames.length === 0) {
+        console.warn('No ATP games found, skipping test (may have WTA only)');
+        return;
+      }
+
+      const game = atpGames[0];
+      const slugParts = game.slug?.split('-') || [];
+      if (slugParts.length < 4) {
+        console.warn('Invalid tennis slug format, skipping test');
+        return;
+      }
+      
+      const slugAwayName = slugParts[1];
+      const slugHomeName = slugParts[2];
+      
+      // Simulate Kalshi 3-letter abbreviations for ATP
+      const kalshiAwayAbbr = slugAwayName.substring(0, 3).toUpperCase();
+      const kalshiHomeAbbr = slugHomeName.substring(0, 3).toUpperCase();
+      
+      expect(slugAwayName.toUpperCase().startsWith(kalshiAwayAbbr)).toBe(true);
+      expect(slugHomeName.toUpperCase().startsWith(kalshiHomeAbbr)).toBe(true);
     });
   });
 

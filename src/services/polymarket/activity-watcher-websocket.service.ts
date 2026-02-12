@@ -14,16 +14,29 @@ import {
   subscribeToActivityBroadcast,
   publishActivityBroadcast,
   isRedisClusterBroadcastReady,
+  subscribeToKalshiPriceBroadcast,
+  subscribeToKalshiPriceBroadcastActivity,
+  KalshiPriceBroadcastMessage,
+  subscribeToKalshiUserBroadcast,
 } from '../redis-cluster-broadcast.service';
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'initial' | 'game_update' | 'price_update' | 'heartbeat' | 'error' | 'subscribed' | 'unsubscribed';
+  type: 'initial' | 'game_update' | 'price_update' | 'kalshi_price_update' | 'kalshi_trade_update' | 'kalshi_position_update' | 'heartbeat' | 'error' | 'subscribed' | 'unsubscribed';
   game?: ActivityWatcherGame;
   slug?: string;
   timestamp?: string;
   message?: string;
   clientCount?: number;
+  // Kalshi price update fields
+  gameId?: string;
+  awayTeam?: { kalshiBuyPrice?: number; kalshiSellPrice?: number };
+  homeTeam?: { kalshiBuyPrice?: number; kalshiSellPrice?: number };
+  ticker?: string;
+  // Kalshi trade/position update fields
+  privyUserId?: string;
+  trade?: unknown;
+  position?: unknown;
 }
 
 interface ClientSubscription {
@@ -42,6 +55,12 @@ export class ActivityWatcherWebSocketService {
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private isInitialized: boolean = false;
   private activityRedisUnsubscribe: (() => void) | null = null;
+  private kalshiRedisUnsubscribe: (() => void) | null = null;
+  private kalshiActivityRedisUnsubscribe: (() => void) | null = null;
+  private kalshiUserRedisUnsubscribe: (() => void) | null = null;
+
+  // Map game ID -> slug for Kalshi broadcasts (populated from subscribed games)
+  private gameIdToSlug: Map<string, string> = new Map();
 
   private wsPath: string = '/ws/activity';
   
@@ -84,6 +103,8 @@ export class ActivityWatcherWebSocketService {
     this.setupEventHandlers();
     this.setupBroadcastCallbacks();
     this.setupActivityRedisBroadcast();
+    this.setupKalshiRedisBroadcast();
+    this.setupKalshiUserBroadcast();
     this.startHeartbeat();
     this.isInitialized = true;
 
@@ -251,6 +272,11 @@ export class ActivityWatcherWebSocketService {
         return;
       }
 
+      // Populate gameIdToSlug map for Kalshi price broadcasts
+      if (game.id && game.slug) {
+        this.gameIdToSlug.set(game.id, game.slug);
+      }
+
       const transformed = await transformToActivityWatcherGame(game);
       
       this.sendToClient(ws, {
@@ -306,6 +332,84 @@ export class ActivityWatcherWebSocketService {
                 this.unsubscribeClient(client);
               }
             }
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * Subscribe to Redis for Kalshi price broadcasts
+   * Broadcasts kalshi_price_update events to clients subscribed to the game
+   */
+  private setupKalshiRedisBroadcast(): void {
+    if (!initRedisClusterBroadcast()) return;
+
+    const onKalshiMessage = (msg: KalshiPriceBroadcastMessage) => {
+      const slug = this.gameIdToSlug.get(String(msg.gameId))?.toLowerCase();
+      const slugsToTry = [slug, String(msg.gameId).toLowerCase()].filter(Boolean) as string[];
+
+      const message: WSMessage = {
+        type: 'kalshi_price_update',
+        gameId: msg.gameId,
+        slug: slug || msg.slug,
+        awayTeam: msg.awayTeam,
+        homeTeam: msg.homeTeam,
+        ticker: msg.ticker,
+        timestamp: new Date(msg.timestamp).toISOString(),
+      };
+
+      const data = JSON.stringify(message);
+      let sentCount = 0;
+      for (const trySlug of slugsToTry) {
+        const clients = this.slugClients.get(trySlug);
+        if (clients) {
+          for (const client of clients) {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(data, { compress: false });
+                sentCount++;
+              } catch {
+                this.unsubscribeClient(client);
+              }
+            }
+          }
+        }
+      }
+      logger.info({
+        message: '[Kalshi broadcast] Activity watcher received kalshi_price_update',
+        gameId: msg.gameId,
+        ticker: msg.ticker,
+        slugResolved: slug ?? null,
+        clientsSentTo: sentCount,
+      });
+    };
+
+    this.kalshiRedisUnsubscribe = subscribeToKalshiPriceBroadcast(onKalshiMessage);
+    this.kalshiActivityRedisUnsubscribe = subscribeToKalshiPriceBroadcastActivity(onKalshiMessage);
+  }
+
+  /**
+   * Subscribe to Kalshi trade/position updates and broadcast to connected clients.
+   * Clients receive kalshi_trade_update or kalshi_position_update messages with privyUserId.
+   */
+  private setupKalshiUserBroadcast(): void {
+    if (!initRedisClusterBroadcast()) return;
+
+    this.kalshiUserRedisUnsubscribe = subscribeToKalshiUserBroadcast((msg) => {
+      const message: WSMessage = {
+        type: msg.type === 'kalshi_trade_update' ? 'kalshi_trade_update' : 'kalshi_position_update',
+        privyUserId: msg.privyUserId,
+        ...(msg.type === 'kalshi_trade_update' ? { trade: msg.trade } : { position: msg.position }),
+        timestamp: new Date().toISOString(),
+      };
+      const data = JSON.stringify(message);
+      for (const [ws] of this.clients) {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(data, { compress: false });
+          } catch {
+            this.unsubscribeClient(ws);
           }
         }
       }
@@ -543,6 +647,15 @@ export class ActivityWatcherWebSocketService {
       this.activityRedisUnsubscribe = null;
     }
 
+    if (this.kalshiRedisUnsubscribe) {
+      this.kalshiRedisUnsubscribe();
+      this.kalshiRedisUnsubscribe = null;
+    }
+    if (this.kalshiActivityRedisUnsubscribe) {
+      this.kalshiActivityRedisUnsubscribe();
+      this.kalshiActivityRedisUnsubscribe = null;
+    }
+
     // Notify clients of shutdown
     const shutdownMessage = JSON.stringify({
       type: 'error',
@@ -561,6 +674,7 @@ export class ActivityWatcherWebSocketService {
     
     this.clients.clear();
     this.slugClients.clear();
+    this.gameIdToSlug.clear();
 
     // Close the WebSocket server
     if (this.wss) {

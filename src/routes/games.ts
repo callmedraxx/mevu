@@ -22,6 +22,7 @@ import { teamsService } from '../services/polymarket/teams.service';
 import { logger } from '../config/logger';
 import { getFrontendGamesFromDatabase, getFrontendGameByIdFromDatabase, getFrontendGameBySlugFromDatabase } from '../services/polymarket/frontend-games.service';
 import { initRedisGamesBroadcast, subscribeToGamesBroadcast, isRedisGamesBroadcastReady } from '../services/redis-games-broadcast.service';
+import { subscribeToKalshiPriceBroadcast } from '../services/redis-cluster-broadcast.service';
 
 const router = Router();
 
@@ -64,6 +65,30 @@ subscribeToGamesBroadcast((msg) => {
     }
   } catch {
     // ignore parse errors
+  }
+});
+
+// Forward Kalshi price updates to SSE clients (same as WebSocket; include updatedSides for partial merge)
+subscribeToKalshiPriceBroadcast((msg) => {
+  try {
+    const payload: Record<string, unknown> = {
+      type: 'kalshi_price_update',
+      gameId: msg.gameId,
+      awayTeam: msg.awayTeam,
+      homeTeam: msg.homeTeam,
+      timestamp: msg.timestamp,
+    };
+    if (msg.updatedSides?.length) payload.updatedSides = msg.updatedSides;
+    const data = JSON.stringify(payload);
+    for (const client of sseClients) {
+      try {
+        client.write(`data: ${data}\n\n`);
+      } catch {
+        sseClients.delete(client);
+      }
+    }
+  } catch {
+    // ignore
   }
 });
 

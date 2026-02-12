@@ -109,10 +109,11 @@ const TEAM_ALIASES: Record<string, string> = {
   'washington': 'washington wizards',
   'orlando': 'orlando magic',
 
-  // NFL Teams
+  // NFL Teams (full phrase so "Buffalo Bills" normalizes correctly, not to buffalo sabres)
   'chiefs': 'kansas city chiefs',
   'kc': 'kansas city chiefs',
   'eagles': 'philadelphia eagles',
+  'buffalo bills': 'buffalo bills',
   'bills': 'buffalo bills',
   'buf': 'buffalo bills',
   '49ers': 'san francisco 49ers',
@@ -166,7 +167,8 @@ const TEAM_ALIASES: Record<string, string> = {
   'rams': 'los angeles rams',
   'lar': 'los angeles rams',
 
-  // NHL Teams
+  // NHL Teams (full phrase so "Boston Bruins" doesn't match 'boston' -> boston celtics)
+  'boston bruins': 'boston bruins',
   'bruins': 'boston bruins',
   'sabres': 'buffalo sabres',
   'buffalo': 'buffalo sabres',

@@ -70,6 +70,13 @@ const SPORTS_GAMES_CONFIG: SportsGamesConfig = {
     seriesId: '10210', // College Football (fallback)
     label: 'College Football',
   },
+  mwoh: {
+    // Men's Winter Olympics Hockey (2026 Winter Olympics)
+    // Slug format: mwoh-{team1}-{team2}-{date} e.g. mwoh-swi-fra-2026-02-12
+    // Outcomes are full country names e.g. ["Switzerland", "France"]
+    seriesId: '11136',
+    label: "Men's Winter Olympics Hockey",
+  },
 };
 
 // Runtime overrides (populated from Gamma /series at startup)

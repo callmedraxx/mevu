@@ -368,8 +368,10 @@ export class ClobPriceUpdateService {
         probability = bestAsk * 100;
       }
       
-      const buyPrice = Math.round(bestAsk * 100);  // best_ask * 100 for buyPrice
-      const sellPrice = Math.round(bestBid * 100); // best_bid * 100 for sellPrice
+      // Keep decimal precision for prices (e.g., 0.995 → 99.5, not rounded to 100)
+      // This gives users more accurate price information
+      const buyPrice = Math.round(bestAsk * 1000) / 10;  // best_ask * 100 with 1 decimal place
+      const sellPrice = Math.round(bestBid * 1000) / 10; // best_bid * 100 with 1 decimal place
 
       // logger.info({
       //   message: 'Processing price change',

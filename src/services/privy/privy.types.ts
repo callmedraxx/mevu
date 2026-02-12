@@ -60,6 +60,8 @@ export interface EIP712Type {
   type: string;
 }
 
+export type TradingRegion = 'us' | 'international';
+
 export interface UserProfile {
   id: string;
   privyUserId: string;
@@ -72,12 +74,18 @@ export interface UserProfile {
   onboardingCompleted: boolean;
   createdAt: Date;
   updatedAt: Date;
+  /** Kalshi/Solana fields (migration 039) */
+  tradingRegion?: TradingRegion | null;
+  solanaWalletAddress?: string | null;
+  kalshiOnboardingCompleted?: boolean;
+  kalshiUsdcBalance?: string;
 }
 
 export interface CreateUserRequest {
   privyUserId: string;
   username: string;
   embeddedWalletAddress: string;
+  tradingRegion?: TradingRegion | null;
 }
 
 export interface CreateUserResponse {

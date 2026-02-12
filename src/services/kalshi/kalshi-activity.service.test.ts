@@ -296,17 +296,40 @@ describe('Kalshi Activity Service - Spread Market Building', () => {
     expect(markets[2].id).toBe('spread-9.5');
   });
 
-  it('should handle markets with only one team for a point value', () => {
+  it('should derive complementary outcome when only one team has a spread row (away only)', () => {
     const spreadRows = [
       createSpreadRow('Charlotte', 3.5, 34, 31),
-      // Missing Houston 3.5
+      // Missing Houston 3.5 - derive from same row NO side
     ];
 
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA');
+    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA', 'Houston', 'Charlotte');
 
     expect(markets).toHaveLength(1);
-    expect(markets[0].outcomes).toHaveLength(1);
+    expect(markets[0].outcomes).toHaveLength(2);
     expect(markets[0].outcomes[0].label).toBe('Charlotte +3.5');
+    expect(markets[0].outcomes[0].buyPrice).toBe(34);
+    expect(markets[0].outcomes[0].sellPrice).toBe(31);
+    expect(markets[0].outcomes[1].label).toBe('Houston -3.5');
+    expect(markets[0].outcomes[1].buyPrice).toBe(100 - 31);
+    expect(markets[0].outcomes[1].sellPrice).toBe(100 - 34);
+  });
+
+  it('should derive complementary outcome when only one team has a spread row (home only)', () => {
+    const spreadRows = [
+      createSpreadRow('Houston', 2.5, 86, 80),
+      // Missing Charlotte 2.5 - derive from same row NO side
+    ];
+
+    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA', 'Houston', 'Charlotte');
+
+    expect(markets).toHaveLength(1);
+    expect(markets[0].outcomes).toHaveLength(2);
+    expect(markets[0].outcomes[0].label).toBe('Charlotte +2.5');
+    expect(markets[0].outcomes[0].buyPrice).toBe(100 - 80);
+    expect(markets[0].outcomes[0].sellPrice).toBe(100 - 86);
+    expect(markets[0].outcomes[1].label).toBe('Houston -2.5');
+    expect(markets[0].outcomes[1].buyPrice).toBe(86);
+    expect(markets[0].outcomes[1].sellPrice).toBe(80);
   });
 
   it('should calculate total volume for paired markets', () => {
@@ -601,5 +624,194 @@ describe('Kalshi Activity Service - Regression: Real Data Format', () => {
     const totalLabels = total217.outcomes.map((o: any) => o.label);
     expect(totalLabels).toContain('Over 217.5');
     expect(totalLabels).toContain('Under 217.5');
+  });
+
+  it('should show both spread outcomes when Kalshi only has one row per spread (single-row spreads)', () => {
+    const mockFrontendGame = {
+      id: '193444',
+      slug: 'nba-was-det-2026-02-05',
+      sport: 'nba',
+      league: 'nba',
+      homeTeam: { abbr: 'det', name: 'Pistons', record: '37-12', probability: 88, buyPrice: 88, sellPrice: 87 },
+      awayTeam: { abbr: 'was', name: 'Wizards', record: '13-36', probability: 12, buyPrice: 13, sellPrice: 12 },
+    };
+
+    // Simulate Kalshi API: only one market per spread (e.g. "Washington +1.5" OR "Detroit -2.5" per line)
+    const kalshiRows = [
+      { ticker: 'KXNBAGAME-26FEB05WASDET-DET', title: 'Washington at Detroit Winner?', yes_bid: 87, yes_ask: 88, no_bid: 12, no_ask: 14, volume: 0 },
+      { ticker: 'KXNBAGAME-26FEB05WASDET-WAS', title: 'Washington at Detroit Winner?', yes_bid: 11, yes_ask: 12, no_bid: 88, no_ask: 87, volume: 0 },
+      { ticker: 'KXNBASPREAD-26FEB05WASDET-WAS1', title: 'Washington wins by over 1.5 Points?', yes_bid: 11, yes_ask: 12, no_bid: 88, no_ask: 89, volume: 0 },
+      { ticker: 'KXNBASPREAD-26FEB05WASDET-DET2', title: 'Detroit wins by over 2.5 Points?', yes_bid: 80, yes_ask: 86, no_bid: 14, no_ask: 20, volume: 0 },
+      { ticker: 'KXNBATOTAL-26FEB05WASDET-209', title: 'Over 209.5 points?', yes_bid: 80, yes_ask: 87, no_bid: 13, no_ask: 20, volume: 0 },
+    ];
+
+    const result = buildActivityGame(mockFrontendGame, kalshiRows);
+
+    const spreadMarkets = result.markets.filter((m: any) => m.id?.startsWith('spread-'));
+    expect(spreadMarkets.length).toBeGreaterThanOrEqual(2);
+
+    for (const market of spreadMarkets) {
+      expect(market.outcomes).toHaveLength(2);
+      const [a, b] = market.outcomes;
+      expect(a.label).toBeDefined();
+      expect(b.label).toBeDefined();
+      expect(a.buyPrice).toBeGreaterThanOrEqual(0);
+      expect(a.sellPrice).toBeGreaterThanOrEqual(0);
+      expect(b.buyPrice).toBeGreaterThanOrEqual(0);
+      expect(b.sellPrice).toBeGreaterThanOrEqual(0);
+    }
+
+    const spread15 = result.markets.find((m: any) => m.id === 'spread-1.5');
+    expect(spread15).toBeDefined();
+    expect(spread15.outcomes).toHaveLength(2);
+    const labels15 = spread15.outcomes.map((o: any) => o.label);
+    expect(labels15).toContain('Washington +1.5');
+    expect(labels15).toContain('Pistons -1.5');
+    const was15 = spread15.outcomes.find((o: any) => o.label.includes('Washington'));
+    expect(was15?.buyPrice).toBe(12);
+    expect(was15?.sellPrice).toBe(11);
+
+    const spread25 = result.markets.find((m: any) => m.id === 'spread-2.5');
+    expect(spread25).toBeDefined();
+    expect(spread25.outcomes).toHaveLength(2);
+    const labels25 = spread25.outcomes.map((o: any) => o.label);
+    expect(labels25).toContain('Wizards +2.5');
+    expect(labels25).toContain('Detroit -2.5');
+    const det25 = spread25.outcomes.find((o: any) => o.label.includes('Detroit') && o.label.includes('-'));
+    expect(det25?.buyPrice).toBe(86);
+    expect(det25?.sellPrice).toBe(80);
+  });
+
+  it('should build moneyline market for tennis (single-market sport)', () => {
+    const mockFrontendGame = {
+      id: '198793',
+      slug: 'atp-mannari-gea-2026-02-06',
+      sport: 'tennis',
+      league: 'tennis',
+      homeTeam: { abbr: 'GEA', name: 'Arthur Gea', record: '0-0', probability: 63, buyPrice: 63, sellPrice: 62 },
+      awayTeam: { abbr: 'MANNARI', name: 'Adrian Mannarino', record: '0-0', probability: 37, buyPrice: 38, sellPrice: 37 },
+    };
+
+    // Tennis has a single market per match: YES = away (Mannarino) wins, NO = home (Gea) wins
+    const kalshiRows = [
+      { 
+        ticker: 'KXATPMATCH-26FEB06MANGEA', 
+        title: 'Mannarino vs Gea',
+        yes_bid: 37,   // Away (Mannarino) sell price
+        yes_ask: 38,   // Away (Mannarino) buy price
+        no_bid: 62,    // Home (Gea) sell price  
+        no_ask: 63,    // Home (Gea) buy price
+        volume: 5000 
+      },
+    ];
+
+    const result = buildActivityGame(mockFrontendGame, kalshiRows);
+
+    // Verify structure
+    expect(result.platform).toBe('kalshi');
+    expect(result.kalshiTicker).toBe('KXATPMATCH-26FEB06MANGEA');
+    expect(result.markets.length).toBe(1);
+
+    // Verify moneyline market
+    const moneyline = result.markets.find((m: any) => m.id === 'moneyline');
+    expect(moneyline).toBeDefined();
+    expect(moneyline.title).toBe('Winner');
+    expect(moneyline.outcomes).toHaveLength(2);
+
+    // Verify away team (Mannarino) outcome - YES prices
+    const awayOutcome = moneyline.outcomes.find((o: any) => o.label === 'MANNARI');
+    expect(awayOutcome).toBeDefined();
+    expect(awayOutcome.buyPrice).toBe(38);
+    expect(awayOutcome.sellPrice).toBe(37);
+
+    // Verify home team (Gea) outcome - NO prices
+    const homeOutcome = moneyline.outcomes.find((o: any) => o.label === 'GEA');
+    expect(homeOutcome).toBeDefined();
+    expect(homeOutcome.buyPrice).toBe(63);
+    expect(homeOutcome.sellPrice).toBe(62);
+
+    // Verify team prices are set correctly
+    expect(result.awayTeam.kalshiBuyPrice).toBe(38);
+    expect(result.awayTeam.kalshiSellPrice).toBe(37);
+    expect(result.homeTeam.kalshiBuyPrice).toBe(63);
+    expect(result.homeTeam.kalshiSellPrice).toBe(62);
+  });
+
+  it('should build moneyline market for WTA tennis', () => {
+    const mockFrontendGame = {
+      id: '199509',
+      slug: 'wta-zarazua-birrell-2026-02-06',
+      sport: 'tennis',
+      league: 'tennis',
+      homeTeam: { abbr: 'BIRRELL', name: 'Kimberly Birrell', record: '0-0', probability: 60, buyPrice: 60, sellPrice: 59 },
+      awayTeam: { abbr: 'ZARAZUA', name: 'Renata Zarazua', record: '0-0', probability: 40, buyPrice: 41, sellPrice: 40 },
+    };
+
+    const kalshiRows = [
+      { 
+        ticker: 'KXWTAMATCH-26FEB06ZARBIR', 
+        title: 'Zarazua vs Birrell',
+        yes_bid: 40,   // Away (Zarazua) sell
+        yes_ask: 41,   // Away (Zarazua) buy
+        no_bid: 59,    // Home (Birrell) sell
+        no_ask: 60,    // Home (Birrell) buy
+        volume: 8000 
+      },
+    ];
+
+    const result = buildActivityGame(mockFrontendGame, kalshiRows);
+
+    expect(result.markets.length).toBe(1);
+    const moneyline = result.markets[0];
+    expect(moneyline.id).toBe('moneyline');
+    expect(moneyline.outcomes).toHaveLength(2);
+
+    // Away = YES, Home = NO
+    expect(moneyline.outcomes[0].label).toBe('ZARAZUA');
+    expect(moneyline.outcomes[0].buyPrice).toBe(41);
+    expect(moneyline.outcomes[1].label).toBe('BIRRELL');
+    expect(moneyline.outcomes[1].buyPrice).toBe(60);
+  });
+
+  it('should build moneyline market for UFC (single-market sport)', () => {
+    const mockFrontendGame = {
+      id: '190700',
+      slug: 'ufc-mic1-mar14-2026-02-07',
+      sport: 'ufc',
+      league: 'ufc',
+      homeTeam: { abbr: 'MAR14', name: 'Marc-Andre Barriault', record: '17-10', probability: 20, buyPrice: 21, sellPrice: 80 },
+      awayTeam: { abbr: 'MIC1', name: 'Michal Oleksiejczuk', record: '21-9', probability: 80, buyPrice: 80, sellPrice: 21 },
+    };
+
+    const kalshiRows = [
+      { 
+        ticker: 'KXUFCFIGHT-26FEB07OLEBAR', 
+        title: 'Oleksiejczuk vs Barriault',
+        yes_bid: 79,   // Away wins sell
+        yes_ask: 81,   // Away wins buy
+        no_bid: 19,    // Home wins sell
+        no_ask: 21,    // Home wins buy
+        volume: 10000 
+      },
+    ];
+
+    const result = buildActivityGame(mockFrontendGame, kalshiRows);
+
+    expect(result.markets.length).toBe(1);
+    const moneyline = result.markets[0];
+    expect(moneyline.id).toBe('moneyline');
+    expect(moneyline.outcomes).toHaveLength(2);
+
+    // Away fighter outcome (YES)
+    const awayOutcome = moneyline.outcomes[0];
+    expect(awayOutcome.label).toBe('MIC1');
+    expect(awayOutcome.buyPrice).toBe(81);
+    expect(awayOutcome.sellPrice).toBe(79);
+
+    // Home fighter outcome (NO)
+    const homeOutcome = moneyline.outcomes[1];
+    expect(homeOutcome.label).toBe('MAR14');
+    expect(homeOutcome.buyPrice).toBe(21);
+    expect(homeOutcome.sellPrice).toBe(19);
   });
 });

@@ -18,6 +18,7 @@ import playByPlayRouter from './playbyplay';
 import whaleProfileRouter from './whale-profile';
 import referralRouter from './referral';
 import oceanRouter from './ocean';
+import kalshiTradingRouter from './kalshi-trading';
 
 const router = Router();
 
@@ -101,5 +102,6 @@ router.use('/referral', referralRouter);
 
 // Ocean routes (whale trades aggregation)
 router.use('/ocean', oceanRouter);
+router.use('/kalshi-trading', kalshiTradingRouter);
 
 export default router;

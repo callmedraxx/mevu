@@ -40,16 +40,16 @@ class KalshiMatcherService {
             lg.sport,
             lg.ended,
             lg.closed,
-            -- Extract away_abbr (2nd part of slug)
+            -- Extract away_abbr (2nd part of slug); allow alphanumeric for UFC (e.g. mic1, mar14)
             LOWER(SPLIT_PART(lg.slug, '-', 2)) as slug_away_abbr,
-            -- Extract home_abbr (3rd part of slug)
             LOWER(SPLIT_PART(lg.slug, '-', 3)) as slug_home_abbr,
-            -- Extract date from slug (last 3 parts: YYYY-MM-DD)
             (SPLIT_PART(lg.slug, '-', 4) || '-' ||
              SPLIT_PART(lg.slug, '-', 5) || '-' ||
-             SPLIT_PART(lg.slug, '-', 6))::date as slug_date
+             SPLIT_PART(lg.slug, '-', 6))::date as slug_date,
+            lg.away_team_normalized,
+            lg.home_team_normalized
           FROM live_games lg
-          WHERE lg.slug ~ '^[a-z]+-[a-z]+-[a-z]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          WHERE lg.slug ~ '^[a-z]+-[a-z0-9]+-[a-z0-9]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
         ),
         matches AS (
           SELECT DISTINCT ON (k.ticker)
@@ -57,17 +57,17 @@ class KalshiMatcherService {
             sp.id as live_game_id
           FROM kalshi_markets k
           JOIN slug_parsed sp ON (
-            -- Sport must match
             LOWER(k.sport) = LOWER(sp.sport)
-            -- Date must match
             AND k.game_date = sp.slug_date
-            -- Team abbreviations must match (from Kalshi abbr to slug abbr)
             AND LOWER(k.home_team_abbr) = sp.slug_home_abbr
             AND LOWER(k.away_team_abbr) = sp.slug_away_abbr
           )
           WHERE k.live_game_id IS NULL
             AND k.status = 'active'
-            AND UPPER(k.ticker) NOT LIKE 'KXSB-%'  -- Exclude Super Bowl (handled separately)
+            AND UPPER(k.ticker) NOT LIKE 'KXSB-%'
+            AND UPPER(k.ticker) NOT LIKE 'KXUFCFIGHT-%'
+            AND UPPER(k.ticker) NOT LIKE 'KXWTAMATCH-%'
+            AND UPPER(k.ticker) NOT LIKE 'KXATPMATCH-%'
             AND sp.ended = false
             AND (sp.closed IS NULL OR sp.closed = false)
           ORDER BY k.ticker
@@ -134,7 +134,142 @@ class KalshiMatcherService {
       `);
 
       const sbMatchCount = sbResult.rowCount || 0;
-      const totalMatchCount = regularMatchCount + sbMatchCount;
+
+      // Match UFC markets (KXUFCFIGHT): one market per fight; match by date + title tokens vs normalized team names
+      const ufcResult = await client.query(`
+        WITH slug_parsed_ufc AS (
+          SELECT
+            lg.id,
+            lg.slug,
+            lg.sport,
+            lg.ended,
+            lg.closed,
+            (SPLIT_PART(lg.slug, '-', 4) || '-' || SPLIT_PART(lg.slug, '-', 5) || '-' || SPLIT_PART(lg.slug, '-', 6))::date as slug_date,
+            LOWER(COALESCE(lg.away_team_normalized, '')) as away_norm,
+            LOWER(COALESCE(lg.home_team_normalized, '')) as home_norm
+          FROM live_games lg
+          WHERE lg.sport = 'ufc'
+            AND lg.slug ~ '^[a-z]+-[a-z0-9]+-[a-z0-9]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        ),
+        ufc_title_tokens AS (
+          SELECT
+            k.ticker,
+            k.title,
+            k.game_date,
+            LOWER(TRIM(SPLIT_PART(k.title, ' vs ', 1))) as token1,
+            LOWER(TRIM(SPLIT_PART(SPLIT_PART(k.title, ' vs ', 2), ' ', 1))) as token2
+          FROM kalshi_markets k
+          WHERE k.live_game_id IS NULL
+            AND k.status IN ('active', 'open', 'unopened')
+            AND UPPER(k.ticker) LIKE 'KXUFCFIGHT-%'
+            AND k.sport = 'ufc'
+            AND k.title LIKE '% vs %'
+        ),
+        ufc_matches AS (
+          SELECT DISTINCT ON (u.ticker)
+            u.ticker,
+            sp.id as live_game_id
+          FROM ufc_title_tokens u
+          JOIN slug_parsed_ufc sp ON (
+            sp.slug_date = u.game_date
+            AND sp.ended = false
+            AND (sp.closed IS NULL OR sp.closed = false)
+            AND (
+              (sp.away_norm LIKE '%' || u.token1 || '%' AND sp.home_norm LIKE '%' || u.token2 || '%')
+              OR (sp.away_norm LIKE '%' || u.token2 || '%' AND sp.home_norm LIKE '%' || u.token1 || '%')
+            )
+          )
+          ORDER BY u.ticker
+        )
+        UPDATE kalshi_markets k
+        SET live_game_id = m.live_game_id, updated_at = NOW()
+        FROM ufc_matches m
+        WHERE k.ticker = m.ticker
+        RETURNING k.ticker
+      `);
+
+      const ufcMatchCount = ufcResult.rowCount || 0;
+
+      // Match Tennis markets (KXWTAMATCH, KXATPMATCH): match by date + player name prefix
+      // Tennis tickers use first 3 letters of each player's last name (e.g., KXWTAMATCH-26FEB06ZARBIR = ZAR + BIR)
+      // Our slugs use abbreviated player names (e.g., wta-zarazua-birrell-2026-02-06)
+      // Try BOTH orderings (Kalshi game code may be away+home or home+away); then normalize away_team_abbr/home_team_abbr
+      // from our slug so price updates always use our canonical away/home and never swap.
+      const tennisResult = await client.query(`
+        WITH slug_parsed_tennis AS (
+          SELECT
+            lg.id,
+            lg.slug,
+            lg.sport,
+            lg.ended,
+            lg.closed,
+            LOWER(SPLIT_PART(lg.slug, '-', 2)) as slug_away_name,
+            LOWER(SPLIT_PART(lg.slug, '-', 3)) as slug_home_name,
+            UPPER(LEFT(SPLIT_PART(lg.slug, '-', 2), 3)) as slug_away_abbr,
+            UPPER(LEFT(SPLIT_PART(lg.slug, '-', 3), 3)) as slug_home_abbr,
+            (SPLIT_PART(lg.slug, '-', 4) || '-' ||
+             SPLIT_PART(lg.slug, '-', 5) || '-' ||
+             SPLIT_PART(lg.slug, '-', 6))::date as slug_date
+          FROM live_games lg
+          WHERE lg.sport = 'tennis'
+            AND lg.slug ~ '^[a-z]+-[a-z]+-[a-z]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        ),
+        tennis_matches AS (
+          SELECT DISTINCT ON (k.ticker)
+            k.ticker,
+            sp.id as live_game_id,
+            sp.slug_away_abbr,
+            sp.slug_home_abbr
+          FROM kalshi_markets k
+          JOIN slug_parsed_tennis sp ON (
+            k.game_date = sp.slug_date
+            AND (
+              (sp.slug_away_name LIKE LOWER(k.away_team_abbr) || '%' AND sp.slug_home_name LIKE LOWER(k.home_team_abbr) || '%')
+              OR (sp.slug_away_name LIKE LOWER(k.home_team_abbr) || '%' AND sp.slug_home_name LIKE LOWER(k.away_team_abbr) || '%')
+            )
+          )
+          WHERE k.live_game_id IS NULL
+            AND k.status IN ('active', 'open', 'unopened')
+            AND (UPPER(k.ticker) LIKE 'KXWTAMATCH-%' OR UPPER(k.ticker) LIKE 'KXATPMATCH-%')
+            AND k.sport = 'tennis'
+            AND sp.ended = false
+            AND (sp.closed IS NULL OR sp.closed = false)
+          ORDER BY k.ticker
+        )
+        UPDATE kalshi_markets k
+        SET live_game_id = m.live_game_id,
+            away_team_abbr = m.slug_away_abbr,
+            home_team_abbr = m.slug_home_abbr,
+            updated_at = NOW()
+        FROM tennis_matches m
+        WHERE k.ticker = m.ticker
+        RETURNING k.ticker
+      `);
+
+      const tennisMatchCount = tennisResult.rowCount || 0;
+
+      // Normalize away_team_abbr/home_team_abbr for already-matched tennis markets from slug (fixes any prior swap)
+      await client.query(`
+        WITH slug_parsed_tennis AS (
+          SELECT
+            lg.id,
+            UPPER(LEFT(SPLIT_PART(lg.slug, '-', 2), 3)) as slug_away_abbr,
+            UPPER(LEFT(SPLIT_PART(lg.slug, '-', 3), 3)) as slug_home_abbr
+          FROM live_games lg
+          WHERE lg.sport = 'tennis'
+            AND lg.slug ~ '^[a-z]+-[a-z]+-[a-z]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        )
+        UPDATE kalshi_markets k
+        SET away_team_abbr = sp.slug_away_abbr,
+            home_team_abbr = sp.slug_home_abbr,
+            updated_at = NOW()
+        FROM slug_parsed_tennis sp
+        WHERE k.live_game_id = sp.id
+          AND k.sport = 'tennis'
+          AND (UPPER(k.ticker) LIKE 'KXWTAMATCH-%' OR UPPER(k.ticker) LIKE 'KXATPMATCH-%')
+      `);
+
+      const totalMatchCount = regularMatchCount + sbMatchCount + ufcMatchCount + tennisMatchCount;
 
       if (totalMatchCount > 0) {
         logger.info({
@@ -142,6 +277,8 @@ class KalshiMatcherService {
           matchedCount: totalMatchCount,
           regularMatches: regularMatchCount,
           superBowlMatches: sbMatchCount,
+          ufcMatches: ufcMatchCount,
+          tennisMatches: tennisMatchCount,
         });
       }
 

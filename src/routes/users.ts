@@ -6,6 +6,7 @@
 import { Router, Request, Response } from 'express';
 import axios, { AxiosError } from 'axios';
 import { logger } from '../config/logger';
+import { ingestDebugLog } from '../config/debug-ingest';
 import { getCache, setCache } from '../utils/cache';
 import {
   registerUserAndDeployWallet,
@@ -21,6 +22,8 @@ import {
   updateUserEmbeddedWalletAddress,
   deleteAllUsers,
 } from '../services/privy';
+import { createSolanaWallet } from '../services/solana/solana-wallet.service';
+import { updateUserTradingRegion, updateUserKalshiOnboarding } from '../services/privy/kalshi-user.service';
 import { privyService } from '../services/privy/privy.service';
 
 const router = Router();
@@ -1011,7 +1014,7 @@ router.post('/approve-tokens', async (req: Request, res: Response) => {
     const { privyUserId } = req.body;
 
     // #region agent log
-    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:915',message:'extracted privyUserId from body',data:{privyUserId:privyUserId,hasPrivyUserId:!!privyUserId,bodyKeys:Object.keys(req.body)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    ingestDebugLog({location:'users.ts:915',message:'extracted privyUserId from body',data:{privyUserId:privyUserId,hasPrivyUserId:!!privyUserId,bodyKeys:Object.keys(req.body)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'});
     // #endregion
 
     if (!privyUserId) {
@@ -1025,7 +1028,7 @@ router.post('/approve-tokens', async (req: Request, res: Response) => {
     }
 
     // #region agent log
-    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:923',message:'calling setupTokenApprovals',data:{privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    ingestDebugLog({location:'users.ts:923',message:'calling setupTokenApprovals',data:{privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'});
     // #endregion
     const result = await setupTokenApprovals(privyUserId);
 
@@ -1040,7 +1043,7 @@ router.post('/approve-tokens', async (req: Request, res: Response) => {
     });
   } catch (error) {
     // #region agent log
-    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:930',message:'error in approve-tokens endpoint',data:{error:error instanceof Error ? error.message : String(error),errorType:error instanceof Error ? error.constructor.name : typeof error,hasMessage:error instanceof Error && 'message' in error},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    ingestDebugLog({location:'users.ts:930',message:'error in approve-tokens endpoint',data:{error:error instanceof Error ? error.message : String(error),errorType:error instanceof Error ? error.constructor.name : typeof error,hasMessage:error instanceof Error && 'message' in error},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'});
     // #endregion
     logger.error({
       message: 'Error setting up token approvals',
@@ -1056,7 +1059,7 @@ router.post('/approve-tokens', async (req: Request, res: Response) => {
       }
       if (error.message.includes('does not have a proxy wallet')) {
         // #region agent log
-        fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:940',message:'no proxy wallet error',data:{privyUserId:req.body.privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+        ingestDebugLog({location:'users.ts:940',message:'no proxy wallet error',data:{privyUserId:req.body.privyUserId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'});
         // #endregion
         return res.status(400).json({
           success: false,
@@ -1066,7 +1069,7 @@ router.post('/approve-tokens', async (req: Request, res: Response) => {
     }
 
     // #region agent log
-    fetch('http://localhost:7245/ingest/60ddb764-e4c3-47f8-bbea-98f9add98263',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'users.ts:947',message:'returning generic 500 error',data:{error:error instanceof Error ? error.message : String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    ingestDebugLog({location:'users.ts:947',message:'returning generic 500 error',data:{error:error instanceof Error ? error.message : String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'});
     // #endregion
     res.status(500).json({ success: false, error: 'Failed to set up token approvals' });
   }
@@ -1228,12 +1231,117 @@ router.post('/complete-onboarding', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error({
       message: '[Onboarding] Error in complete-onboarding endpoint',
+      privyUserId: (req as any).body?.privyUserId,
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined,
     });
     res.status(500).json({
       success: false,
       error: 'Failed to complete onboarding',
+    });
+  }
+});
+
+/**
+ * POST /api/users/register-kalshi - US user registration (creates Solana wallet)
+ */
+router.post('/register-kalshi', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId, username } = req.body;
+    if (!privyUserId || !username) {
+      return res.status(400).json({ success: false, error: 'Missing privyUserId or username' });
+    }
+    const usernameRegex = /^[a-zA-Z0-9_]{3,50}$/;
+    if (!usernameRegex.test(username)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Username must be 3-50 characters, alphanumeric and underscores only',
+      });
+    }
+
+    const existingUser = await getUserByPrivyId(privyUserId);
+    if (existingUser) {
+      if (existingUser.solanaWalletAddress) {
+        return res.status(201).json({
+          success: true,
+          user: existingUser,
+          solanaWalletAddress: existingUser.solanaWalletAddress,
+          message: 'User already registered with Solana wallet',
+        });
+      }
+      const wallet = await createSolanaWallet(privyUserId);
+      await updateUserTradingRegion(privyUserId, 'us');
+      const updated = await getUserByPrivyId(privyUserId);
+      return res.status(201).json({
+        success: true,
+        user: updated,
+        solanaWalletAddress: wallet.address,
+      });
+    }
+
+    const embeddedAddress = await privyService.getEmbeddedWalletAddress(privyUserId);
+    if (!embeddedAddress) {
+      return res.status(400).json({ success: false, error: 'No embedded wallet found. Create a user first.' });
+    }
+
+    const { createUser } = await import('../services/privy/user.service');
+    const user = await createUser({
+      privyUserId,
+      username,
+      embeddedWalletAddress: embeddedAddress,
+    });
+    await updateUserTradingRegion(privyUserId, 'us');
+    const wallet = await createSolanaWallet(privyUserId);
+    const finalUser = await getUserByPrivyId(privyUserId);
+
+    res.status(201).json({
+      success: true,
+      user: finalUser,
+      solanaWalletAddress: wallet.address,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error in register-kalshi',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to register Kalshi user',
+    });
+  }
+});
+
+/**
+ * POST /api/users/complete-kalshi-onboarding - Mark Kalshi onboarding done
+ */
+router.post('/complete-kalshi-onboarding', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId } = req.body;
+    if (!privyUserId) {
+      return res.status(400).json({ success: false, error: 'Missing privyUserId' });
+    }
+
+    const user = await getUserByPrivyId(privyUserId);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    await updateUserKalshiOnboarding(privyUserId, true);
+    const updated = await getUserByPrivyId(privyUserId);
+
+    res.json({
+      success: true,
+      message: 'Kalshi onboarding completed',
+      user: updated,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error in complete-kalshi-onboarding',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to complete Kalshi onboarding',
     });
   }
 });

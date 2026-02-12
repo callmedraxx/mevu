@@ -5,6 +5,8 @@
  *
  * Channels:
  * - games:broadcast - game_update, price_update, games_update
+ * - activity:broadcast - per-game activity updates
+ * - kalshi:prices - Kalshi real-time price updates
  * - deposits:progress - deposit progress events (depositProgressService)
  * - deposits:balance - Alchemy deposit/balance notifications
  */
@@ -15,26 +17,31 @@ import { logger } from '../config/logger';
 
 const GAMES_CHANNEL = 'games:broadcast';
 const ACTIVITY_CHANNEL = 'activity:broadcast';
+const KALSHI_PRICES_CHANNEL = 'kalshi:prices';
+const KALSHI_PRICES_ACTIVITY_CHANNEL = 'kalshi:prices:activity';
 const DEPOSITS_PROGRESS_CHANNEL = 'deposits:progress';
 const DEPOSITS_BALANCE_CHANNEL = 'deposits:balance';
+const KALSHI_USER_CHANNEL = 'kalshi:user';
 
 let redisPub: Redis | null = null;
 let redisSub: Redis | null = null;
 const gamesCallbacks: Set<(msg: unknown) => void> = new Set();
 const activityCallbacks: Set<(msg: unknown) => void> = new Set();
+const kalshiPricesCallbacks: Set<(msg: unknown) => void> = new Set();
+const kalshiPricesActivityCallbacks: Set<(msg: unknown) => void> = new Set();
 const depositsProgressCallbacks: Set<(msg: unknown) => void> = new Set();
 const depositsBalanceCallbacks: Set<(msg: unknown) => void> = new Set();
+const kalshiUserCallbacks: Set<(msg: unknown) => void> = new Set();
 
 /**
  * Initialize Redis connection. Idempotent - safe to call multiple times.
- * Returns true if Redis is available and we're in cluster mode.
+ * Returns true if Redis is available. In production cluster mode all workers use this;
+ * in dev with REDIS_URL set we still init so Kalshi/activity broadcasts reach the games WebSocket.
  */
 export function initRedisClusterBroadcast(): boolean {
   const redisUrl = process.env.REDIS_URL;
-  const nodeEnv = process.env.NODE_ENV || 'development';
-  const isClusterWorker = cluster.isWorker && nodeEnv === 'production';
 
-  if (!redisUrl || !isClusterWorker) return false;
+  if (!redisUrl) return false;
   if (redisPub && redisSub) return true;
 
   try {
@@ -76,10 +83,14 @@ export function initRedisClusterBroadcast(): boolean {
           gamesCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
         } else if (channel === ACTIVITY_CHANNEL) {
           activityCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === KALSHI_PRICES_CHANNEL) {
+          kalshiPricesCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
         } else if (channel === DEPOSITS_PROGRESS_CHANNEL) {
           depositsProgressCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
         } else if (channel === DEPOSITS_BALANCE_CHANNEL) {
           depositsBalanceCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === KALSHI_USER_CHANNEL) {
+          kalshiUserCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
         }
       } catch (err) {
         logger.warn({
@@ -90,7 +101,7 @@ export function initRedisClusterBroadcast(): boolean {
       }
     });
 
-    redisSub.subscribe(GAMES_CHANNEL, ACTIVITY_CHANNEL, DEPOSITS_PROGRESS_CHANNEL, DEPOSITS_BALANCE_CHANNEL);
+    redisSub.subscribe(GAMES_CHANNEL, ACTIVITY_CHANNEL, KALSHI_PRICES_CHANNEL, KALSHI_PRICES_ACTIVITY_CHANNEL, DEPOSITS_PROGRESS_CHANNEL, DEPOSITS_BALANCE_CHANNEL, KALSHI_USER_CHANNEL);
     return true;
   } catch (error) {
     logger.warn({
@@ -234,6 +245,99 @@ export function publishActivityBroadcast(slugs: string[], message: { type: strin
   scheduleActivityFlush();
 }
 
+// --- Kalshi prices (real-time WebSocket price updates) ---
+export interface KalshiPriceBroadcastMessage {
+  type: 'kalshi_price_update';
+  gameId: string;
+  slug?: string;
+  awayTeam: {
+    kalshiBuyPrice: number;
+    kalshiSellPrice: number;
+  };
+  homeTeam: {
+    kalshiBuyPrice: number;
+    kalshiSellPrice: number;
+  };
+  /** When set, only these sides have real data; frontend merges and keeps existing for other sides (tennis/soccer partial) */
+  updatedSides?: ('away' | 'home')[];
+  ticker: string;
+  timestamp: number;
+}
+
+/** Batch Kalshi price messages to reduce Redis publish rate (50ms = imperceptible) */
+const KALSHI_BATCH_DELAY_MS = 50;
+let kalshiBatchTimer: NodeJS.Timeout | null = null;
+// Key by game ID (and updatedSides for partials) so we keep both away/home messages for tennis
+const kalshiPendingByKey = new Map<string, KalshiPriceBroadcastMessage>();
+
+function kalshiPendingKey(msg: KalshiPriceBroadcastMessage): string {
+  const sides = msg.updatedSides?.length ? msg.updatedSides.join(',') : 'full';
+  return `${msg.gameId}:${sides}`;
+}
+
+function flushKalshiBatch(): void {
+  kalshiBatchTimer = null;
+  if (kalshiPendingByKey.size === 0) return;
+  const messages = Array.from(kalshiPendingByKey.values());
+  kalshiPendingByKey.clear();
+
+  if (messages.length === 1) {
+    publish(KALSHI_PRICES_CHANNEL, messages[0]);
+  } else {
+    // Send as batch - receiver will unpack
+    publish(KALSHI_PRICES_CHANNEL, { type: 'batch', items: messages });
+  }
+}
+
+function scheduleKalshiFlush(): void {
+  if (kalshiBatchTimer) return;
+  kalshiBatchTimer = setTimeout(flushKalshiBatch, KALSHI_BATCH_DELAY_MS);
+}
+
+export function subscribeToKalshiPriceBroadcast(callback: (msg: KalshiPriceBroadcastMessage) => void): () => void {
+  const wrapped = (msg: unknown) => {
+    const m = msg as any;
+    if (m.type === 'batch' && Array.isArray(m.items)) {
+      // Unpack batch
+      for (const item of m.items) {
+        callback(item as KalshiPriceBroadcastMessage);
+      }
+    } else {
+      callback(msg as KalshiPriceBroadcastMessage);
+    }
+  };
+  kalshiPricesCallbacks.add(wrapped);
+  return () => kalshiPricesCallbacks.delete(wrapped);
+}
+
+export function publishKalshiPriceBroadcast(message: KalshiPriceBroadcastMessage): void {
+  if (!redisPub) return;
+
+  // Dedupe by gameId + updatedSides so partial updates (away vs home) for same game are both sent
+  kalshiPendingByKey.set(kalshiPendingKey(message), message);
+  scheduleKalshiFlush();
+}
+
+/** Subscribe to Kalshi all-market updates (spreads, totals) for activity widget only. Games list uses subscribeToKalshiPriceBroadcast (moneyline with updatedSides). */
+export function subscribeToKalshiPriceBroadcastActivity(callback: (msg: KalshiPriceBroadcastMessage) => void): () => void {
+  const wrapped = (msg: unknown) => {
+    const m = msg as any;
+    if (m.type === 'batch' && Array.isArray(m.items)) {
+      for (const item of m.items) callback(item as KalshiPriceBroadcastMessage);
+    } else {
+      callback(msg as KalshiPriceBroadcastMessage);
+    }
+  };
+  kalshiPricesActivityCallbacks.add(wrapped);
+  return () => kalshiPricesActivityCallbacks.delete(wrapped);
+}
+
+/** Publish Kalshi all-market updates to activity channel only (not games list). Avoids overwriting moneyline partial updates. */
+export function publishKalshiPriceBroadcastActivity(message: KalshiPriceBroadcastMessage): void {
+  if (!redisPub) return;
+  publish(KALSHI_PRICES_ACTIVITY_CHANNEL, message);
+}
+
 // --- Deposits progress (depositProgressService) ---
 export function subscribeToDepositsProgress(callback: (msg: { privyUserId: string; event: unknown }) => void): () => void {
   depositsProgressCallbacks.add(callback as (msg: unknown) => void);
@@ -254,6 +358,34 @@ export function publishDepositsBalance(notification: unknown): void {
   publish(DEPOSITS_BALANCE_CHANNEL, notification);
 }
 
+// --- Kalshi trade/position updates (for US users) ---
+export interface KalshiTradeUpdateMessage {
+  type: 'kalshi_trade_update';
+  privyUserId: string;
+  trade: unknown;
+}
+
+export interface KalshiPositionUpdateMessage {
+  type: 'kalshi_position_update';
+  privyUserId: string;
+  position: unknown;
+}
+
+export function subscribeToKalshiUserBroadcast(
+  callback: (msg: KalshiTradeUpdateMessage | KalshiPositionUpdateMessage) => void
+): () => void {
+  kalshiUserCallbacks.add(callback as (msg: unknown) => void);
+  return () => kalshiUserCallbacks.delete(callback as (msg: unknown) => void);
+}
+
+export function publishKalshiTradeUpdate(privyUserId: string, trade: unknown): void {
+  publish(KALSHI_USER_CHANNEL, { type: 'kalshi_trade_update', privyUserId, trade });
+}
+
+export function publishKalshiPositionUpdate(privyUserId: string, position: unknown): void {
+  publish(KALSHI_USER_CHANNEL, { type: 'kalshi_position_update', privyUserId, position });
+}
+
 export function isRedisClusterBroadcastReady(): boolean {
   return redisPub !== null;
 }
@@ -269,6 +401,9 @@ export async function shutdownRedisClusterBroadcast(): Promise<void> {
   }
   gamesCallbacks.clear();
   activityCallbacks.clear();
+  kalshiPricesCallbacks.clear();
+  kalshiPricesActivityCallbacks.clear();
   depositsProgressCallbacks.clear();
   depositsBalanceCallbacks.clear();
+  kalshiUserCallbacks.clear();
 }
