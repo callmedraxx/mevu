@@ -357,6 +357,43 @@ const TEAM_ALIASES: Record<string, string> = {
   'gra': 'granada cf',
   'almeria': 'ud almeria',
   'alm': 'ud almeria',
+
+  // Men's Winter Olympics Hockey (mwoh) countries
+  // Keyed by full name and common slug abbreviation; ISO alpha-3 variants also mapped
+  'switzerland': 'switzerland',
+  'swi': 'switzerland',
+  // Note: 'che' is already mapped to Chelsea FC (EPL); ISO CHE→SWI handled in normalizeKalshiTeamAbbr
+  'france': 'france',
+  'fra': 'france',
+  'canada': 'canada',
+  'can': 'canada',
+  'germany': 'germany',
+  'ger': 'germany',
+  'deu': 'germany',         // ISO 3166-1 alpha-3
+  'finland': 'finland',
+  'fin': 'finland',
+  'sweden': 'sweden',
+  'swe': 'sweden',
+  'czech republic': 'czech republic',
+  'czechia': 'czech republic',
+  'cze': 'czech republic',
+  'latvia': 'latvia',
+  'lat': 'latvia',
+  'lva': 'latvia',          // ISO 3166-1 alpha-3
+  'denmark': 'denmark',
+  // Note: 'den' is already mapped to Denver Nuggets (NBA); ISO DNK→DEN handled in normalizeKalshiTeamAbbr
+  'dnk': 'denmark',         // ISO 3166-1 alpha-3
+  'norway': 'norway',
+  'nor': 'norway',
+  'slovakia': 'slovakia',
+  'svk': 'slovakia',
+  'slovenia': 'slovenia',
+  'slo': 'slovenia',
+  'svn': 'slovenia',        // ISO 3166-1 alpha-3
+  'austria': 'austria',
+  'aut': 'austria',
+  'kazakhstan': 'kazakhstan',
+  'kaz': 'kazakhstan',
 };
 
 // Abbreviation patterns by league

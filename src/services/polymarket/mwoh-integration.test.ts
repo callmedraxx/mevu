@@ -227,14 +227,14 @@ describe('MWOH transformToFrontendGame', () => {
     expect(result.homeTeam.abbr).toBe('FRA');
   });
 
-  it('should extract country names from market outcomes as team names', async () => {
+  it('should extract country names and strip group prefix from title', async () => {
     const game = makeMwohLiveGame();
     const result = await transformToFrontendGame(game);
 
-    // Names should come from the market outcome labels ("Switzerland", "France")
-    // or fall back to title extraction
-    expect(result.awayTeam.name).toBeTruthy();
-    expect(result.homeTeam.name).toBeTruthy();
+    // Title is "Men's Group A - Switzerland vs. France"
+    // After cleaning: away = "Switzerland", home = "France"
+    expect(result.awayTeam.name).toBe('Switzerland');
+    expect(result.homeTeam.name).toBe('France');
   });
 
   it('should extract win probabilities from outcome prices', async () => {

@@ -168,6 +168,15 @@ function isTennisGame(game: LiveGame): boolean {
 }
 
 /**
+ * Check if a game is an mwoh (Men's Winter Olympics Hockey) game
+ */
+function isMwohGame(game: LiveGame): boolean {
+  const sport = (game.sport || '').toLowerCase();
+  const league = (game.league || '').toLowerCase();
+  return sport === 'mwoh' || league === 'mwoh';
+}
+
+/**
  * Format time from date string
  */
 function formatGameTime(dateStr: string | undefined): string {
@@ -318,6 +327,25 @@ function cleanTennisTeamName(name: string | undefined | null): string | undefine
   }
   
   return cleaned || undefined;
+}
+
+/**
+ * Clean mwoh (Men's Winter Olympics Hockey) team names by removing round/group prefixes.
+ * Handles:
+ *   Group stage:  "Men's Group A - Switzerland"  -> "Switzerland"
+ *   Group stage:  "Men's Group C - USA"          -> "USA"
+ *   Knockout:     "Men's Quarterfinal - Canada"  -> "Canada"
+ *   Medal rounds: "Men's Gold Medal Game - USA"  -> "USA"
+ *
+ * Pattern: ^Men's <anything up to the first dash> - <country>
+ */
+function cleanMwohTeamName(name: string | undefined | null): string | undefined {
+  if (!name) return undefined;
+
+  // Strip "Men's <round/group> - " prefix
+  // ['\u2019] handles both straight apostrophe and right single quotation mark
+  const cleaned = name.replace(/^Men['\u2019]s\s+[^-\u2013\u2014]+\s*[-\u2013\u2014]\s*/i, '').trim();
+  return cleaned || name.trim() || undefined;
 }
 
 /**
@@ -544,7 +572,19 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
     if (cleanedHome) homeTeamName = cleanedHome.toLowerCase();
     if (cleanedAway) awayTeamName = cleanedAway.toLowerCase();
   }
-  
+
+  // mwoh: strip group/round prefixes like "Men's Group A - " from team names
+  // so outcome labels ("Switzerland") match cleaned names ("switzerland")
+  const isMwoh = isMwohGame(game);
+  if (isMwoh) {
+    if (homeTeamName) {
+      homeTeamName = cleanMwohTeamName(homeTeamName)?.toLowerCase() || homeTeamName;
+    }
+    if (awayTeamName) {
+      awayTeamName = cleanMwohTeamName(awayTeamName)?.toLowerCase() || awayTeamName;
+    }
+  }
+
   // Fallback: Extract team names from title if teams aren't enriched
   if (!homeTeamName && !awayTeamName && game.title) {
     const title = game.title;
@@ -558,8 +598,15 @@ function findMoneylineMarket(game: LiveGame): { home: TeamOutcome | null; away: 
         break;
       }
     }
+
+    // mwoh: clean group/round prefix from title-derived names
+    // e.g. "men's group a - switzerland" -> "switzerland"
+    if (isMwoh) {
+      if (awayTeamName) awayTeamName = cleanMwohTeamName(awayTeamName)?.toLowerCase() || awayTeamName;
+      if (homeTeamName) homeTeamName = cleanMwohTeamName(homeTeamName)?.toLowerCase() || homeTeamName;
+    }
   }
-  
+
   // Fallback: Extract from slug if available (format: sport-away-home-date)
   if (!homeTeamName && !awayTeamName && game.slug) {
     const slugParts = game.slug.split('-');
@@ -1174,6 +1221,9 @@ export async function transformToFrontendGame(
   
   // Detect tennis games for special score handling
   const isTennisMatch = isTennisGame(game);
+
+  // Detect mwoh (Men's Winter Olympics Hockey) for name prefix stripping
+  const isMwoh = isMwohGame(game);
   
   // Parse score - use tennis parser for tennis games
   let scores: { home?: number; away?: number } = {};
@@ -1208,7 +1258,17 @@ export async function transformToFrontendGame(
       titleTeams.home = cleanTennisTeamName(titleTeams.home) || titleTeams.home;
     }
   }
-  
+
+  // Clean mwoh team names from title (strip "Men's Group X - " / round prefixes)
+  if (isMwoh) {
+    if (titleTeams.away) {
+      titleTeams.away = cleanMwohTeamName(titleTeams.away) || titleTeams.away;
+    }
+    if (titleTeams.home) {
+      titleTeams.home = cleanMwohTeamName(titleTeams.home) || titleTeams.home;
+    }
+  }
+
   // Extract team abbreviations from slug as fallback (format: sport-away-home-date)
   // Pass the game's sport to avoid incorrectly skipping team abbreviations that match sport identifiers
   const slugAbbrevs = extractAbbrevsFromSlug(game.slug, game.sport || game.league);
@@ -1342,6 +1402,8 @@ export async function transformToFrontendGame(
         ? (ufcAwayName || descNames.away || titleTeams.away || rawAwayId || awayTeam?.name || 'Away Fighter')
         : isTennisMatch
         ? (descNames.away || cleanTennisTeamName(awayTeam?.name) || cleanTennisTeamName(rawAwayId) || cleanTennisTeamName(titleTeams.away) || 'Away Player')
+        : isMwoh
+        ? (cleanMwohTeamName(awayTeam?.name) || cleanMwohTeamName(rawAwayId) || titleTeams.away || 'Away Team')
         : (awayTeam?.name || rawAwayId || titleTeams.away || 'Away Team'),
       record: isUfc
         ? getFighterRecord(ufcAwayName || descNames.away || titleTeams.away || rawAwayId || awayTeam?.name || '')
@@ -1377,6 +1439,8 @@ export async function transformToFrontendGame(
         ? (ufcHomeName || descNames.home || titleTeams.home || rawHomeId || homeTeam?.name || 'Home Fighter')
         : isTennisMatch
         ? (descNames.home || cleanTennisTeamName(homeTeam?.name) || cleanTennisTeamName(rawHomeId) || cleanTennisTeamName(titleTeams.home) || 'Home Player')
+        : isMwoh
+        ? (cleanMwohTeamName(homeTeam?.name) || cleanMwohTeamName(rawHomeId) || titleTeams.home || 'Home Team')
         : (homeTeam?.name || rawHomeId || titleTeams.home || 'Home Team'),
       record: isUfc
         ? getFighterRecord(ufcHomeName || descNames.home || titleTeams.home || rawHomeId || homeTeam?.name || '')

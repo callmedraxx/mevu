@@ -15,6 +15,10 @@ export const KALSHI_SPORT_SERIES: Record<string, string[]> = {
   tennis: ['KXATPMATCH', 'KXWTAMATCH'],
   cbb: ['KXNCAAMBGAME', 'KXNCAAWBGAME'],
   // Note: CFB does not have individual game markets on Kalshi
+  // Men's Winter Olympics Hockey (2026 Milan-Cortina)
+  // Single binary market per game: YES = first team (away) wins, NO = second team (home) wins
+  // Kalshi uses ISO 3166-1 alpha-3 codes (CHE, DEU, LVA…); our slugs use common abbrs (SWI, GER, LAT…)
+  mwoh: ['KXWOMHOCKEY'],
 };
 
 // Reverse mapping: series ticker -> our sport identifier

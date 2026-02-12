@@ -118,25 +118,27 @@ class KalshiActivityService {
     const homeAbbr = homeTeam.abbr?.toUpperCase();
     const awayAbbr = awayTeam.abbr?.toUpperCase();
     
-    // Check if this is a single-market sport (tennis, UFC) or multi-market sport (NBA, NFL, etc.)
+    // Check if this is a single-market sport (tennis, UFC, mwoh) or multi-market sport (NBA, NFL, etc.)
     const isSingleMarketSport = kalshiRows.some(r => {
       const tickerUpper = r.ticker.toUpperCase();
-      return tickerUpper.startsWith('KXWTAMATCH-') || 
-             tickerUpper.startsWith('KXATPMATCH-') || 
-             tickerUpper.startsWith('KXUFCFIGHT-');
+      return tickerUpper.startsWith('KXWTAMATCH-') ||
+             tickerUpper.startsWith('KXATPMATCH-') ||
+             tickerUpper.startsWith('KXUFCFIGHT-') ||
+             tickerUpper.startsWith('KXWOMHOCKEY-');
     });
 
     let homeMoneyline = null;
     let awayMoneyline = null;
     
     if (isSingleMarketSport) {
-      // Tennis/UFC: single market per match (YES = away wins, NO = home wins)
+      // Tennis/UFC/mwoh: single market per match (YES = away wins, NO = home wins)
       // Use the same market for both teams, but invert prices for home team
       const singleMarket = kalshiRows.find(r => {
         const tickerUpper = r.ticker.toUpperCase();
-        return tickerUpper.startsWith('KXWTAMATCH-') || 
-               tickerUpper.startsWith('KXATPMATCH-') || 
-               tickerUpper.startsWith('KXUFCFIGHT-');
+        return tickerUpper.startsWith('KXWTAMATCH-') ||
+               tickerUpper.startsWith('KXATPMATCH-') ||
+               tickerUpper.startsWith('KXUFCFIGHT-') ||
+               tickerUpper.startsWith('KXWOMHOCKEY-');
       });
       
       if (singleMarket) {
@@ -180,11 +182,12 @@ class KalshiActivityService {
     if (marketGroups.moneyline.length > 0) {
       const mlMarkets = marketGroups.moneyline;
       
-      // Check if this is a single-market sport (tennis, UFC)
+      // Check if this is a single-market sport (tennis, UFC, mwoh)
       const firstTicker = mlMarkets[0]?.ticker.toUpperCase() || '';
-      const isSingleMarket = firstTicker.startsWith('KXWTAMATCH-') || 
-                             firstTicker.startsWith('KXATPMATCH-') || 
-                             firstTicker.startsWith('KXUFCFIGHT-');
+      const isSingleMarket = firstTicker.startsWith('KXWTAMATCH-') ||
+                             firstTicker.startsWith('KXATPMATCH-') ||
+                             firstTicker.startsWith('KXUFCFIGHT-') ||
+                             firstTicker.startsWith('KXWOMHOCKEY-');
       
       if (isSingleMarket && mlMarkets.length === 1) {
         // Single-market sports: create two outcomes from one market
@@ -303,11 +306,12 @@ class KalshiActivityService {
     for (const row of rows) {
       const ticker = row.ticker.toUpperCase();
       
-      // Moneyline markets: regular GAME markets, tennis MATCH markets, UFC FIGHT markets
-      if (ticker.includes('GAME-') || 
-          ticker.startsWith('KXWTAMATCH-') || 
-          ticker.startsWith('KXATPMATCH-') || 
-          ticker.startsWith('KXUFCFIGHT-')) {
+      // Moneyline markets: regular GAME markets, tennis MATCH markets, UFC FIGHT markets, mwoh HOCKEY markets
+      if (ticker.includes('GAME-') ||
+          ticker.startsWith('KXWTAMATCH-') ||
+          ticker.startsWith('KXATPMATCH-') ||
+          ticker.startsWith('KXUFCFIGHT-') ||
+          ticker.startsWith('KXWOMHOCKEY-')) {
         groups.moneyline.push(row);
       } else if (ticker.includes('SPREAD-') || ticker.includes('SPREAD')) {
         groups.spread.push(row);

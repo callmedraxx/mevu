@@ -230,7 +230,7 @@ class KalshiService {
    */
   private normalizeKalshiTeamAbbr(abbr: string): string {
     const upperAbbr = abbr.toUpperCase();
-    
+
     // NHL abbreviation mappings (Kalshi -> our slugs)
     const NHL_ABBR_MAP: Record<string, string> = {
       'VGK': 'LAS',   // Vegas Golden Knights -> las (Las Vegas)
@@ -239,10 +239,19 @@ class KalshiService {
       'MTL': 'MON',   // Montreal Canadiens -> mon (if we use this)
       'UTA': 'UTAH',  // Utah Hockey Club -> utah
       'SJ': 'SJS',    // San Jose Sharks -> sjs (if we use 3 chars)
-      // Add more mappings as needed
     };
-    
-    return NHL_ABBR_MAP[upperAbbr] || upperAbbr;
+
+    // Men's Winter Olympics Hockey (mwoh): Kalshi uses ISO 3166-1 alpha-3 codes,
+    // our Polymarket slugs use common 3-letter abbreviations derived from country names.
+    const MWOH_ABBR_MAP: Record<string, string> = {
+      'CHE': 'SWI',  // Switzerland (Confoederatio Helvetica)
+      'DEU': 'GER',  // Germany (Deutschland)
+      'LVA': 'LAT',  // Latvia
+      'DNK': 'DEN',  // Denmark
+      'SVN': 'SLO',  // Slovenia
+    };
+
+    return NHL_ABBR_MAP[upperAbbr] || MWOH_ABBR_MAP[upperAbbr] || upperAbbr;
   }
 
   /**
@@ -636,13 +645,14 @@ class KalshiService {
       // Fetch moneyline markets:
       // - Regular games: KXNBAGAME, KXNFLGAME, etc. (ticker contains 'GAME-')
       // - Super Bowl: KXSB-YY-TEAM format
+      // - Single-market sports (UFC, tennis, mwoh): one market per game, YES=away wins, NO=home wins
       const result = await client.query(
         `
-        SELECT 
-          km.yes_bid, 
-          km.yes_ask, 
-          km.no_bid, 
-          km.no_ask, 
+        SELECT
+          km.yes_bid,
+          km.yes_ask,
+          km.no_bid,
+          km.no_ask,
           km.ticker,
           km.away_team_abbr,
           km.home_team_abbr
@@ -653,6 +663,10 @@ class KalshiService {
           AND (
             (UPPER(km.ticker) LIKE '%GAME-%' AND UPPER(km.ticker) NOT LIKE '%-TIE')
             OR UPPER(km.ticker) LIKE 'KXSB-%'
+            OR UPPER(km.ticker) LIKE 'KXUFCFIGHT-%'
+            OR UPPER(km.ticker) LIKE 'KXATPMATCH-%'
+            OR UPPER(km.ticker) LIKE 'KXWTAMATCH-%'
+            OR UPPER(km.ticker) LIKE 'KXWOMHOCKEY-%'
           )
         ORDER BY km.ticker
         `,
@@ -666,10 +680,20 @@ class KalshiService {
       // Find away and home team markets
       let awayMarket = null;
       let homeMarket = null;
-      
+      // Single-market sports (UFC, tennis, mwoh): one market per game
+      // YES = first-listed (away) team wins, NO = second-listed (home) team wins
+      let singleMarket = null;
+      const SINGLE_MARKET_PREFIXES = ['KXUFCFIGHT-', 'KXATPMATCH-', 'KXWTAMATCH-', 'KXWOMHOCKEY-'];
+
       for (const market of result.rows) {
         const tickerUpper = market.ticker.toUpperCase();
-        
+
+        // For single-market sports, the entire row has YES/NO prices for away/home
+        if (SINGLE_MARKET_PREFIXES.some(p => tickerUpper.startsWith(p))) {
+          singleMarket = market;
+          break;
+        }
+
         // For Super Bowl (KXSB-YY-TEAM), match based on the team in the ticker vs game teams
         if (tickerUpper.startsWith('KXSB-')) {
           const sbMatch = tickerUpper.match(/KXSB-\d{2}-([A-Z]{2,4})$/);
@@ -684,21 +708,32 @@ class KalshiService {
           }
           continue;
         }
-        
+
         // For regular GAME markets, extract the team suffix from ticker
         const tickerSuffixMatch = tickerUpper.match(/-([A-Z]{2,4})$/);
         if (!tickerSuffixMatch) continue;
         const tickerTeam = tickerSuffixMatch[1];
-        
+
         // Normalize the ticker team to match our slug format
         const normalizedTickerTeam = this.normalizeKalshiTeamAbbr(tickerTeam);
-        
+
         // Match against game's away/home teams
         if (normalizedTickerTeam === gameAwayAbbr) {
           awayMarket = market;
         } else if (normalizedTickerTeam === gameHomeAbbr) {
           homeMarket = market;
         }
+      }
+
+      // Single-market: YES bid/ask = away wins, NO bid/ask = home wins
+      if (singleMarket) {
+        return {
+          yesBid: singleMarket.yes_bid ?? 0,
+          yesAsk: singleMarket.yes_ask ?? 0,
+          noBid: singleMarket.no_bid ?? 0,
+          noAsk: singleMarket.no_ask ?? 0,
+          ticker: singleMarket.ticker,
+        };
       }
 
       if (!awayMarket && !homeMarket) {

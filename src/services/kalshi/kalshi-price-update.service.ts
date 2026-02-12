@@ -354,6 +354,12 @@ export class KalshiPriceUpdateService extends EventEmitter {
       'MTL': 'MON',   // Montreal Canadiens
       'UTA': 'UTAH',  // Utah Hockey Club (NHL only, not NBA Jazz!)
       'SJ': 'SJS',    // San Jose Sharks
+      // Men's Winter Olympics Hockey (mwoh) — ISO 3166-1 alpha-3 → slug abbr
+      'CHE': 'SWI',   // Switzerland
+      'DEU': 'GER',   // Germany
+      'LVA': 'LAT',   // Latvia
+      'DNK': 'DEN',   // Denmark
+      'SVN': 'SLO',   // Slovenia
     };
     
     return KALSHI_TO_SLUG[upperAbbr] || upperAbbr;
@@ -414,7 +420,13 @@ export class KalshiPriceUpdateService extends EventEmitter {
       // Should NOT contain +/- for spreads
       return !ticker.includes('+') && !ticker.includes('OVER') && !ticker.includes('UNDER');
     }
-    
+
+    // Men's Winter Olympics Hockey: single binary market per game
+    // Ticker format: KXWOMHOCKEY-26FEB12CHEFRA (YES = first team / away wins)
+    if (upperTicker.startsWith('KXWOMHOCKEY-')) {
+      return !ticker.includes('+') && !ticker.includes('OVER') && !ticker.includes('UNDER');
+    }
+
     // Tennis matches are single-market (YES = player1 wins) - treat as moneyline
     // WTA ticker format: KXWTAMATCH-26FEB06ZARBIR (ZAR=Zarazua, BIR=Birrell)
     // ATP ticker format: KXATPMATCH-26FEB06XXXYYY
@@ -499,6 +511,16 @@ export class KalshiPriceUpdateService extends EventEmitter {
       });
     }
 
+    // Debug: Log mwoh ticker messages
+    if (ticker.toUpperCase().startsWith('KXWOMHOCKEY-')) {
+      logger.info({
+        message: 'MWOH ticker message received',
+        ticker,
+        yesBid: message.msg.yes_bid,
+        yesAsk: message.msg.yes_ask,
+      });
+    }
+
     const mapping = this.tickerMapper.getMappingForTicker(ticker);
     if (!mapping) {
       // Ticker not mapped to a game - skip
@@ -506,6 +528,13 @@ export class KalshiPriceUpdateService extends EventEmitter {
       if (ticker.toUpperCase().includes('ATPMATCH') || ticker.toUpperCase().includes('WTAMATCH')) {
         logger.warn({
           message: 'Tennis ticker NOT MAPPED - skipping',
+          ticker,
+          mapperStats: this.tickerMapper.getStats(),
+        });
+      }
+      if (ticker.toUpperCase().startsWith('KXWOMHOCKEY-')) {
+        logger.warn({
+          message: 'MWOH ticker NOT MAPPED - skipping',
           ticker,
           mapperStats: this.tickerMapper.getStats(),
         });
@@ -536,6 +565,12 @@ export class KalshiPriceUpdateService extends EventEmitter {
       // Don't set both true or we'd treat a single ticker as merged; queuePriceUpdate will set one side when it sees the other ticker
       isAwayTeamTicker = false;
       isHomeTeamTicker = false;
+    }
+
+    // mwoh: single binary market with no per-team suffix (KXWOMHOCKEY-26FEB12CHEFRA).
+    // YES = first-listed team = away team (slug convention: sport-away-home-date).
+    if (!isAwayTeamTicker && !isHomeTeamTicker && sport === 'mwoh') {
+      isAwayTeamTicker = true;
     }
 
     // If we can't determine which team, skip (shouldn't happen for moneyline)

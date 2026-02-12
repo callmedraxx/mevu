@@ -556,3 +556,88 @@ describe('MWOH Sport Detection', () => {
     expect(detectSportFromSlug('nflx-earnings-2026')).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// MWOH Team Name Cleaning Tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Duplicate of cleanMwohTeamName from frontend-game.transformer.ts for pure-unit testing.
+ * Strips "Men's <Group/Round> - " prefix from mwoh team names.
+ */
+function cleanMwohTeamName(name: string | undefined | null): string | undefined {
+  if (!name) return undefined;
+  const cleaned = name.replace(/^Men['\u2019]s\s+[^-\u2013\u2014]+\s*[-\u2013\u2014]\s*/i, '').trim();
+  return cleaned || name.trim() || undefined;
+}
+
+describe('MWOH Team Name Cleaning', () => {
+  // Group stage prefixes (Groups A, B, C, ...)
+  it('should strip "Men\'s Group A - " from a country name', () => {
+    expect(cleanMwohTeamName("Men's Group A - Switzerland")).toBe('Switzerland');
+  });
+
+  it('should strip "Men\'s Group B - " prefix', () => {
+    expect(cleanMwohTeamName("Men's Group B - Finland")).toBe('Finland');
+  });
+
+  it('should strip "Men\'s Group C - " prefix', () => {
+    expect(cleanMwohTeamName("Men's Group C - Germany")).toBe('Germany');
+    expect(cleanMwohTeamName("Men's Group C - USA")).toBe('USA');
+    expect(cleanMwohTeamName("Men's Group C - Latvia")).toBe('Latvia');
+    expect(cleanMwohTeamName("Men's Group C - Denmark")).toBe('Denmark');
+  });
+
+  it('should strip all group letters (D, E, ...)', () => {
+    expect(cleanMwohTeamName("Men's Group D - Canada")).toBe('Canada');
+  });
+
+  // Multi-word country names
+  it('should handle multi-word country names', () => {
+    expect(cleanMwohTeamName("Men's Group A - Czech Republic")).toBe('Czech Republic');
+    expect(cleanMwohTeamName("Men's Group B - South Korea")).toBe('South Korea');
+  });
+
+  // Knockout / medal round prefixes
+  it('should strip "Men\'s Quarterfinal - " prefix', () => {
+    expect(cleanMwohTeamName("Men's Quarterfinal - Canada")).toBe('Canada');
+  });
+
+  it('should strip "Men\'s Semifinal - " prefix', () => {
+    expect(cleanMwohTeamName("Men's Semifinal - Sweden")).toBe('Sweden');
+  });
+
+  it('should strip "Men\'s Gold Medal Game - " prefix', () => {
+    expect(cleanMwohTeamName("Men's Gold Medal Game - USA")).toBe('USA');
+  });
+
+  it('should strip "Men\'s Bronze Medal Game - " prefix', () => {
+    expect(cleanMwohTeamName("Men's Bronze Medal Game - Norway")).toBe('Norway');
+  });
+
+  // Already-clean names (no prefix)
+  it('should return clean names unchanged', () => {
+    expect(cleanMwohTeamName('Switzerland')).toBe('Switzerland');
+    expect(cleanMwohTeamName('France')).toBe('France');
+    expect(cleanMwohTeamName('USA')).toBe('USA');
+    expect(cleanMwohTeamName('Czech Republic')).toBe('Czech Republic');
+  });
+
+  // Edge cases
+  it('should handle smart apostrophe in "Men\u2019s"', () => {
+    expect(cleanMwohTeamName('Men\u2019s Group A - Finland')).toBe('Finland');
+  });
+
+  it('should return undefined for null/undefined/empty input', () => {
+    expect(cleanMwohTeamName(null)).toBeUndefined();
+    expect(cleanMwohTeamName(undefined)).toBeUndefined();
+    expect(cleanMwohTeamName('')).toBeUndefined();
+  });
+
+  it('should NOT strip names that do not start with "Men\'s"', () => {
+    // "Australian Open Men's - Djokovic" starts with "Australian", not "Men's",
+    // so the pattern does not match and the name is returned unchanged.
+    const input = "Australian Open Men's - Djokovic";
+    expect(cleanMwohTeamName(input)).toBe(input);
+  });
+});
