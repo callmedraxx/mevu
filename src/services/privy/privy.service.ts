@@ -1745,6 +1745,78 @@ class PrivyService {
       throw error;
     }
   }
+
+  /**
+   * Sign a message with the user's embedded Solana wallet (no transaction submission).
+   * Used for Proof KYC deep link signing.
+   *
+   * @param walletId - The Privy wallet ID (not the address)
+   * @param message - The message bytes to sign
+   * @returns Base58-encoded signature
+   */
+  async signSolanaMessage(
+    walletId: string,
+    message: Uint8Array
+  ): Promise<{ signature: string }> {
+    if (!this.initialized) {
+      throw new Error('Privy service not initialized');
+    }
+
+    if (!this.privyClient) {
+      throw new Error('PrivyClient SDK not initialized');
+    }
+
+    const authorizationContext = this.getAuthorizationContext();
+    if (!authorizationContext) {
+      throw new Error('Authorization private key not configured. Set PRIVY_AUTHORIZATION_PRIVATE_KEY.');
+    }
+
+    logger.info({
+      message: 'Signing Solana message via Privy SDK',
+      walletId,
+      messageLength: message.length,
+    });
+
+    try {
+      const solanaWallets = this.privyClient.wallets().solana();
+
+      const response = await (solanaWallets as any).signMessage(
+        walletId,
+        {
+          message,
+          caip2: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', // Solana mainnet
+          authorization_context: authorizationContext,
+        }
+      );
+
+      const signature = (response as any)?.signature;
+
+      if (!signature) {
+        logger.error({
+          message: 'Solana signMessage response missing signature',
+          walletId,
+          response,
+        });
+        throw new Error('Solana signMessage response missing signature');
+      }
+
+      logger.info({
+        message: 'Solana message signed successfully via Privy SDK',
+        walletId,
+      });
+
+      return { signature };
+    } catch (error: any) {
+      logger.error({
+        message: 'Privy Solana signMessage FAILED',
+        walletId,
+        error: error.message,
+        status: error?.response?.status,
+        responseData: error?.response?.data,
+      });
+      throw error;
+    }
+  }
 }
 
 // Export singleton instance

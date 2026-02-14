@@ -12,6 +12,7 @@ import { validateKalshiBuyRequest, validateKalshiSellRequest } from './kalshi-tr
 import { validateDFlowBuyOrder, validateDFlowSellOrder, SOLANA_USDC_MINT } from '../dflow/dflow-order-validation';
 import { subtractFromKalshiUsdcBalance, addToKalshiUsdcBalance } from '../privy/kalshi-user.service';
 import { publishKalshiPositionUpdate } from '../redis-cluster-broadcast.service';
+import { checkVerification } from '../proof/proof.service';
 import { logger } from '../../config/logger';
 
 const KALSHI_TRADING_ENABLED = process.env.KALSHI_TRADING_ENABLED === 'true';
@@ -37,6 +38,7 @@ export interface KalshiTradeResult {
   tradeId?: string;
   solanaSignature?: string;
   error?: string;
+  errorCode?: string;
 }
 
 export async function executeKalshiBuy(req: KalshiBuyRequest): Promise<KalshiTradeResult> {
@@ -54,13 +56,35 @@ export async function executeKalshiBuy(req: KalshiBuyRequest): Promise<KalshiTra
   if (!solanaWalletId) return { success: false, error: 'User has no Solana wallet ID — please recreate wallet' };
 
   const usdcAmountHuman = (Number(req.usdcAmount) / 1e6).toFixed(6);
-  const balance = parseFloat((user as any).kalshiUsdcBalance ?? '0') || 0;
-  if (balance < parseFloat(usdcAmountHuman)) {
-    return { success: false, error: `Insufficient balance. You have $${balance.toFixed(2)} USDC. Need $${parseFloat(usdcAmountHuman).toFixed(2)}.` };
+  logger.info({
+    message: 'Kalshi buy request',
+    kalshiTicker: req.kalshiTicker,
+    outcome: req.outcome,
+    usdcAmount: req.usdcAmount,
+  });
+  const skipBalanceCheck = process.env.KALSHI_SKIP_BALANCE_CHECK === 'true';
+  if (!skipBalanceCheck) {
+    const balance = parseFloat((user as any).kalshiUsdcBalance ?? '0') || 0;
+    if (balance < parseFloat(usdcAmountHuman)) {
+      return { success: false, error: `Insufficient balance. You have $${balance.toFixed(2)} USDC. Need $${parseFloat(usdcAmountHuman).toFixed(2)}.` };
+    }
+  }
+
+  // Proof KYC verification gate — required for all Kalshi buys
+  const isVerified = await checkVerification(solanaWallet);
+  if (!isVerified) {
+    return { success: false, error: 'PROOF_REQUIRED', errorCode: 'PROOF_REQUIRED' };
   }
 
   const outcomeMint = await dflowMetadataService.getOutcomeMint(req.kalshiTicker, req.outcome);
-  if (!outcomeMint) return { success: false, error: 'Market not available for trading' };
+  if (!outcomeMint) {
+    logger.warn({
+      message: 'Kalshi buy: no DFlow mapping for ticker',
+      kalshiTicker: req.kalshiTicker,
+      outcome: req.outcome,
+    });
+    return { success: false, error: `Market not available for trading. Ticker "${req.kalshiTicker}" not in dflow_market_mappings.` };
+  }
 
   const dflowParams = {
     inputMint: SOLANA_USDC_MINT,
@@ -141,7 +165,14 @@ export async function executeKalshiSell(req: KalshiSellRequest): Promise<KalshiT
   if (!solanaWalletId) return { success: false, error: 'User has no Solana wallet ID — please recreate wallet' };
 
   const outcomeMint = await dflowMetadataService.getOutcomeMint(req.kalshiTicker, req.outcome);
-  if (!outcomeMint) return { success: false, error: 'Market not available for trading' };
+  if (!outcomeMint) {
+    logger.warn({
+      message: 'Kalshi sell: no DFlow mapping for ticker',
+      kalshiTicker: req.kalshiTicker,
+      outcome: req.outcome,
+    });
+    return { success: false, error: `Market not available for trading. Ticker "${req.kalshiTicker}" not in dflow_market_mappings.` };
+  }
 
   const dflowParams = {
     inputMint: outcomeMint,

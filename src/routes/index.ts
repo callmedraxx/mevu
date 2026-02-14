@@ -20,6 +20,7 @@ import referralRouter from './referral';
 import oceanRouter from './ocean';
 import kalshiTradingRouter from './kalshi-trading';
 import announcementsRouter from './announcements';
+import proofRouter from './proof';
 
 const router = Router();
 
@@ -105,5 +106,6 @@ router.use('/referral', referralRouter);
 router.use('/ocean', oceanRouter);
 router.use('/kalshi-trading', kalshiTradingRouter);
 router.use('/announcements', announcementsRouter);
+router.use('/proof', proofRouter);
 
 export default router;
