@@ -1457,6 +1457,294 @@ class PrivyService {
       throw error;
     }
   }
+
+  /**
+   * Get the Solana embedded wallet address for a user
+   * Similar to getEmbeddedWalletAddress but filters for Solana chain type
+   */
+  async getSolanaEmbeddedWalletAddress(userId: string): Promise<{ address: string; walletId: string } | null> {
+    try {
+      const user = await this.getUser(userId);
+      if (!user) return null;
+
+      const userAny = user as any;
+      let linkedAccounts: any[] = [];
+
+      if (Array.isArray(userAny?.linkedAccounts)) {
+        linkedAccounts = userAny.linkedAccounts;
+      } else if (Array.isArray(userAny?.linked_accounts)) {
+        linkedAccounts = userAny.linked_accounts;
+      } else if (Array.isArray(userAny?.wallets)) {
+        linkedAccounts = userAny.wallets;
+      }
+
+      if (!Array.isArray(linkedAccounts) || linkedAccounts.length === 0) {
+        return null;
+      }
+
+      // Find Solana embedded wallet: chain_type = solana AND walletClientType = privy
+      const solanaWallet = linkedAccounts.find((account: any) => {
+        const chainType = account?.chainType || account?.chain_type;
+        const walletClientType = account?.walletClientType || account?.wallet_client_type;
+        const type = account?.type || account?.account_type;
+        return chainType === 'solana' && (walletClientType === 'privy' || type === 'wallet');
+      });
+
+      if (solanaWallet) {
+        const address = solanaWallet.address || solanaWallet.wallet_address;
+        const walletId = solanaWallet.id || solanaWallet.walletId || solanaWallet.wallet_id;
+        if (address && walletId) {
+          return { address, walletId };
+        }
+        // If we have address but no ID, try to look it up
+        if (address) {
+          const lookedUpId = await this.getWalletIdByAddress(userId, address);
+          return { address, walletId: lookedUpId || '' };
+        }
+      }
+
+      return null;
+    } catch (error) {
+      logger.error({
+        message: 'Error getting Solana embedded wallet address',
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Create a Solana embedded wallet for a user
+   * Uses Privy SDK (same pattern as createEmbeddedWallet but with chain_type: 'solana')
+   *
+   * IMPORTANT: EVM wallet MUST be created before Solana wallet (Privy requirement)
+   */
+  private solanaWalletCreationLocks = new Map<string, Promise<{ address: string; walletId: string }>>();
+
+  async createSolanaEmbeddedWallet(userId: string): Promise<{ address: string; walletId: string }> {
+    if (!this.initialized) {
+      throw new Error('Privy service not initialized');
+    }
+
+    // Check for existing lock
+    const existingLock = this.solanaWalletCreationLocks.get(userId);
+    if (existingLock) {
+      logger.info({
+        message: 'Solana wallet creation already in progress, waiting for existing request',
+        userId,
+      });
+      return existingLock;
+    }
+
+    const creationPromise = (async (): Promise<{ address: string; walletId: string }> => {
+      try {
+        // Check if user already has a Solana embedded wallet
+        const existingWallet = await this.getSolanaEmbeddedWalletAddress(userId);
+        if (existingWallet && existingWallet.address) {
+          logger.info({
+            message: 'User already has Solana embedded wallet',
+            userId,
+            walletAddress: existingWallet.address,
+          });
+          return existingWallet;
+        }
+
+        // Use SDK if available
+        if (this.privyClient) {
+          try {
+            const walletsService = this.privyClient.wallets();
+
+            const createRequest: any = {
+              chain_type: 'solana',
+              owner: {
+                user_id: userId,
+              },
+            };
+
+            // Add app as additional signer (same signer ID as EVM wallet)
+            if (privyConfig.defaultSignerId) {
+              createRequest.additional_signers = [
+                {
+                  signer_id: privyConfig.defaultSignerId,
+                },
+              ];
+              logger.info({
+                message: 'Creating Solana wallet via SDK with app as additional signer',
+                userId,
+                signerId: privyConfig.defaultSignerId,
+              });
+            }
+
+            const wallet = await walletsService.create(createRequest);
+
+            if (!wallet || !wallet.address) {
+              throw new Error('Solana wallet creation returned invalid response');
+            }
+
+            logger.info({
+              message: 'Solana wallet created successfully via SDK',
+              userId,
+              walletAddress: wallet.address,
+              walletId: wallet.id,
+            });
+
+            return { address: wallet.address, walletId: wallet.id };
+          } catch (error: any) {
+            logger.warn({
+              message: 'SDK Solana wallet creation failed, falling back to REST API',
+              userId,
+              error: error.message,
+              status: error?.response?.status,
+            });
+          }
+        }
+
+        // Fallback to REST API
+        const requestBody: any = {
+          chain_type: 'solana',
+          owner: {
+            user_id: userId,
+          },
+        };
+
+        if (privyConfig.defaultSignerId) {
+          requestBody.additional_signers = [
+            {
+              signer_id: privyConfig.defaultSignerId,
+            },
+          ];
+        }
+
+        const response = await this.walletClient.post('/v1/wallets', requestBody);
+        const walletAddress = response.data?.address;
+        const walletId = response.data?.id;
+
+        if (!walletAddress) {
+          throw new Error('Solana wallet address not found in Privy response');
+        }
+
+        logger.info({
+          message: 'Solana wallet created successfully via REST API',
+          userId,
+          walletAddress,
+          walletId,
+        });
+
+        return { address: walletAddress, walletId: walletId || '' };
+      } catch (error) {
+        logger.error({
+          message: 'Error creating Solana wallet via Privy',
+          userId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+
+        if (axios.isAxiosError(error)) {
+          const status = error.response?.status;
+          const responseData = error.response?.data;
+
+          if (status === 409) {
+            // Wallet already exists — try to retrieve it
+            const existing = await this.getSolanaEmbeddedWalletAddress(userId);
+            if (existing) return existing;
+            throw new Error('Solana wallet already exists but could not be retrieved');
+          }
+
+          const errorMessage = responseData?.error || responseData?.message || error.message;
+          throw new Error(errorMessage || `Failed to create Solana wallet (HTTP ${status})`);
+        }
+
+        throw error;
+      } finally {
+        this.solanaWalletCreationLocks.delete(userId);
+      }
+    })();
+
+    this.solanaWalletCreationLocks.set(userId, creationPromise);
+    return creationPromise;
+  }
+
+  /**
+   * Sign and send a Solana transaction using the user's embedded Solana wallet
+   * Uses Privy server SDK with gas sponsorship
+   *
+   * @param walletId - The Privy wallet ID (not the address)
+   * @param base64Transaction - Base64-encoded serialized Solana transaction
+   * @returns Transaction hash
+   */
+  async signAndSendSolanaTransaction(
+    walletId: string,
+    base64Transaction: string
+  ): Promise<{ hash: string }> {
+    if (!this.initialized) {
+      throw new Error('Privy service not initialized');
+    }
+
+    if (!this.privyClient) {
+      throw new Error('PrivyClient SDK not initialized');
+    }
+
+    const authorizationContext = this.getAuthorizationContext();
+    if (!authorizationContext) {
+      throw new Error('Authorization private key not configured. Set PRIVY_AUTHORIZATION_PRIVATE_KEY.');
+    }
+
+    logger.info({
+      message: 'Signing and sending Solana transaction via Privy SDK',
+      walletId,
+      transactionLength: base64Transaction.length,
+    });
+
+    try {
+      const solanaWallets = this.privyClient.wallets().solana();
+
+      const response = await (solanaWallets as any).signAndSendTransaction(
+        walletId,
+        {
+          caip2: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', // Solana mainnet
+          transaction: base64Transaction,
+          sponsor: true, // Privy covers SOL gas fees
+          authorization_context: authorizationContext,
+        }
+      );
+
+      const txHash = (response as any)?.hash || (response as any)?.signature || (response as any)?.transactionHash;
+
+      if (!txHash) {
+        logger.error({
+          message: 'Solana transaction response missing hash',
+          walletId,
+          response,
+        });
+        throw new Error('Solana transaction response missing hash');
+      }
+
+      logger.info({
+        message: 'Solana transaction sent successfully via Privy SDK',
+        walletId,
+        txHash,
+        solscanUrl: `https://solscan.io/tx/${txHash}`,
+      });
+
+      return { hash: txHash };
+    } catch (error: any) {
+      logger.error({
+        message: 'Privy Solana signAndSendTransaction FAILED',
+        walletId,
+        error: error.message,
+        status: error?.response?.status,
+        responseData: error?.response?.data,
+        troubleshooting: [
+          'Check if gas sponsorship is enabled in Privy dashboard for Solana',
+          'Check if Solana (solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp) is enabled for sponsorship',
+          'Check if PRIVY_AUTHORIZATION_PRIVATE_KEY is correct',
+          'Verify the wallet exists and belongs to the user',
+          'Verify the transaction is a valid base64-encoded Solana transaction',
+        ],
+      });
+      throw error;
+    }
+  }
 }
 
 // Export singleton instance

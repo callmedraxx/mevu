@@ -29,7 +29,8 @@ export async function updateUserTradingRegion(
 
 export async function updateUserSolanaWallet(
   privyUserId: string,
-  solanaWalletAddress: string
+  solanaWalletAddress: string,
+  solanaWalletId?: string
 ): Promise<boolean> {
   const dbConfig = getDatabaseConfig();
   if (dbConfig.type !== 'postgres') return false;
@@ -37,9 +38,9 @@ export async function updateUserSolanaWallet(
   const client = await pool.connect();
   try {
     const result = await client.query(
-      `UPDATE users SET solana_wallet_address = $1, updated_at = CURRENT_TIMESTAMP
+      `UPDATE users SET solana_wallet_address = $1, solana_wallet_id = $3, updated_at = CURRENT_TIMESTAMP
        WHERE privy_user_id = $2`,
-      [solanaWalletAddress, privyUserId]
+      [solanaWalletAddress, privyUserId, solanaWalletId ?? null]
     );
     return (result.rowCount ?? 0) > 0;
   } finally {
@@ -80,6 +81,58 @@ export async function updateUserKalshiUsdcBalance(
       `UPDATE users SET kalshi_usdc_balance = $1, updated_at = CURRENT_TIMESTAMP
        WHERE privy_user_id = $2`,
       [balance, privyUserId]
+    );
+    return (result.rowCount ?? 0) > 0;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Add a deposit amount to the user's Kalshi USDC balance.
+ * Used when Solana deposits are detected via Alchemy webhook.
+ */
+export async function addToKalshiUsdcBalance(
+  privyUserId: string,
+  amountToAdd: string
+): Promise<boolean> {
+  const dbConfig = getDatabaseConfig();
+  if (dbConfig.type !== 'postgres') return false;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users SET
+         kalshi_usdc_balance = GREATEST(0, COALESCE(kalshi_usdc_balance, 0) + $1::numeric),
+         updated_at = CURRENT_TIMESTAMP
+       WHERE privy_user_id = $2`,
+      [amountToAdd, privyUserId]
+    );
+    return (result.rowCount ?? 0) > 0;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Subtract an amount from the user's Kalshi USDC balance.
+ * Used when: (1) outgoing USDC detected via Alchemy webhook, (2) Kalshi buy trade executed.
+ */
+export async function subtractFromKalshiUsdcBalance(
+  privyUserId: string,
+  amountToSubtract: string
+): Promise<boolean> {
+  const dbConfig = getDatabaseConfig();
+  if (dbConfig.type !== 'postgres') return false;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users SET
+         kalshi_usdc_balance = GREATEST(0, COALESCE(kalshi_usdc_balance, 0) - $1::numeric),
+         updated_at = CURRENT_TIMESTAMP
+       WHERE privy_user_id = $2`,
+      [amountToSubtract, privyUserId]
     );
     return (result.rowCount ?? 0) > 0;
   } finally {

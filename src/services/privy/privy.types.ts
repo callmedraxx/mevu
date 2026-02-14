@@ -77,6 +77,7 @@ export interface UserProfile {
   /** Kalshi/Solana fields (migration 039) */
   tradingRegion?: TradingRegion | null;
   solanaWalletAddress?: string | null;
+  solanaWalletId?: string | null;
   kalshiOnboardingCompleted?: boolean;
   kalshiUsdcBalance?: string;
 }

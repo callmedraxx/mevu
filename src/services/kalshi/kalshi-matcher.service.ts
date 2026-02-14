@@ -81,6 +81,53 @@ class KalshiMatcherService {
 
       const regularMatchCount = regularResult.rowCount || 0;
 
+      // Date tolerance fallback (±2 days): Polymarket and Kalshi sometimes use different dates
+      // for the same match. Applies to all sports with standard slug format (NBA, NHL, NFL, La Liga, EPL, CBB, etc.).
+      // Excludes special formats (Super Bowl, UFC, Tennis) which have their own matchers.
+      const dateToleranceResult = await client.query(`
+        WITH slug_parsed AS (
+          SELECT
+            lg.id,
+            lg.slug,
+            lg.sport,
+            LOWER(SPLIT_PART(lg.slug, '-', 2)) as slug_away_abbr,
+            LOWER(SPLIT_PART(lg.slug, '-', 3)) as slug_home_abbr,
+            (SPLIT_PART(lg.slug, '-', 4) || '-' ||
+             SPLIT_PART(lg.slug, '-', 5) || '-' ||
+             SPLIT_PART(lg.slug, '-', 6))::date as slug_date
+          FROM live_games lg
+          WHERE lg.slug ~ '^[a-z]+-[a-z0-9]+-[a-z0-9]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            AND lg.ended = false
+            AND (lg.closed IS NULL OR lg.closed = false)
+        ),
+        matches AS (
+          SELECT DISTINCT ON (k.ticker)
+            k.ticker,
+            sp.id as live_game_id
+          FROM kalshi_markets k
+          JOIN slug_parsed sp ON (
+            LOWER(k.sport) = LOWER(sp.sport)
+            AND k.game_date BETWEEN (sp.slug_date - 2) AND (sp.slug_date + 2)
+            AND LOWER(k.home_team_abbr) = sp.slug_home_abbr
+            AND LOWER(k.away_team_abbr) = sp.slug_away_abbr
+          )
+          WHERE k.live_game_id IS NULL
+            AND k.status IN ('active', 'open', 'unopened', 'initialized')
+            AND UPPER(k.ticker) NOT LIKE 'KXSB-%'
+            AND UPPER(k.ticker) NOT LIKE 'KXUFCFIGHT-%'
+            AND UPPER(k.ticker) NOT LIKE 'KXWTAMATCH-%'
+            AND UPPER(k.ticker) NOT LIKE 'KXATPMATCH-%'
+          ORDER BY k.ticker, ABS(EXTRACT(EPOCH FROM (k.game_date - sp.slug_date)))
+        )
+        UPDATE kalshi_markets k
+        SET live_game_id = m.live_game_id, updated_at = NOW()
+        FROM matches m
+        WHERE k.ticker = m.ticker
+        RETURNING k.ticker
+      `);
+
+      const dateToleranceCount = dateToleranceResult.rowCount || 0;
+
       // Match Super Bowl markets (KXSB-YY-TEAM format)
       // These are per-team markets, so match if the team is either home or away
       const sbResult = await client.query(`
@@ -269,13 +316,14 @@ class KalshiMatcherService {
           AND (UPPER(k.ticker) LIKE 'KXWTAMATCH-%' OR UPPER(k.ticker) LIKE 'KXATPMATCH-%')
       `);
 
-      const totalMatchCount = regularMatchCount + sbMatchCount + ufcMatchCount + tennisMatchCount;
+      const totalMatchCount = regularMatchCount + dateToleranceCount + sbMatchCount + ufcMatchCount + tennisMatchCount;
 
       if (totalMatchCount > 0) {
         logger.info({
           message: 'Kalshi markets matched to live games',
           matchedCount: totalMatchCount,
           regularMatches: regularMatchCount,
+          dateToleranceMatches: dateToleranceCount,
           superBowlMatches: sbMatchCount,
           ufcMatches: ufcMatchCount,
           tennisMatches: tennisMatchCount,

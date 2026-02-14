@@ -1243,6 +1243,56 @@ router.post('/complete-onboarding', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/users/create-solana-wallet - Create Solana wallet for existing users
+ * Used for existing users who registered before Solana wallet support was added
+ */
+router.post('/create-solana-wallet', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId } = req.body;
+    if (!privyUserId) {
+      return res.status(400).json({ success: false, error: 'Missing privyUserId' });
+    }
+
+    const user = await getUserByPrivyId(privyUserId);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    // Check if user already has a Solana wallet
+    if (user.solanaWalletAddress) {
+      return res.json({
+        success: true,
+        address: user.solanaWalletAddress,
+        walletId: user.solanaWalletId,
+        alreadyExists: true,
+      });
+    }
+
+    // Create Solana embedded wallet server-side via Privy
+    const { privyService } = await import('../services/privy/privy.service');
+    const result = await privyService.createSolanaEmbeddedWallet(privyUserId);
+
+    // Save to database
+    const { updateUserSolanaWallet } = await import('../services/privy/kalshi-user.service');
+    await updateUserSolanaWallet(privyUserId, result.address, result.walletId);
+
+    const { addSolanaAddressToWebhook } = await import('../services/alchemy/alchemy-solana-webhook-addresses');
+    addSolanaAddressToWebhook(result.address).catch(() => {});
+
+    return res.json({
+      success: true,
+      address: result.address,
+      walletId: result.walletId,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to create Solana wallet',
+    });
+  }
+});
+
+/**
  * POST /api/users/register-kalshi - US user registration (creates Solana wallet)
  */
 router.post('/register-kalshi', async (req: Request, res: Response) => {
@@ -1868,8 +1918,13 @@ router.post('/:privyUserId/deploy-proxy-wallet', async (req: Request, res: Respo
  *                   properties:
  *                     embeddedWalletAddress:
  *                       type: string
+ *                       description: Privy embedded EVM wallet
  *                     proxyWalletAddress:
  *                       type: string
+ *                       description: Polymarket proxy (Gnosis Safe); display when platform is polymarket
+ *                     solanaWalletAddress:
+ *                       type: string
+ *                       description: Solana wallet for Kalshi; display when platform is kalshi
  *                     hasApprovals:
  *                       type: boolean
  *       404:

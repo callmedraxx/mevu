@@ -37,10 +37,15 @@ export async function initializeUsersTable(): Promise<void> {
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
       
+      -- Add Solana wallet columns if missing (idempotent)
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS solana_wallet_address VARCHAR(64);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS solana_wallet_id VARCHAR(255);
+
       CREATE INDEX IF NOT EXISTS idx_users_privy_user_id ON users(privy_user_id);
       CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
       CREATE INDEX IF NOT EXISTS idx_users_embedded_wallet ON users(embedded_wallet_address);
       CREATE INDEX IF NOT EXISTS idx_users_proxy_wallet ON users(proxy_wallet_address);
+      CREATE INDEX IF NOT EXISTS idx_users_solana_wallet ON users(solana_wallet_address);
     `);
     
     logger.info({ message: 'Users table initialized successfully' });
@@ -155,7 +160,7 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
               proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
               ctf_approval_enabled, onboarding_completed, created_at, updated_at,
-              trading_region, solana_wallet_address, kalshi_onboarding_completed, kalshi_usdc_balance
+              trading_region, solana_wallet_address, solana_wallet_id, kalshi_onboarding_completed, kalshi_usdc_balance
        FROM users WHERE privy_user_id = $1`,
       [privyUserId]
     );
@@ -178,6 +183,7 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
     };
     if (row.trading_region != null) user.tradingRegion = row.trading_region;
     if (row.solana_wallet_address != null) user.solanaWalletAddress = row.solana_wallet_address;
+    if (row.solana_wallet_id != null) user.solanaWalletId = row.solana_wallet_id;
     if (row.kalshi_onboarding_completed != null) user.kalshiOnboardingCompleted = row.kalshi_onboarding_completed;
     if (row.kalshi_usdc_balance != null) user.kalshiUsdcBalance = String(row.kalshi_usdc_balance);
     return user;

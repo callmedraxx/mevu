@@ -461,6 +461,29 @@ export async function registerUserAndDeployWallet(
     walletId: walletId || 'not available',
   });
 
+  // Step 2B: Create Solana embedded wallet (for Kalshi trading)
+  // IMPORTANT: EVM wallet MUST be created before Solana wallet (Privy requirement)
+  let solanaWalletAddress: string | null = null;
+  let solanaWalletId: string | null = null;
+  try {
+    const solanaResult = await privyService.createSolanaEmbeddedWallet(privyUserId);
+    solanaWalletAddress = solanaResult.address;
+    solanaWalletId = solanaResult.walletId;
+    logger.info({
+      message: 'Solana embedded wallet created during registration',
+      privyUserId,
+      solanaWalletAddress,
+      solanaWalletId,
+    });
+  } catch (solanaError) {
+    // Non-critical — user can create Solana wallet later via /api/users/create-solana-wallet
+    logger.warn({
+      message: 'Failed to create Solana wallet during registration — can be retried later',
+      privyUserId,
+      error: solanaError instanceof Error ? solanaError.message : String(solanaError),
+    });
+  }
+
   // Step 3: Validate username
   const usernameAvailable = await isUsernameAvailable(username);
   if (!usernameAvailable) {
@@ -481,6 +504,24 @@ export async function registerUserAndDeployWallet(
     username: user.username,
     embeddedWalletAddress: user.embeddedWalletAddress,
   });
+
+  // Step 4B: Save Solana wallet address if created
+  if (solanaWalletAddress) {
+    try {
+      const { updateUserSolanaWallet } = await import('./kalshi-user.service');
+      await updateUserSolanaWallet(privyUserId, solanaWalletAddress, solanaWalletId || undefined);
+      user.solanaWalletAddress = solanaWalletAddress;
+      user.solanaWalletId = solanaWalletId;
+      const { addSolanaAddressToWebhook } = await import('../alchemy/alchemy-solana-webhook-addresses');
+      addSolanaAddressToWebhook(solanaWalletAddress).catch(() => {});
+    } catch (err) {
+      logger.warn({
+        message: 'Failed to save Solana wallet address to DB',
+        privyUserId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // Step 5: Add session signer to enable backend signing (before deploying proxy wallet)
   // NOTE: If wallet was just created, it may already have the session signer added during creation
@@ -1778,14 +1819,17 @@ export async function setupTokenApprovals(
 
 /**
  * Get user's wallet information
+ * Returns both Polymarket (proxy) and Kalshi (Solana) addresses so the frontend
+ * can display the appropriate one based on the poly/kalshi platform toggle.
  */
 export async function getUserWalletInfo(privyUserId: string): Promise<{
   embeddedWalletAddress: string;
   proxyWalletAddress: string | null;
+  solanaWalletAddress: string | null;
   hasApprovals: boolean;
 } | null> {
   const user = await getUserByPrivyId(privyUserId);
-  
+
   if (!user) {
     return null;
   }
@@ -1796,7 +1840,8 @@ export async function getUserWalletInfo(privyUserId: string): Promise<{
 
   return {
     embeddedWalletAddress: user.embeddedWalletAddress,
-    proxyWalletAddress: user.proxyWalletAddress,
+    proxyWalletAddress: user.proxyWalletAddress ?? null,
+    solanaWalletAddress: user.solanaWalletAddress ?? null,
     hasApprovals,
   };
 }

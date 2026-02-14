@@ -62,7 +62,7 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
     // CBB (NCAAB): half-by-half scores
     // Soccer: 1H/2H scores derived from goals
     const sport = game.sport?.toLowerCase() || '';
-    const supportedPeriodScoreSports = ['nba', 'nfl', 'cbb', 'ncaab', 'epl', 'lal', 'laliga', 'ser', 'seriea', 'bund', 'bundesliga', 'lig', 'ligue1'];
+    const supportedPeriodScoreSports = ['nba', 'nfl', 'nhl', 'cbb', 'ncaab', 'epl', 'lal', 'laliga', 'ser', 'seriea', 'bund', 'bundesliga', 'lig', 'ligue1', 'mwoh'];
     if (supportedPeriodScoreSports.includes(sport)) {
       try {
         const periodScores = await fetchPeriodScores(game);
@@ -78,12 +78,12 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
             }
           }
           stats.periodScores = convertedScores;
-          // logger.info({
-          //   message: 'Updated period scores from Ball Don\'t Lie',
-          //   gameId: game.id,
-          //   sport,
-          //   periodScores: convertedScores,
-          // });
+          logger.info({
+            message: 'Updated period scores from Ball Don\'t Lie',
+            gameId: game.id,
+            sport,
+            periodScoresKeys: Object.keys(convertedScores),
+          });
         }
       } catch (error) {
         logger.warn({

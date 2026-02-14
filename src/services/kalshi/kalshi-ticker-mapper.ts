@@ -172,7 +172,7 @@ export class KalshiTickerMapper {
         FROM kalshi_markets km
         LEFT JOIN live_games lg ON lg.id = km.live_game_id
         WHERE km.live_game_id IS NOT NULL
-          AND km.status IN ('open', 'unopened', 'active')
+          AND km.status IN ('open', 'unopened', 'active', 'initialized')
           AND km.close_ts > NOW() - INTERVAL '1 hour'
         ORDER BY km.game_date ASC
       `);

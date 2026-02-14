@@ -206,20 +206,22 @@ class KalshiActivityService {
           liquidity: '$0',
           outcomes: [
             {
-              // Away team = YES outcome
               label: awayAbbr || 'Away',
               price: market.yes_ask,
               probability: market.yes_ask,
               buyPrice: market.yes_ask,
               sellPrice: market.yes_bid,
+              kalshiTicker: market.ticker,
+              kalshiOutcome: 'YES' as const,
             },
             {
-              // Home team = NO outcome (inverted prices)
               label: homeAbbr || 'Home',
               price: market.no_ask ?? (100 - market.yes_bid),
               probability: market.no_ask ?? (100 - market.yes_bid),
               buyPrice: market.no_ask ?? (100 - market.yes_bid),
               sellPrice: market.no_bid ?? (100 - market.yes_ask),
+              kalshiTicker: market.ticker,
+              kalshiOutcome: 'NO' as const,
             },
           ],
         });
@@ -237,6 +239,8 @@ class KalshiActivityService {
             probability: m.yes_ask,
             buyPrice: m.yes_ask,
             sellPrice: m.yes_bid,
+            kalshiTicker: m.ticker,
+            kalshiOutcome: 'YES' as const,
           })),
         });
       }

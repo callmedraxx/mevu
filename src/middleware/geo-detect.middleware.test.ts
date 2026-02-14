@@ -36,10 +36,11 @@ describe('Geo Detect Middleware', () => {
   });
 
   describe('geoDetectMiddleware', () => {
-    it('should set userRegion from cf-ipcountry when present', () => {
+    it('should set userRegion and userCountryCode from cf-ipcountry when present', () => {
       mockReq.headers['cf-ipcountry'] = 'US';
       geoDetectMiddleware(mockReq, mockRes, mockNext);
       expect(mockReq.userRegion).toBe('us');
+      expect(mockReq.userCountryCode).toBe('US');
       expect(mockNext).toHaveBeenCalled();
     });
 
@@ -67,17 +68,30 @@ describe('Geo Detect Middleware', () => {
   });
 
   describe('requireKalshiRegion', () => {
-    it('should call next when userRegion is us', () => {
-      mockReq.userRegion = 'us';
+    it('should call next when GEO_ENFORCEMENT_ENABLED is false', () => {
+      vi.stubEnv('GEO_ENFORCEMENT_ENABLED', 'false');
+      mockReq.userRegion = 'international';
+      mockReq.userCountryCode = 'GB';
       requireKalshiRegion(mockReq, mockRes, mockNext);
       expect(mockNext).toHaveBeenCalled();
       expect(mockRes.status).not.toHaveBeenCalled();
     });
 
-    it('should return 403 when userRegion is international and enforcement enabled', () => {
-      const orig = process.env.GEO_ENFORCEMENT_ENABLED;
-      process.env.GEO_ENFORCEMENT_ENABLED = 'true';
+    it('should call next when userRegion is us (empty blocklist, backward compat)', () => {
+      vi.stubEnv('GEO_ENFORCEMENT_ENABLED', 'true');
+      vi.stubEnv('GEO_BLOCKLIST_COUNTRIES', '');
+      mockReq.userRegion = 'us';
+      mockReq.userCountryCode = 'US';
+      requireKalshiRegion(mockReq, mockRes, mockNext);
+      expect(mockNext).toHaveBeenCalled();
+      expect(mockRes.status).not.toHaveBeenCalled();
+    });
+
+    it('should return 403 when userRegion is international and blocklist empty (backward compat)', () => {
+      vi.stubEnv('GEO_ENFORCEMENT_ENABLED', 'true');
+      vi.stubEnv('GEO_BLOCKLIST_COUNTRIES', '');
       mockReq.userRegion = 'international';
+      mockReq.userCountryCode = 'GB';
       requireKalshiRegion(mockReq, mockRes, mockNext);
       expect(mockNext).not.toHaveBeenCalled();
       expect(mockRes.status).toHaveBeenCalledWith(403);
@@ -87,7 +101,57 @@ describe('Geo Detect Middleware', () => {
           error: expect.stringContaining('United States'),
         })
       );
-      process.env.GEO_ENFORCEMENT_ENABLED = orig;
+    });
+
+    it('should allow whitelisted user from blocked country', () => {
+      vi.stubEnv('GEO_ENFORCEMENT_ENABLED', 'true');
+      vi.stubEnv('GEO_BLOCKLIST_COUNTRIES', 'CN,RU');
+      vi.stubEnv('GEO_WHITELIST_PRIVY_IDS', 'did:privy:whitelisted-user');
+      mockReq.userRegion = 'international';
+      mockReq.userCountryCode = 'CN';
+      mockReq.query = { privyUserId: 'did:privy:whitelisted-user' };
+      requireKalshiRegion(mockReq, mockRes, mockNext);
+      expect(mockNext).toHaveBeenCalled();
+      expect(mockRes.status).not.toHaveBeenCalled();
+    });
+
+    it('should block non-whitelisted user from blocklisted country', () => {
+      vi.stubEnv('GEO_ENFORCEMENT_ENABLED', 'true');
+      vi.stubEnv('GEO_BLOCKLIST_COUNTRIES', 'CN,RU');
+      vi.stubEnv('GEO_WHITELIST_PRIVY_IDS', '');
+      mockReq.userRegion = 'international';
+      mockReq.userCountryCode = 'CN';
+      requireKalshiRegion(mockReq, mockRes, mockNext);
+      expect(mockNext).not.toHaveBeenCalled();
+      expect(mockRes.status).toHaveBeenCalledWith(403);
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          error: expect.stringContaining('not available'),
+          userCountryCode: 'CN',
+        })
+      );
+    });
+
+    it('should allow non-blocklisted country when blocklist is set', () => {
+      vi.stubEnv('GEO_ENFORCEMENT_ENABLED', 'true');
+      vi.stubEnv('GEO_BLOCKLIST_COUNTRIES', 'CN,RU');
+      mockReq.userRegion = 'us';
+      mockReq.userCountryCode = 'US';
+      requireKalshiRegion(mockReq, mockRes, mockNext);
+      expect(mockNext).toHaveBeenCalled();
+      expect(mockRes.status).not.toHaveBeenCalled();
+    });
+
+    it('should bypass geo for webhook paths', () => {
+      vi.stubEnv('GEO_ENFORCEMENT_ENABLED', 'true');
+      vi.stubEnv('GEO_BLOCKLIST_COUNTRIES', '');
+      mockReq.path = '/deposit/webhook';
+      mockReq.userRegion = 'international';
+      mockReq.userCountryCode = 'GB';
+      requireKalshiRegion(mockReq, mockRes, mockNext);
+      expect(mockNext).toHaveBeenCalled();
+      expect(mockRes.status).not.toHaveBeenCalled();
     });
   });
 });

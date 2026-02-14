@@ -360,6 +360,7 @@ export class KalshiPriceUpdateService extends EventEmitter {
       'LVA': 'LAT',   // Latvia
       'DNK': 'DEN',   // Denmark
       'SVN': 'SLO',   // Slovenia
+      'SVK': 'SLO',   // Slovakia (our slug uses "slo")
     };
     
     return KALSHI_TO_SLUG[upperAbbr] || upperAbbr;

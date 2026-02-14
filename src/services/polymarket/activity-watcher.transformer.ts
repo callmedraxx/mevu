@@ -10,8 +10,11 @@ export interface ActivityWatcherOutcome {
   probability: number;
   buyPrice?: number; // Best ask price for buying this outcome
   sellPrice?: number; // Best bid price for selling this outcome
-  // Trading fields
+  // Trading fields (Polymarket)
   clobTokenId?: string; // Required for executing trades
+  // Trading fields (Kalshi)
+  kalshiTicker?: string; // Kalshi market ticker for this outcome
+  kalshiOutcome?: 'YES' | 'NO'; // Kalshi side for this outcome
 }
 
 export interface ActivityWatcherMarket {

@@ -6,6 +6,10 @@
 import { Router, Request, Response } from 'express';
 import { logger } from '../config/logger';
 import { alchemyWebhookService } from '../services/alchemy/alchemy-webhook.service';
+import {
+  processSolanaWebhook,
+  verifySolanaWebhookSignature,
+} from '../services/alchemy/alchemy-solana-webhook.service';
 
 const router = Router();
 
@@ -102,6 +106,46 @@ router.post('/alchemy', async (req: Request, res: Response) => {
     });
 
     // Still return 200 to prevent Alchemy from retrying
+    res.status(200).json({ success: false, error: 'Processing error' });
+  }
+});
+
+/**
+ * @swagger
+ * /api/webhooks/alchemy-solana:
+ *   post:
+ *     summary: Receive Alchemy Solana Address Activity webhook
+ *     description: Tracks USDC deposits to user Solana wallets for Kalshi balance updates
+ *     tags: [Webhooks]
+ *     responses:
+ *       200:
+ *         description: Webhook processed
+ */
+router.post('/alchemy-solana', async (req: Request, res: Response) => {
+  try {
+    const rawBody = JSON.stringify(req.body);
+    const signature = req.headers['x-alchemy-signature'] as string;
+
+    if (signature && !verifySolanaWebhookSignature(rawBody, signature)) {
+      logger.warn({ message: 'Invalid Alchemy Solana webhook signature' });
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    res.status(200).json({ success: true, message: 'Webhook received' });
+
+    try {
+      await processSolanaWebhook(req.body);
+    } catch (processError) {
+      logger.error({
+        message: 'Error processing Alchemy Solana webhook',
+        error: processError instanceof Error ? processError.message : String(processError),
+      });
+    }
+  } catch (error) {
+    logger.error({
+      message: 'Error handling Alchemy Solana webhook',
+      error: error instanceof Error ? error.message : String(error),
+    });
     res.status(200).json({ success: false, error: 'Processing error' });
   }
 });
@@ -205,6 +249,31 @@ router.get('/alchemy/status', async (req: Request, res: Response) => {
     webhookConfigured: !!process.env.ALCHEMY_WEBHOOK_ID || !!process.env.ALCHEMY_WEBHOOK_URL,
     authTokenConfigured: !!process.env.ALCHEMY_AUTH_TOKEN,
     signingKeyConfigured: !!process.env.ALCHEMY_SIGNING_KEY,
+    webhookUrl: process.env.ALCHEMY_WEBHOOK_URL || null,
+  });
+});
+
+/**
+ * @swagger
+ * /api/webhooks/alchemy-solana/status:
+ *   get:
+ *     summary: Get Alchemy Solana webhook status
+ *     tags: [Webhooks]
+ *     responses:
+ *       200:
+ *         description: Solana webhook service status
+ */
+router.get('/alchemy-solana/status', async (req: Request, res: Response) => {
+  const webhookUrl = process.env.ALCHEMY_SOLANA_WEBHOOK_URL || null;
+  res.json({
+    success: true,
+    webhookConfigured: !!process.env.ALCHEMY_SOLANA_WEBHOOK_ID || !!webhookUrl,
+    webhookUrl,
+    webhookIdConfigured: !!process.env.ALCHEMY_SOLANA_WEBHOOK_ID,
+    authTokenConfigured: !!process.env.ALCHEMY_AUTH_TOKEN,
+    signingKeyConfigured: !!(
+      process.env.ALCHEMY_SOLANA_SIGNING_KEY || process.env.ALCHEMY_SIGNING_KEY
+    ),
   });
 });
 

@@ -1872,6 +1872,11 @@ export interface PeriodScores {
   ot1?: { home: number | null; away: number | null };
   ot2?: { home: number | null; away: number | null };
   ot3?: { home: number | null; away: number | null };
+  // NHL periods
+  p1?: { home: number | null; away: number | null };
+  p2?: { home: number | null; away: number | null };
+  p3?: { home: number | null; away: number | null };
+  ot?: { home: number | null; away: number | null };
   // NCAAB halves
   h1?: { home: number | null; away: number | null };
   h2?: { home: number | null; away: number | null };
@@ -1897,20 +1902,33 @@ export async function fetchPeriodScores(game: any): Promise<PeriodScores | null>
   const apiKey = getApiKey();
   const sport = game.sport?.toLowerCase();
   const bdSport = getBalldontlieSport(sport || '');
-  
+
   // Supported sports for period scores
-  const supportedSports = ['nba', 'nfl', 'ncaab', 'epl', 'laliga', 'bundesliga', 'seriea', 'ligue1'];
+  const supportedSports = ['nba', 'nfl', 'nhl', 'ncaab', 'epl', 'laliga', 'bundesliga', 'seriea', 'ligue1'];
   if (!bdSport || !supportedSports.includes(bdSport)) {
-    // logger.debug({
-    //   message: 'Period scores not available for sport',
-    //   sport,
-    //   note: 'Period scores supported for: NBA, NFL, NCAAB, EPL, La Liga, Bundesliga, Serie A, Ligue 1',
-    // });
+    logger.debug({
+      message: 'Period scores not available for sport',
+      sport,
+      bdSport,
+      gameId: game.id,
+    });
     return null;
   }
-  
+
   // Get Ball Don't Lie game ID
   let balldontlieGameId = game.balldontlie_game_id;
+
+  // Validate stored game ID (IDs <= 1 are invalid placeholders)
+  if (balldontlieGameId && balldontlieGameId <= 1) {
+    logger.warn({
+      message: 'Invalid Ball Don\'t Lie game ID in fetchPeriodScores, will attempt to remap',
+      gameId: game.id,
+      storedGameId: balldontlieGameId,
+      sport,
+    });
+    balldontlieGameId = null;
+  }
+
   if (!balldontlieGameId) {
     balldontlieGameId = await findAndMapBalldontlieGameId(game);
     if (!balldontlieGameId) {
@@ -1922,37 +1940,39 @@ export async function fetchPeriodScores(game: any): Promise<PeriodScores | null>
       return null;
     }
   }
-  
+
   try {
     // Soccer leagues use goals/events endpoint to derive 1H/2H scores
     if (isSoccerSport(bdSport)) {
       return await fetchSoccerPeriodScores(game, bdSport, balldontlieGameId, apiKey);
     }
-    
-    // Determine API endpoint based on sport (NBA/NFL/NCAAB)
+
+    // Determine API endpoint based on sport
     let endpoint: string;
     if (bdSport === 'nba') {
       endpoint = `https://api.balldontlie.io/v1/games/${balldontlieGameId}`;
     } else if (bdSport === 'ncaab') {
       endpoint = `https://api.balldontlie.io/ncaab/v1/games/${balldontlieGameId}`;
+    } else if (bdSport === 'nhl') {
+      endpoint = `https://api.balldontlie.io/nhl/v1/games/${balldontlieGameId}`;
     } else {
       endpoint = `https://api.balldontlie.io/nfl/v1/games/${balldontlieGameId}`;
     }
-    
-    // logger.info({
-    //   message: 'Fetching period scores from Ball Don\'t Lie',
-    //   gameId: game.id,
-    //   balldontlieGameId,
-    //   sport: bdSport,
-    //   endpoint,
-    // });
-    
+
+    logger.info({
+      message: 'Fetching period scores from Ball Don\'t Lie',
+      gameId: game.id,
+      balldontlieGameId,
+      sport: bdSport,
+      endpoint,
+    });
+
     const response = await axios.get(endpoint, {
       headers: { 'Authorization': apiKey },
     });
-    
+
     const gameData = response.data?.data || response.data;
-    
+
     if (!gameData) {
       logger.warn({
         message: 'No game data returned for period scores',
@@ -2054,22 +2074,55 @@ export async function fetchPeriodScores(game: any): Promise<PeriodScores | null>
           away: gameData.away_score ?? null,
         },
       };
+    } else if (bdSport === 'nhl') {
+      // NHL uses periods: home_p1, home_p2, home_p3, home_ot, visitor_p1, etc.
+      // Also check for home_team_p1/visitor_team_p1 format
+      periodScores = {
+        p1: {
+          home: gameData.home_p1 ?? gameData.home_team_p1 ?? null,
+          away: gameData.visitor_p1 ?? gameData.visitor_team_p1 ?? null
+        },
+        p2: {
+          home: gameData.home_p2 ?? gameData.home_team_p2 ?? null,
+          away: gameData.visitor_p2 ?? gameData.visitor_team_p2 ?? null
+        },
+        p3: {
+          home: gameData.home_p3 ?? gameData.home_team_p3 ?? null,
+          away: gameData.visitor_p3 ?? gameData.visitor_team_p3 ?? null
+        },
+        // Overtime
+        ot: gameData.home_ot != null || gameData.visitor_ot != null || gameData.home_team_ot != null || gameData.visitor_team_ot != null
+          ? {
+              home: gameData.home_ot ?? gameData.home_team_ot ?? null,
+              away: gameData.visitor_ot ?? gameData.visitor_team_ot ?? null
+            }
+          : undefined,
+        // Final score
+        ft: {
+          home: gameData.home_team_score ?? null,
+          away: gameData.visitor_team_score ?? null,
+        },
+        vft: {
+          home: gameData.home_team_score ?? null,
+          away: gameData.visitor_team_score ?? null,
+        },
+      };
     }
-    
+
     // Remove undefined keys
     Object.keys(periodScores).forEach(key => {
       if (periodScores[key as keyof PeriodScores] === undefined) {
         delete periodScores[key as keyof PeriodScores];
       }
     });
-    
-    // logger.info({
-    //   message: 'Period scores fetched successfully',
-    //   gameId: game.id,
-    //   sport: bdSport,
-    //   periodScores,
-    // });
-    
+
+    logger.info({
+      message: 'Period scores fetched successfully',
+      gameId: game.id,
+      sport: bdSport,
+      periodScores,
+    });
+
     return periodScores;
     
   } catch (error: any) {

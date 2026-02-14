@@ -37,6 +37,9 @@ export async function createSolanaWallet(
 
     await updateUserSolanaWallet(privyUserId, wallet.address);
 
+    const { addSolanaAddressToWebhook } = await import('../alchemy/alchemy-solana-webhook-addresses');
+    addSolanaAddressToWebhook(wallet.address).catch(() => {});
+
     logger.info({
       message: 'Solana wallet created',
       privyUserId,

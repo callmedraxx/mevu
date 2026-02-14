@@ -80,7 +80,12 @@ class KalshiService {
       }
 
       // Trigger matching (database-driven)
-      await kalshiMatcherService.matchAllUnmatched();
+      const matchCount = await kalshiMatcherService.matchAllUnmatched();
+
+      // Backfill Kalshi prices to frontend_games for newly matched games (avoids waiting for next games refresh)
+      if (matchCount > 0) {
+        await this.backfillKalshiPricesToFrontendGames();
+      }
 
       this.lastRefreshTime = new Date();
       this.lastRefreshCount = transformed.length;
@@ -249,9 +254,28 @@ class KalshiService {
       'LVA': 'LAT',  // Latvia
       'DNK': 'DEN',  // Denmark
       'SVN': 'SLO',  // Slovenia
+      'SVK': 'SLO',  // Slovakia (ISO 3166-1 alpha-3; our slug uses "slo")
     };
 
-    return NHL_ABBR_MAP[upperAbbr] || MWOH_ABBR_MAP[upperAbbr] || upperAbbr;
+    // La Liga (lal): Kalshi uses different codes than our slugs
+    // Mappings derived from Kalshi API (e.g. KXLALIGAGAME-26FEB21ATMESP, KXLALIGAGAME-26FEB15RVCATM)
+    const LAL_ABBR_MAP: Record<string, string> = {
+      'RCC': 'CEL',  'ATM': 'MAD',  'RMA': 'REA',  'RVC': 'RAY',
+      'RBB': 'BET',  'ATH': 'BIL',  'VCF': 'VAL',
+    };
+
+    // EPL (English Premier League): Kalshi uses different codes than our slugs
+    // Mappings from Kalshi API (e.g. KXEPLGAME-26FEB21WHUBOU, KXEPLGAME-26FEB22NFOLFC)
+    const EPL_ABBR_MAP: Record<string, string> = {
+      'CFC': 'CHE',  // Chelsea FC (Kalshi: CFC, we: che)
+      'NFO': 'NOT',  // Nottingham Forest (Kalshi: NFO, we: not)
+      'MCI': 'MAC',  // Manchester City (Kalshi: MCI, we: mac)
+      'LFC': 'LIV',  // Liverpool FC (Kalshi: LFC, we: liv)
+      'WHU': 'WES',  // West Ham United (Kalshi: WHU, we: wes)
+      'AVL': 'AST',  // Aston Villa (Kalshi: AVL, we: ast)
+    };
+
+    return NHL_ABBR_MAP[upperAbbr] || MWOH_ABBR_MAP[upperAbbr] || LAL_ABBR_MAP[upperAbbr] || EPL_ABBR_MAP[upperAbbr] || upperAbbr;
   }
 
   /**
@@ -508,6 +532,7 @@ class KalshiService {
       // Fetch moneyline markets for each game, including live game slug for team matching
       // - Regular games: KXNBAGAME, KXNFLGAME, etc. (ticker contains 'GAME-')
       // - Super Bowl: KXSB-YY-TEAM format
+      // - Single-market (UFC, tennis, mwoh): one market per game, YES=away wins, NO=home wins
       // Exclude TIE outcomes
       const result = await client.query(
         `
@@ -524,10 +549,14 @@ class KalshiService {
         FROM kalshi_markets km
         JOIN live_games lg ON km.live_game_id = lg.id
         WHERE km.live_game_id = ANY($1::text[])
-          AND km.status = 'active'
+          AND km.status IN ('active', 'open', 'unopened', 'initialized')
           AND (
             (UPPER(km.ticker) LIKE '%GAME-%' AND UPPER(km.ticker) NOT LIKE '%-TIE')
             OR UPPER(km.ticker) LIKE 'KXSB-%'
+            OR UPPER(km.ticker) LIKE 'KXUFCFIGHT-%'
+            OR UPPER(km.ticker) LIKE 'KXATPMATCH-%'
+            OR UPPER(km.ticker) LIKE 'KXWTAMATCH-%'
+            OR UPPER(km.ticker) LIKE 'KXWOMHOCKEY-%'
           )
         ORDER BY km.live_game_id, km.ticker
         `,
@@ -561,12 +590,20 @@ class KalshiService {
         // Match based on the normalized team abbreviations stored in the database
         let awayMarket = null;
         let homeMarket = null;
-        
+        // Single-market sports (UFC, tennis): one market per game, YES=away wins, NO=home wins
+        // Note: KXWOMHOCKEY has per-team markets (e.g. KXWOMHOCKEY-26FEB14SWESVK-SWE, -SVK) like NBA
+        let singleMarket = null;
+        const SINGLE_MARKET_PREFIXES = ['KXUFCFIGHT-', 'KXATPMATCH-', 'KXWTAMATCH-'];
+
         for (const market of markets) {
           const tickerUpper = market.ticker.toUpperCase();
-          const marketAwayAbbr = market.away_team_abbr?.toUpperCase(); // Normalized: LAK
-          const marketHomeAbbr = market.home_team_abbr?.toUpperCase(); // Normalized: LAS
-          
+
+          // For single-market sports (no -TEAM suffix), use YES/NO for away/home directly
+          if (SINGLE_MARKET_PREFIXES.some(p => tickerUpper.startsWith(p))) {
+            singleMarket = market;
+            break;
+          }
+
           // For Super Bowl (KXSB-YY-TEAM), match based on the team in the ticker vs game teams
           if (tickerUpper.startsWith('KXSB-')) {
             const sbMatch = tickerUpper.match(/KXSB-\d{2}-([A-Z]{2,4})$/);
@@ -600,14 +637,20 @@ class KalshiService {
         }
 
         // Build combined price data
-        // yesBid/yesAsk = away team win prices (from away market's YES)
-        // noBid/noAsk = home team win prices (from home market's YES)
-        if (awayMarket || homeMarket) {
+        // Single-market: YES = away wins, NO = home wins
+        if (singleMarket) {
           map.set(gameId, {
-            // Away team prices (YES from away team's market)
+            yesBid: singleMarket.yes_bid ?? 0,
+            yesAsk: singleMarket.yes_ask ?? 0,
+            noBid: singleMarket.no_bid ?? 0,
+            noAsk: singleMarket.no_ask ?? 0,
+            ticker: singleMarket.ticker || '',
+          });
+        } else if (awayMarket || homeMarket) {
+          // Multi-market: yesBid/yesAsk = away (from away market's YES), noBid/noAsk = home (from home market's YES)
+          map.set(gameId, {
             yesBid: awayMarket?.yes_bid ?? 0,
             yesAsk: awayMarket?.yes_ask ?? 0,
-            // Home team prices (YES from home team's market, stored as NO to match interface)
             noBid: homeMarket?.yes_bid ?? 0,
             noAsk: homeMarket?.yes_ask ?? 0,
             ticker: awayMarket?.ticker || homeMarket?.ticker || '',
@@ -616,6 +659,97 @@ class KalshiService {
       }
 
       return map;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Backfill Kalshi prices to frontend_games for games that have matched kalshi_markets
+   * but missing prices in frontend_data. Runs after matcher to avoid waiting for next games refresh.
+   */
+  private async backfillKalshiPricesToFrontendGames(): Promise<void> {
+    const nodeEnv = process.env.NODE_ENV || 'development';
+    if (nodeEnv !== 'production') return;
+
+    const client = await connectWithRetry();
+    try {
+      const idsResult = await client.query(
+        `
+        SELECT DISTINCT fg.id
+        FROM frontend_games fg
+        JOIN kalshi_markets km ON km.live_game_id = fg.id
+        WHERE (fg.frontend_data->'awayTeam'->>'kalshiBuyPrice') IS NULL
+          AND km.status IN ('active', 'open', 'unopened', 'initialized')
+          AND (
+            (UPPER(km.ticker) LIKE '%GAME-%' AND UPPER(km.ticker) NOT LIKE '%-TIE')
+            OR UPPER(km.ticker) LIKE 'KXSB-%'
+            OR UPPER(km.ticker) LIKE 'KXUFCFIGHT-%'
+            OR UPPER(km.ticker) LIKE 'KXATPMATCH-%'
+            OR UPPER(km.ticker) LIKE 'KXWTAMATCH-%'
+            OR UPPER(km.ticker) LIKE 'KXWOMHOCKEY-%'
+          )
+        `
+      );
+      const gameIds = idsResult.rows.map((r: { id: string }) => r.id);
+      if (gameIds.length === 0) return;
+
+      const pricesMap = await this.getKalshiPricesForGames(gameIds);
+      const updates: Array<{ id: string; awayBuy: number; awaySell: number; homeBuy: number; homeSell: number }> = [];
+
+      for (const gameId of gameIds) {
+        const prices = pricesMap.get(gameId);
+        if (prices && (prices.yesAsk > 0 || prices.noAsk > 0)) {
+          updates.push({
+            id: gameId,
+            awayBuy: prices.yesAsk,
+            awaySell: prices.yesBid,
+            homeBuy: prices.noAsk,
+            homeSell: prices.noBid,
+          });
+        }
+      }
+
+      if (updates.length === 0) return;
+
+      const placeholders = updates.map(
+        (_, i) =>
+          `($${i * 5 + 1}::text, $${i * 5 + 2}::int, $${i * 5 + 3}::int, $${i * 5 + 4}::int, $${i * 5 + 5}::int)`
+      );
+      const values = updates.flatMap((u) => [u.id, u.awayBuy, u.awaySell, u.homeBuy, u.homeSell]);
+
+      await client.query(
+        `
+        UPDATE frontend_games fg
+        SET frontend_data = jsonb_set(
+              jsonb_set(
+                jsonb_set(
+                  jsonb_set(
+                    fg.frontend_data,
+                    '{awayTeam,kalshiBuyPrice}', to_jsonb(u.away_buy)
+                  ),
+                  '{awayTeam,kalshiSellPrice}', to_jsonb(u.away_sell)
+                ),
+                '{homeTeam,kalshiBuyPrice}', to_jsonb(u.home_buy)
+              ),
+              '{homeTeam,kalshiSellPrice}', to_jsonb(u.home_sell)
+            ),
+            updated_at = NOW()
+        FROM (VALUES ${placeholders.join(', ')}) AS u(id, away_buy, away_sell, home_buy, home_sell)
+        WHERE fg.id = u.id
+        `,
+        values
+      );
+
+      logger.info({
+        message: 'Backfilled Kalshi prices to frontend_games',
+        gameCount: updates.length,
+      });
+    } catch (error) {
+      logger.warn({
+        message: 'Error backfilling Kalshi prices to frontend_games',
+        error: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       client.release();
     }
@@ -659,7 +793,7 @@ class KalshiService {
         FROM kalshi_markets km
         JOIN live_games lg ON km.live_game_id = lg.id
         WHERE LOWER(lg.slug) = LOWER($1)
-          AND km.status = 'active'
+          AND km.status IN ('active', 'open', 'unopened', 'initialized')
           AND (
             (UPPER(km.ticker) LIKE '%GAME-%' AND UPPER(km.ticker) NOT LIKE '%-TIE')
             OR UPPER(km.ticker) LIKE 'KXSB-%'
@@ -680,10 +814,10 @@ class KalshiService {
       // Find away and home team markets
       let awayMarket = null;
       let homeMarket = null;
-      // Single-market sports (UFC, tennis, mwoh): one market per game
-      // YES = first-listed (away) team wins, NO = second-listed (home) team wins
+      // Single-market sports (UFC, tennis): one market per game, YES=away NO=home
+      // KXWOMHOCKEY has per-team markets (-SWE, -SVK) like NBA - use ticker suffix matching
       let singleMarket = null;
-      const SINGLE_MARKET_PREFIXES = ['KXUFCFIGHT-', 'KXATPMATCH-', 'KXWTAMATCH-', 'KXWOMHOCKEY-'];
+      const SINGLE_MARKET_PREFIXES = ['KXUFCFIGHT-', 'KXATPMATCH-', 'KXWTAMATCH-'];
 
       for (const market of result.rows) {
         const tickerUpper = market.ticker.toUpperCase();
