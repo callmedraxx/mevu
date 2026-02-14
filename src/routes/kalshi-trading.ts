@@ -9,7 +9,6 @@ import { geoDetectMiddleware, requireKalshiRegion } from '../middleware/geo-dete
 import { executeKalshiBuy, executeKalshiSell } from '../services/kalshi/kalshi-trading.service';
 import { redeemKalshiPosition, getRedeemablePositions } from '../services/kalshi/kalshi-redemption.service';
 import { getUserByPrivyId } from '../services/privy/user.service';
-import { createOnrampSession } from '../services/onramp/onramp.service';
 import { handleOnrampWebhook } from '../services/onramp/onramp-webhook.service';
 import { subscribeToKalshiUserBroadcast } from '../services/redis-cluster-broadcast.service';
 import { pool, getDatabaseConfig } from '../config/database';
@@ -211,14 +210,12 @@ router.get('/balance/stream', async (req: Request, res: Response) => {
   }
 });
 
-router.post('/deposit/onramp', async (req: Request, res: Response) => {
-  const privyUserId = req.body.privyUserId as string;
-  if (!privyUserId) return res.status(400).json({ success: false, error: 'Missing privyUserId' });
-  const user = await getUserByPrivyId(privyUserId);
-  const solanaWallet = (user as any)?.solanaWalletAddress;
-  if (!solanaWallet) return res.status(400).json({ success: false, error: 'User has no Solana wallet' });
-  const result = await createOnrampSession(solanaWallet, privyUserId);
-  return res.json({ success: true, ...result });
+/** Onramp disabled - Kalshi deposits use Privy MoonPay or crypto (send USDC to Solana address) */
+router.post('/deposit/onramp', async (_req: Request, res: Response) => {
+  return res.status(503).json({
+    success: false,
+    error: 'Onramp disabled. Use crypto deposit (send USDC to your Solana address) or Privy MoonPay.',
+  });
 });
 
 router.post('/deposit/webhook', async (req: Request, res: Response) => {

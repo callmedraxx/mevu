@@ -11,7 +11,6 @@ vi.stubEnv('KALSHI_TRADING_ENABLED', 'false');
 vi.mock('../services/privy/user.service', () => ({ getUserByPrivyId: vi.fn() }));
 vi.mock('../services/kalshi/kalshi-trading.service', () => ({ executeKalshiBuy: vi.fn(), executeKalshiSell: vi.fn() }));
 vi.mock('../services/kalshi/kalshi-redemption.service', () => ({ redeemKalshiPosition: vi.fn(), getRedeemablePositions: vi.fn().mockResolvedValue([]) }));
-vi.mock('../services/onramp/onramp.service', () => ({ createOnrampSession: vi.fn().mockResolvedValue({ provider: 'moonpay', widgetUrl: 'https://buy.moonpay.com' }) }));
 vi.mock('../services/onramp/onramp-webhook.service', () => ({ handleOnrampWebhook: vi.fn().mockResolvedValue({ success: true }) }));
 
 let kalshiTradingRouter: import('express').Router;
@@ -56,17 +55,9 @@ describe('Kalshi Trading Routes', () => {
     expect(res.body.error).toContain('disabled');
   });
 
-  it('POST /deposit/onramp returns 400 when privyUserId missing', async () => {
-    const res = await request(appWithRouter()).post('/api/kalshi-trading/deposit/onramp').send({}).expect(400);
+  it('POST /deposit/onramp returns 503 when onramp disabled', async () => {
+    const res = await request(appWithRouter()).post('/api/kalshi-trading/deposit/onramp').send({ privyUserId: 'did:privy:u1' }).expect(503);
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toContain('privyUserId');
-  });
-
-  it('POST /deposit/onramp returns widget when user has Solana wallet', async () => {
-    const { getUserByPrivyId } = await import('../services/privy/user.service');
-    vi.mocked(getUserByPrivyId).mockResolvedValue({ solanaWalletAddress: '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs' } as never);
-    const res = await request(appWithRouter()).post('/api/kalshi-trading/deposit/onramp').send({ privyUserId: 'did:privy:u1' }).expect(200);
-    expect(res.body.success).toBe(true);
-    expect(res.body.widgetUrl).toBeDefined();
+    expect(res.body.error).toContain('disabled');
   });
 });

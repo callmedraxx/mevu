@@ -19,6 +19,7 @@ import whaleProfileRouter from './whale-profile';
 import referralRouter from './referral';
 import oceanRouter from './ocean';
 import kalshiTradingRouter from './kalshi-trading';
+import announcementsRouter from './announcements';
 
 const router = Router();
 
@@ -103,5 +104,6 @@ router.use('/referral', referralRouter);
 // Ocean routes (whale trades aggregation)
 router.use('/ocean', oceanRouter);
 router.use('/kalshi-trading', kalshiTradingRouter);
+router.use('/announcements', announcementsRouter);
 
 export default router;

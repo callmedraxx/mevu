@@ -23,9 +23,13 @@ export async function createOnrampSession(
 ): Promise<OnrampSessionResult> {
   if (!ONRAMP_API_KEY) {
     logger.warn({ message: 'Onramp API key not configured' });
+    const params = new URLSearchParams({
+      walletAddress: solanaWalletAddress,
+      defaultCurrencyCode: 'usdc_sol', // USDC on Solana - pre-select for Kalshi deposits
+    });
     return {
       provider: ONRAMP_PROVIDER,
-      widgetUrl: `https://www.moonpay.com/buy/usdc_sol?walletAddress=${solanaWalletAddress}`,
+      widgetUrl: `https://www.moonpay.com/buy/usdc?${params.toString()}`,
     };
   }
 
@@ -55,9 +59,13 @@ export async function createOnrampSession(
       };
     }
     default:
+      const params = new URLSearchParams({
+        walletAddress: solanaWalletAddress,
+        defaultCurrencyCode: 'usdc_sol',
+      });
       return {
         provider: ONRAMP_PROVIDER,
-        widgetUrl: `https://www.moonpay.com/buy/usdc_sol?walletAddress=${solanaWalletAddress}`,
+        widgetUrl: `https://www.moonpay.com/buy/usdc?${params.toString()}`,
       };
   }
 }
