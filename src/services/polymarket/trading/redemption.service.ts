@@ -1,10 +1,26 @@
 /**
  * Redemption Service
- * Handles redeeming winning positions on Polymarket via RelayerClient
+ * Handles redeeming winning positions on Polymarket
  * Supports both standard and negative risk markets
+ *
+ * Uses on-chain Safe nonce instead of relayer's /nonce endpoint to avoid
+ * nonce desync issues (relayer increments nonce on failed txs, on-chain doesn't).
  */
 
-import { encodeFunctionData } from 'viem';
+import {
+  encodeFunctionData,
+  hashTypedData,
+  toBytes,
+  encodePacked,
+  hexToBigInt,
+  zeroAddress,
+  getCreate2Address,
+  keccak256,
+  encodeAbiParameters,
+  createPublicClient,
+  http,
+} from 'viem';
+import { polygon } from 'viem/chains';
 import { pool } from '../../../config/database';
 import { logger } from '../../../config/logger';
 import { getUserByPrivyId } from '../../privy/user.service';
@@ -12,11 +28,25 @@ import { privyConfig } from '../../privy/privy.config';
 import { saveTradeRecord, updateTradeRecordById } from './trades-history.service';
 import { refreshAndUpdateBalance } from '../../alchemy/balance.service';
 import { refreshPositions } from '../../positions/positions.service';
+import axios from 'axios';
 
 // Contract addresses
 const CTF_CONTRACT_ADDRESS = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045';
 const NEG_RISK_ADAPTER_ADDRESS = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
 const USDC_CONTRACT_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+
+// Safe infrastructure constants (from @polymarket/builder-relayer-client)
+const SAFE_FACTORY = '0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b' as `0x${string}`;
+const SAFE_INIT_CODE_HASH = '0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf' as `0x${string}`;
+
+// Safe nonce ABI
+const SAFE_NONCE_ABI = [{
+  name: 'nonce',
+  type: 'function',
+  stateMutability: 'view',
+  inputs: [] as const,
+  outputs: [{ name: '', type: 'uint256' }],
+}] as const;
 
 // Parent collection ID is always null (0x00...00) for Polymarket binary markets
 const PARENT_COLLECTION_ID = '0x0000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`;
@@ -38,20 +68,19 @@ const REDEEM_POSITIONS_ABI = [{
 }] as const;
 
 // Neg Risk Adapter redeemPositions ABI (negative risk markets)
-// The adapter wraps CTF redemption with negative risk handling
+// Per SDK: only conditionId + amounts (no indexSets parameter)
 const NEG_RISK_REDEEM_ABI = [{
   name: 'redeemPositions',
   type: 'function',
   inputs: [
-    { name: 'conditionId', type: 'bytes32' },
-    { name: 'indexSets', type: 'uint256[]' },
-    { name: 'amounts', type: 'uint256[]' }
+    { name: '_conditionId', type: 'bytes32' },
+    { name: '_amounts', type: 'uint256[]' }
   ],
   outputs: []
 }] as const;
 
-// Cache for RelayerClient instances
-const relayerClientCache = new Map<string, { relayerClient: any; wallet: any; builderConfig: any }>();
+// Cache for wallet/builderConfig instances (no longer caching RelayerClient)
+const walletCache = new Map<string, { wallet: any; builderConfig: any }>();
 
 export interface RedeemablePosition {
   asset: string;
@@ -89,19 +118,17 @@ export interface BatchRedemptionResult {
 }
 
 /**
- * Get or create RelayerClient for user
+ * Get or create wallet + builderConfig for user
  */
-async function getRelayerClient(privyUserId: string, embeddedWalletAddress: string): Promise<any> {
-  const cached = relayerClientCache.get(privyUserId);
+async function getWalletAndConfig(privyUserId: string, embeddedWalletAddress: string): Promise<{ wallet: any; builderConfig: any }> {
+  const cached = walletCache.get(privyUserId);
   if (cached) {
-    return cached.relayerClient;
+    return cached;
   }
 
-  const { RelayClient, RelayerTxType } = await import('@polymarket/builder-relayer-client');
   const { createViemWalletForRelayer } = await import('../../privy/wallet-deployment.service');
   const { privyService } = await import('../../privy/privy.service');
 
-  // Get wallet ID for the user (optional - used to speed up signing)
   let walletId: string | undefined = undefined;
   try {
     const fetchedWalletId = await privyService.getWalletIdByAddress(privyUserId, embeddedWalletAddress);
@@ -114,26 +141,230 @@ async function getRelayerClient(privyUserId: string, embeddedWalletAddress: stri
       privyUserId,
     });
   }
-  
-  // Create viem wallet client and builder config
-  // Signature: createViemWalletForRelayer(privyUserId, embeddedWalletAddress, walletId?)
+
   const { wallet, builderConfig } = await createViemWalletForRelayer(
     privyUserId,
     embeddedWalletAddress,
     walletId || undefined
   );
 
-  // Create RelayerClient
-  const relayerClient = new RelayClient(
-    privyConfig.relayerUrl,
-    privyConfig.chainId,
-    wallet,
-    builderConfig,
-    RelayerTxType.SAFE
-  );
+  const result = { wallet, builderConfig };
+  walletCache.set(privyUserId, result);
+  return result;
+}
 
-  relayerClientCache.set(privyUserId, { relayerClient, wallet, builderConfig });
-  return relayerClient;
+/**
+ * Derive Safe address from owner address (same logic as SDK)
+ */
+function deriveSafeAddress(ownerAddress: string): `0x${string}` {
+  return getCreate2Address({
+    bytecodeHash: SAFE_INIT_CODE_HASH,
+    from: SAFE_FACTORY,
+    salt: keccak256(encodeAbiParameters([{ name: 'address', type: 'address' }], [ownerAddress as `0x${string}`])),
+  });
+}
+
+/**
+ * Read Safe nonce directly from on-chain (bypasses relayer's stale nonce)
+ */
+async function getOnChainSafeNonce(safeAddress: `0x${string}`): Promise<bigint> {
+  const publicClient = createPublicClient({
+    chain: polygon,
+    transport: http(privyConfig.rpcUrl),
+  });
+
+  // Use type assertion to work around strict viem generics
+  const nonce = await (publicClient as any).readContract({
+    address: safeAddress,
+    abi: SAFE_NONCE_ABI,
+    functionName: 'nonce',
+  }) as bigint;
+
+  return nonce;
+}
+
+/**
+ * Split signature and pack with adjusted v for Gnosis Safe eth_sign type
+ * Replicates splitAndPackSig from @polymarket/builder-relayer-client
+ */
+function splitAndPackSafeSignature(sig: string): string {
+  let sigV = parseInt(sig.slice(-2), 16);
+  switch (sigV) {
+    case 0:
+    case 1:
+      sigV += 31;
+      break;
+    case 27:
+    case 28:
+      sigV += 4;
+      break;
+    default:
+      throw new Error(`Invalid signature v value: ${sigV}`);
+  }
+  const adjusted = sig.slice(0, -2) + sigV.toString(16);
+  const r = hexToBigInt(('0x' + adjusted.slice(2, 66)) as `0x${string}`);
+  const s = hexToBigInt(('0x' + adjusted.slice(66, 130)) as `0x${string}`);
+  const v = parseInt(adjusted.slice(130, 132), 16);
+  return encodePacked(['uint256', 'uint256', 'uint8'], [r, s, v]);
+}
+
+/**
+ * Execute a Safe transaction with on-chain nonce, bypassing the relayer's /nonce endpoint.
+ * Signs the Safe TX locally and submits directly to the relayer's /submit endpoint.
+ */
+async function executeWithOnChainNonce(
+  wallet: any,
+  builderConfig: any,
+  transaction: { to: string; data: `0x${string}`; value: string },
+  metadata: string,
+): Promise<{ transactionHash?: string; state?: string }> {
+  const ownerAddress = wallet.account.address as `0x${string}`;
+  const safeAddress = deriveSafeAddress(ownerAddress);
+  const chainId = privyConfig.chainId;
+
+  // 1. Read nonce from on-chain (the source of truth)
+  const onChainNonce = await getOnChainSafeNonce(safeAddress);
+
+  logger.info({
+    message: 'On-chain Safe nonce fetched for redemption',
+    ownerAddress,
+    safeAddress,
+    onChainNonce: onChainNonce.toString(),
+  });
+
+  // 2. Build EIP-712 SafeTx hash (same as SDK's createStructHash)
+  const structHash = hashTypedData({
+    primaryType: 'SafeTx',
+    domain: {
+      chainId,
+      verifyingContract: safeAddress,
+    },
+    types: {
+      SafeTx: [
+        { name: 'to', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'data', type: 'bytes' },
+        { name: 'operation', type: 'uint8' },
+        { name: 'safeTxGas', type: 'uint256' },
+        { name: 'baseGas', type: 'uint256' },
+        { name: 'gasPrice', type: 'uint256' },
+        { name: 'gasToken', type: 'address' },
+        { name: 'refundReceiver', type: 'address' },
+        { name: 'nonce', type: 'uint256' },
+      ],
+    },
+    message: {
+      to: transaction.to as `0x${string}`,
+      value: BigInt(0),
+      data: transaction.data,
+      operation: 0,
+      safeTxGas: BigInt(0),
+      baseGas: BigInt(0),
+      gasPrice: BigInt(0),
+      gasToken: zeroAddress,
+      refundReceiver: zeroAddress,
+      nonce: onChainNonce,
+    },
+  });
+
+  // 3. Sign the hash using personal_sign (eth_sign mode, same as SDK)
+  const rawSig = await wallet.signMessage({
+    account: wallet.account,
+    message: { raw: toBytes(structHash) },
+  });
+
+  // 4. Pack signature with adjusted v for Safe eth_sign type
+  const packedSig = splitAndPackSafeSignature(rawSig);
+
+  // 5. Build the request payload (same format as SDK's buildSafeTransactionRequest)
+  const request = {
+    from: ownerAddress,
+    to: transaction.to,
+    proxyWallet: safeAddress,
+    data: transaction.data,
+    nonce: onChainNonce.toString(),
+    signature: packedSig,
+    signatureParams: {
+      gasPrice: '0',
+      operation: '0',
+      safeTxnGas: '0',
+      baseGas: '0',
+      gasToken: zeroAddress,
+      refundReceiver: zeroAddress,
+    },
+    type: 'SAFE',
+    metadata,
+  };
+
+  logger.info({
+    message: 'Submitting Safe transaction with on-chain nonce',
+    ownerAddress,
+    safeAddress,
+    nonce: onChainNonce.toString(),
+    to: transaction.to,
+  });
+
+  // 6. Generate builder auth headers and submit to relayer
+  const relayerUrl = privyConfig.relayerUrl.endsWith('/')
+    ? privyConfig.relayerUrl.slice(0, -1)
+    : privyConfig.relayerUrl;
+
+  const body = JSON.stringify(request);
+  let headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+  if (builderConfig && builderConfig.isValid()) {
+    const builderHeaders = await builderConfig.generateBuilderHeaders('POST', '/submit', body);
+    if (builderHeaders) {
+      headers = { ...headers, ...builderHeaders };
+    }
+  }
+
+  const submitResponse = await axios.post(`${relayerUrl}/submit`, body, { headers });
+  const { transactionID, state, transactionHash } = submitResponse.data;
+
+  logger.info({
+    message: 'Relayer submit response received',
+    transactionID,
+    state,
+    transactionHash,
+  });
+
+  // 7. Poll for transaction confirmation (same logic as SDK's pollUntilState)
+  const maxPolls = 100;
+  const pollFrequency = 2000;
+  const targetStates = ['STATE_MINED', 'STATE_CONFIRMED'];
+  const failState = 'STATE_FAILED';
+
+  logger.info({
+    message: `Waiting for transaction ${transactionID} to reach ${targetStates.join('/')}`,
+  });
+
+  for (let i = 0; i < maxPolls; i++) {
+    const txnResponse = await axios.get(`${relayerUrl}/transaction`, {
+      params: { id: transactionID },
+    });
+    const txns = txnResponse.data;
+
+    if (Array.isArray(txns) && txns.length > 0) {
+      const txn = txns[0];
+      if (targetStates.includes(txn.state)) {
+        return { transactionHash: txn.transactionHash, state: txn.state };
+      }
+      if (txn.state === failState) {
+        logger.error({
+          message: `Transaction ${transactionID} failed on-chain`,
+          transactionHash: txn.transactionHash,
+          state: txn.state,
+        });
+        return { transactionHash: txn.transactionHash, state: txn.state };
+      }
+    }
+
+    await new Promise(resolve => setTimeout(resolve, pollFrequency));
+  }
+
+  logger.error({ message: `Transaction ${transactionID} polling timed out` });
+  return { state: 'TIMEOUT' };
 }
 
 /**
@@ -248,24 +479,19 @@ export async function redeemPosition(
   });
 
   try {
-    // Get RelayerClient
-    const relayerClient = await getRelayerClient(privyUserId, user.embeddedWalletAddress);
+    // Get wallet and builder config (no RelayerClient needed)
+    const { wallet, builderConfig } = await getWalletAndConfig(privyUserId, user.embeddedWalletAddress);
 
     let redeemData: `0x${string}`;
     let targetContract: string;
 
     if (isNegativeRisk) {
       // Negative risk markets: use the Neg Risk Adapter
-      // Convert size to raw amount (6 decimals for USDC-based tokens)
       const rawAmount = BigInt(Math.floor(parseFloat(position.size) * 1e6));
-      
-      // For binary markets: outcome_index 0 = index set 1, outcome_index 1 = index set 2
-      // The Neg Risk Adapter requires amounts for both index sets
-      // We provide the amount for the outcome we have, and 0 for the other
-      const outcomeIndex = position.outcome_index ?? 0; // Default to 0 if not set
+      const outcomeIndex = position.outcome_index ?? 0;
       const indexSet1Amount = outcomeIndex === 0 ? rawAmount : BigInt(0);
       const indexSet2Amount = outcomeIndex === 1 ? rawAmount : BigInt(0);
-      
+
       logger.info({
         message: 'Using Neg Risk Adapter for redemption',
         privyUserId,
@@ -275,14 +501,13 @@ export async function redeemPosition(
         indexSet1Amount: indexSet1Amount.toString(),
         indexSet2Amount: indexSet2Amount.toString(),
       });
-      
+
       redeemData = encodeFunctionData({
         abi: NEG_RISK_REDEEM_ABI,
         functionName: 'redeemPositions',
         args: [
           conditionId as `0x${string}`,
-          INDEX_SETS,
-          [indexSet1Amount, indexSet2Amount], // amounts for [index1, index2]
+          [indexSet1Amount, indexSet2Amount],
         ],
       });
       targetContract = NEG_RISK_ADAPTER_ADDRESS;
@@ -308,90 +533,38 @@ export async function redeemPosition(
     };
 
     logger.info({
-      message: 'Executing redemption via relayer',
+      message: 'Executing redemption with on-chain nonce',
       privyUserId,
       conditionId,
       targetContract,
       isNegativeRisk,
     });
 
-    // Execute via RelayerClient
-    const response = await relayerClient.execute(
-      [transaction],
-      `Redeem ${position.outcome} position: ${position.title}`
+    // Execute with on-chain nonce (bypasses relayer's stale nonce)
+    const txResult = await executeWithOnChainNonce(
+      wallet,
+      builderConfig,
+      transaction,
+      `Redeem ${position.outcome} position: ${position.title}`,
     );
 
-    logger.info({
-      message: 'Relayer execute response received',
-      privyUserId,
-      conditionId,
-      responseType: typeof response,
-      responseKeys: response ? Object.keys(response) : null,
-      hasWait: response && typeof response.wait === 'function',
-    });
+    const transactionHash = txResult.transactionHash;
+    const isFailed = txResult.state === 'STATE_FAILED' || txResult.state === 'TIMEOUT';
 
-    // Wait for transaction confirmation
-    let txResult: any;
-    try {
-      txResult = await response.wait();
-      
-      logger.info({
-        message: 'Transaction wait completed',
-        privyUserId,
-        conditionId,
-        txResultType: typeof txResult,
-        txResultKeys: txResult ? Object.keys(txResult) : null,
-        txResultValue: txResult ? JSON.stringify(txResult, null, 2) : null,
-        hasTransactionHash: txResult && 'transactionHash' in txResult,
-        transactionHash: txResult?.transactionHash,
-        state: txResult?.state,
-        status: txResult?.status,
-      });
-    } catch (waitError) {
+    if (!transactionHash || isFailed) {
       logger.error({
-        message: 'Error waiting for transaction',
-        privyUserId,
-        conditionId,
-        error: waitError instanceof Error ? waitError.message : String(waitError),
-        errorStack: waitError instanceof Error ? waitError.stack : undefined,
-      });
-      throw waitError;
-    }
-
-    // Check for transaction hash in various possible fields
-    const transactionHash = txResult?.transactionHash || txResult?.hash || txResult?.txHash || txResult?.tx?.hash;
-    
-    // Check if transaction failed (relayer may return hash even if transaction failed on-chain)
-    const transactionState = txResult?.state;
-    const transactionStatus = txResult?.status;
-    const isFailed = transactionState === 'FAILED' || 
-                     transactionState === 'REVERTED' ||
-                     transactionStatus === 'FAILED' ||
-                     transactionStatus === 'REVERTED' ||
-                     (txResult && 'failed' in txResult && txResult.failed === true);
-    
-    if (!txResult || !transactionHash) {
-      logger.error({
-        message: 'Transaction failed - no hash returned',
-        privyUserId,
-        conditionId,
-        txResult,
-        isNegativeRisk,
-      });
-      throw new Error('Transaction failed - no hash returned');
-    }
-    
-    if (isFailed) {
-      logger.error({
-        message: 'Transaction failed on-chain',
+        message: 'Redemption transaction failed',
         privyUserId,
         conditionId,
         transactionHash,
-        state: transactionState,
-        status: transactionStatus,
+        state: txResult.state,
         isNegativeRisk,
       });
-      throw new Error(`Transaction failed on-chain. Hash: ${transactionHash}. This may indicate the redemption contract call reverted. For negative risk markets, ensure you have the correct outcome and sufficient balance.`);
+      throw new Error(
+        txResult.state === 'TIMEOUT'
+          ? 'Transaction polling timed out'
+          : `Transaction failed on-chain. Hash: ${transactionHash}`
+      );
     }
 
     logger.info({
