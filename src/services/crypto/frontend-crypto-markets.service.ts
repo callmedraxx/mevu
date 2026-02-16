@@ -215,6 +215,40 @@ export async function getFrontendCryptoMarketsFromDatabase(
   return result;
 }
 
+/**
+ * Fetch full/raw detail of a crypto market by slug — SSR-like structure.
+ * Composes the response in PostgreSQL to minimise Node.js work.
+ * Returns null when not found.
+ */
+export async function getCryptoMarketDetailBySlug(
+  slug: string
+): Promise<Record<string, unknown> | null> {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await connectWithRetry();
+  try {
+    const res = await client.query(
+      `SELECT
+         id, ticker, slug, title, description, resolution_source,
+         start_date, end_date, start_time, image, icon,
+         active, closed, archived, restricted,
+         liquidity, volume, open_interest, competitive,
+         enable_order_book, liquidity_clob, neg_risk,
+         comment_count, is_live,
+         timeframe, asset, series_slug,
+         markets, series, tags_data AS tags
+       FROM crypto_markets
+       WHERE LOWER(slug) = LOWER($1)
+       LIMIT 1`,
+      [slug]
+    );
+    if (res.rows.length === 0) return null;
+    return res.rows[0] as Record<string, unknown>;
+  } finally {
+    client.release();
+  }
+}
+
 export async function getFrontendCryptoMarketBySlugFromDatabase(
   slug: string
 ): Promise<PredictionMarketFrontend | null> {
