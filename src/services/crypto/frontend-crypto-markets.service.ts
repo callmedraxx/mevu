@@ -1,0 +1,258 @@
+/**
+ * Frontend Crypto Markets Service
+ * Fetches crypto_markets from DB, transforms to PredictionMarket format.
+ * Uses in-memory cache, promise coalescing for burst traffic, connect-only-when-read.
+ */
+
+import { connectWithRetry } from '../../config/database';
+import {
+  transformCryptoMarketToFrontend,
+  PredictionMarketFrontend,
+  CryptoMarketRow,
+} from './crypto-market.transformer';
+
+interface CacheEntry {
+  data: PredictionMarketFrontend[];
+  timestamp: number;
+  total: number;
+  hasMore: boolean;
+}
+
+const cache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 5_000;
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+
+/** In-flight promises keyed by cache key to coalesce concurrent identical requests */
+const inFlight = new Map<string, Promise<PaginatedResult>>();
+
+export interface PaginatedResult {
+  markets: PredictionMarketFrontend[];
+  total: number;
+  page: number;
+  limit: number;
+  hasMore: boolean;
+}
+
+export interface ListOptions {
+  timeframe?: string | null;
+  asset?: string | null;
+  page?: number;
+  limit?: number;
+}
+
+const TIMEFRAME_ALIASES: Record<string, string> = {
+  '15min': '15m',
+  '15m': '15m',
+  '1h': '1h',
+  'hourly': '1h',
+  '4h': '4h',
+  '4hour': '4h',
+  'daily': 'daily',
+  'weekly': 'weekly',
+  'monthly': 'monthly',
+  'yearly': 'yearly',
+  'pre-market': 'pre-market',
+  'etf': 'etf',
+};
+
+function normalizeTimeframe(v: string | null | undefined): string | null {
+  if (!v) return null;
+  const s = v.toLowerCase().trim();
+  return (TIMEFRAME_ALIASES[s] ?? s) || null;
+}
+
+function normalizeAsset(v: string | null | undefined): string | null {
+  if (!v) return null;
+  const s = v.toLowerCase().trim();
+  return s || null;
+}
+
+/** Timeframes where we deduplicate by series_slug, showing only the current/active window.
+ *  Short intervals (5m–daily) have many recurring events per asset; longer ones (weekly+)
+ *  are naturally unique but included for safety — DISTINCT ON is a no-op when only one exists. */
+const DEDUP_TIMEFRAMES = new Set(['5m', '15m', '1h', '4h', 'daily', 'weekly', 'monthly', 'yearly', 'pre-market', 'etf']);
+
+async function fetchFromDb(options: ListOptions): Promise<PaginatedResult> {
+  const page = Math.max(1, options.page ?? 1);
+  const limit = Math.min(MAX_LIMIT, Math.max(1, options.limit ?? DEFAULT_LIMIT));
+  const offset = (page - 1) * limit;
+  const timeframe = normalizeTimeframe(options.timeframe);
+  const asset = normalizeAsset(options.asset);
+
+  const client = await connectWithRetry();
+  try {
+    const params: unknown[] = [];
+    const where: string[] = ['active = true', 'closed = false', 'archived = false'];
+
+    if (timeframe) {
+      params.push(timeframe);
+      where.push(`LOWER(timeframe) = $${params.length}`);
+    }
+    if (asset) {
+      params.push(asset);
+      where.push(`LOWER(asset) = $${params.length}`);
+    }
+
+    const isShortTimeframe = timeframe != null && DEDUP_TIMEFRAMES.has(timeframe);
+    const whereClause = where.join(' AND ');
+
+    let q: string;
+    if (isShortTimeframe) {
+      // Short timeframes (15m, 5m): deduplicate by series_slug, pick the current window.
+      // DISTINCT ON picks one row per series_slug. The CASE expression prioritises
+      // the window we are inside (start_time <= NOW) over future windows, and
+      // end_date ASC picks the soonest-ending within each priority tier.
+      // COUNT(*) OVER() avoids a separate COUNT round-trip.
+      params.push(limit, offset);
+      q = `
+        SELECT *, COUNT(*) OVER () AS total_count FROM (
+          SELECT DISTINCT ON (series_slug)
+            id, slug, title, end_date, icon, active, closed, liquidity, volume,
+            comment_count, is_live, timeframe, asset, tags, markets
+          FROM crypto_markets
+          WHERE ${whereClause}
+            AND series_slug IS NOT NULL
+            AND end_date > NOW()
+          ORDER BY series_slug,
+            CASE WHEN start_time <= NOW() THEN 0 ELSE 1 END,
+            end_date ASC NULLS LAST
+        ) AS deduped
+        ORDER BY volume DESC NULLS LAST, end_date ASC NULLS LAST
+        LIMIT $${params.length - 1} OFFSET $${params.length}
+      `;
+    } else {
+      // Normal path: single query with window-function count.
+      params.push(limit, offset);
+      q = `
+        SELECT id, slug, title, end_date, icon, active, closed, liquidity, volume,
+               comment_count, is_live, timeframe, asset, tags, markets,
+               COUNT(*) OVER () AS total_count
+        FROM crypto_markets
+        WHERE ${whereClause}
+        ORDER BY volume DESC NULLS LAST, end_date ASC NULLS LAST
+        LIMIT $${params.length - 1} OFFSET $${params.length}
+      `;
+    }
+
+    const res = await client.query(q, params);
+    const rows = res.rows as (CryptoMarketRow & { total_count?: string })[];
+    const total = rows.length > 0 ? parseInt(rows[0].total_count ?? '0', 10) : 0;
+    const markets = rows.map(transformCryptoMarketToFrontend);
+
+    return {
+      markets,
+      total,
+      page,
+      limit,
+      hasMore: offset + markets.length < total,
+    };
+  } finally {
+    client.release();
+  }
+}
+
+export async function getFrontendCryptoMarketsFromDatabase(
+  options: ListOptions
+): Promise<PaginatedResult> {
+  // Skip DB when no database configured (local dev without DATABASE_URL)
+  if (!process.env.DATABASE_URL) {
+    return { markets: [], total: 0, page: 1, limit: DEFAULT_LIMIT, hasMore: false };
+  }
+
+  const cacheKey = JSON.stringify({
+    tf: options.timeframe ?? null,
+    a: options.asset ?? null,
+    p: options.page ?? 1,
+    l: options.limit ?? DEFAULT_LIMIT,
+  });
+
+  const now = Date.now();
+  const tf = normalizeTimeframe(options.timeframe);
+  const asset = normalizeAsset(options.asset);
+  const isFirstPageUnfiltered =
+    !tf &&
+    !asset &&
+    (options.page ?? 1) === 1 &&
+    (options.limit ?? DEFAULT_LIMIT) === DEFAULT_LIMIT;
+  const simpleCacheKey = 'list:p1:default';
+
+  if (isFirstPageUnfiltered) {
+    const hit = cache.get(simpleCacheKey);
+    if (hit && now - hit.timestamp < CACHE_TTL_MS) {
+      return {
+        markets: hit.data,
+        total: hit.total,
+        page: 1,
+        limit: DEFAULT_LIMIT,
+        hasMore: hit.hasMore,
+      };
+    }
+  }
+
+  let promise = inFlight.get(cacheKey);
+  if (!promise) {
+    promise = fetchFromDb(options);
+    inFlight.set(cacheKey, promise);
+    promise.finally(() => inFlight.delete(cacheKey));
+  }
+  const result = await promise;
+
+  if (isFirstPageUnfiltered) {
+    cache.set(simpleCacheKey, {
+      data: result.markets,
+      timestamp: now,
+      total: result.total,
+      hasMore: result.hasMore,
+    });
+    if (cache.size > 10) {
+      for (const [k, e] of cache.entries()) {
+        if (now - e.timestamp >= CACHE_TTL_MS) cache.delete(k);
+      }
+    }
+  }
+
+  return result;
+}
+
+export async function getFrontendCryptoMarketBySlugFromDatabase(
+  slug: string
+): Promise<PredictionMarketFrontend | null> {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await connectWithRetry();
+  try {
+    const res = await client.query(
+      `SELECT id, slug, title, end_date, icon, active, closed, liquidity, volume,
+              comment_count, is_live, timeframe, asset, tags, markets
+       FROM crypto_markets
+       WHERE LOWER(slug) = LOWER($1) AND active = true AND closed = false`,
+      [slug]
+    );
+    if (res.rows.length === 0) return null;
+    return transformCryptoMarketToFrontend(res.rows[0] as CryptoMarketRow);
+  } finally {
+    client.release();
+  }
+}
+
+export async function getFrontendCryptoMarketByIdFromDatabase(
+  id: string
+): Promise<PredictionMarketFrontend | null> {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await connectWithRetry();
+  try {
+    const res = await client.query(
+      `SELECT id, slug, title, end_date, icon, active, closed, liquidity, volume,
+              comment_count, is_live, timeframe, asset, tags, markets
+       FROM crypto_markets
+       WHERE id = $1 AND active = true AND closed = false`,
+      [id]
+    );
+    if (res.rows.length === 0) return null;
+    return transformCryptoMarketToFrontend(res.rows[0] as CryptoMarketRow);
+  } finally {
+    client.release();
+  }
+}
