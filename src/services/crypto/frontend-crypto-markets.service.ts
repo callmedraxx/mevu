@@ -10,6 +10,7 @@ import {
   PredictionMarketFrontend,
   CryptoMarketRow,
 } from './crypto-market.transformer';
+import { fetchOpeningPrice } from './crypto-opening-price.service';
 
 interface CacheEntry {
   data: PredictionMarketFrontend[];
@@ -236,6 +237,7 @@ export async function getCryptoMarketDetailBySlug(
          enable_order_book, liquidity_clob, neg_risk,
          comment_count, is_live,
          timeframe, asset, series_slug,
+         opening_price,
          markets, series, tags_data AS tags
        FROM crypto_markets
        WHERE LOWER(slug) = LOWER($1)
@@ -243,7 +245,26 @@ export async function getCryptoMarketDetailBySlug(
       [slug]
     );
     if (res.rows.length === 0) return null;
-    return res.rows[0] as Record<string, unknown>;
+    const row = res.rows[0] as Record<string, unknown>;
+
+    // On-demand: if opening_price is missing and market has started, fetch from Polymarket SSR
+    if (row.opening_price == null && row.start_time && new Date(row.start_time as string) <= new Date()) {
+      try {
+        const price = await fetchOpeningPrice(row.slug as string);
+        if (price != null) {
+          row.opening_price = price;
+          // Persist in background (don't block response)
+          client.query(
+            'UPDATE crypto_markets SET opening_price = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+            [price, row.id]
+          ).catch(() => {});
+        }
+      } catch {
+        // Non-critical — return row without opening_price
+      }
+    }
+
+    return row;
   } finally {
     client.release();
   }
@@ -286,6 +307,33 @@ export async function getFrontendCryptoMarketByIdFromDatabase(
     );
     if (res.rows.length === 0) return null;
     return transformCryptoMarketToFrontend(res.rows[0] as CryptoMarketRow);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get the currently active market in a series (start_time <= now AND end_date > now).
+ * Returns the slug of the active market or null if none is active.
+ */
+export async function getCurrentMarketBySeriesSlug(
+  seriesSlug: string
+): Promise<string | null> {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await connectWithRetry();
+  try {
+    const res = await client.query(
+      `SELECT slug FROM crypto_markets
+       WHERE series_slug = $1
+         AND start_time <= NOW()
+         AND end_date > NOW()
+         AND active = true
+       ORDER BY start_time DESC
+       LIMIT 1`,
+      [seriesSlug]
+    );
+    return res.rows[0]?.slug ?? null;
   } finally {
     client.release();
   }

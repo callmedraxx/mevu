@@ -10,6 +10,7 @@ import {
   getFrontendCryptoMarketBySlugFromDatabase,
   getFrontendCryptoMarketByIdFromDatabase,
   getCryptoMarketDetailBySlug,
+  getCurrentMarketBySeriesSlug,
 } from '../services/crypto/frontend-crypto-markets.service';
 import { cryptoMarketsService } from '../services/crypto/crypto-markets.service';
 
@@ -308,6 +309,48 @@ router.get('/slug/:slug', async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       error: 'Failed to fetch crypto market',
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/crypto-markets/series/{seriesSlug}/current:
+ *   get:
+ *     summary: Get the currently active market in a series
+ *     description: Returns the slug of the market whose time window is currently active (start_time <= now < end_date).
+ *     tags: [CryptoMarkets]
+ *     parameters:
+ *       - in: path
+ *         name: seriesSlug
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Series slug (e.g., btc-up-or-down-15m)
+ *     responses:
+ *       200:
+ *         description: Current market slug (or null if none active)
+ *       500:
+ *         description: Server error
+ */
+router.get('/series/:seriesSlug/current', async (req: Request, res: Response) => {
+  try {
+    const { seriesSlug } = req.params;
+    const slug = await getCurrentMarketBySeriesSlug(seriesSlug);
+
+    return res.json({
+      success: true,
+      slug,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching current market for series',
+      seriesSlug: req.params.seriesSlug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch current market',
     });
   }
 });

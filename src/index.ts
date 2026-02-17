@@ -33,6 +33,7 @@ import { autoTransferService } from './services/privy/auto-transfer.service';
 import { depositProgressService } from './services/privy/deposit-progress.service';
 import { kalshiService, kalshiPriceUpdateService } from './services/kalshi';
 import { registerOnGamesRefreshed } from './services/polymarket/live-games.service';
+import { cryptoMarketsService } from './services/crypto/crypto-markets.service';
 
 // Load environment variables
 dotenv.config();
@@ -259,6 +260,10 @@ async function initializeSportsServices() {
         error: depositProgressError instanceof Error ? depositProgressError.message : String(depositProgressError),
       });
     }
+
+    // Start crypto markets polling service (1h refresh)
+    logger.info({ message: 'Starting crypto markets service...' });
+    cryptoMarketsService.start();
 
     // Start sports WebSocket for live game score updates
     logger.info({ message: 'Starting sports WebSocket service...' });
