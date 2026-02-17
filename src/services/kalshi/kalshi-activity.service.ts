@@ -21,9 +21,10 @@ class KalshiActivityService {
   /**
    * Get activity data for a game slug with Kalshi prices
    * @param slug - Game slug (e.g., "nba-lal-bos-2025-01-15")
+   * @param includeDebug - When true, add _debug field with kalshiRowCount to response
    * @returns Activity game data with Kalshi prices, or null if not found
    */
-  async getActivityForSlug(slug: string): Promise<KalshiActivityGame | null> {
+  async getActivityForSlug(slug: string, includeDebug = false): Promise<KalshiActivityGame | null> {
     const nodeEnv = process.env.NODE_ENV || 'development';
 
     // First, get the live game
@@ -37,10 +38,13 @@ class KalshiActivityService {
 
     // In non-production, return without Kalshi data
     if (nodeEnv !== 'production') {
-      return this.buildActivityGame(frontendGame, []);
+      const result = this.buildActivityGame(frontendGame, []);
+      if (includeDebug) (result as any)._debug = { kalshiRowCount: 0, reason: 'NODE_ENV!==production' };
+      return result;
     }
 
     // Get ALL Kalshi markets for this game (moneyline, spread, total)
+    // Use same status filter as getKalshiPricesForGames: active, open, unopened, initialized
     const client = await connectWithRetry();
     try {
       const result = await client.query(
@@ -57,7 +61,7 @@ class KalshiActivityService {
         FROM kalshi_markets km
         JOIN live_games lg ON km.live_game_id = lg.id
         WHERE LOWER(lg.slug) = LOWER($1)
-          AND km.status = 'active'
+          AND km.status IN ('active', 'open', 'unopened', 'initialized')
         ORDER BY km.ticker
         `,
         [slug]
@@ -65,10 +69,14 @@ class KalshiActivityService {
 
       if (result.rows.length === 0) {
         // No Kalshi market found - return game without Kalshi data
-        return this.buildActivityGame(frontendGame, []);
+        const emptyResult = this.buildActivityGame(frontendGame, []);
+        if (includeDebug) (emptyResult as any)._debug = { kalshiRowCount: 0, reason: 'query returned 0 rows' };
+        return emptyResult;
       }
 
-      return this.buildActivityGame(frontendGame, result.rows);
+      const built = this.buildActivityGame(frontendGame, result.rows);
+      if (includeDebug) (built as any)._debug = { kalshiRowCount: result.rows.length };
+      return built;
     } catch (error) {
       logger.error({
         message: 'Error fetching Kalshi activity data',
@@ -76,7 +84,9 @@ class KalshiActivityService {
         error: error instanceof Error ? error.message : String(error),
       });
       // Return game without Kalshi data on error
-      return this.buildActivityGame(frontendGame, []);
+      const errResult = this.buildActivityGame(frontendGame, []);
+      if (includeDebug) (errResult as any)._debug = { kalshiRowCount: 0, reason: 'exception', error: error instanceof Error ? error.message : String(error) };
+      return errResult;
     } finally {
       client.release();
     }
@@ -172,114 +182,30 @@ class KalshiActivityService {
       awayTeam.kalshiSellPrice = awayMoneyline.yes_bid;
     }
 
-    // Build markets array - group by market type
+    // Build markets: one per Kalshi row, with actual question and Yes/No outcomes (matching Kalshi)
     const markets: ActivityWatcherMarket[] = [];
-
-    // Group markets by type based on ticker pattern
     const marketGroups = this.groupMarketsByType(kalshiRows);
 
-    // Add moneyline market
-    if (marketGroups.moneyline.length > 0) {
-      const mlMarkets = marketGroups.moneyline;
-      
-      // Check if this is a single-market sport (tennis, UFC, mwoh)
-      const firstTicker = mlMarkets[0]?.ticker.toUpperCase() || '';
-      const isSingleMarket = firstTicker.startsWith('KXWTAMATCH-') ||
-                             firstTicker.startsWith('KXATPMATCH-') ||
-                             firstTicker.startsWith('KXUFCFIGHT-') ||
-                             firstTicker.startsWith('KXWOMHOCKEY-');
-      
-      if (isSingleMarket && mlMarkets.length === 1) {
-        // Single-market sports: create two outcomes from one market
-        // YES = away wins, NO = home wins
-        const market = mlMarkets[0];
-        const title = market.title || 'Who will win?';
-        
-        // Build question from team names
-        const question = `${awayTeam.name || awayAbbr} at ${homeTeam.name || homeAbbr} Winner?`;
-        
-        markets.push({
-          id: 'moneyline',
-          title: 'Winner',
-          question,
-          volume: this.formatVolume(market.volume || 0),
-          liquidity: '$0',
-          outcomes: [
-            {
-              label: awayAbbr || 'Away',
-              price: market.yes_ask,
-              probability: market.yes_ask,
-              buyPrice: market.yes_ask,
-              sellPrice: market.yes_bid,
-              kalshiTicker: market.ticker,
-              kalshiOutcome: 'YES' as const,
-            },
-            {
-              label: homeAbbr || 'Home',
-              price: market.no_ask ?? (100 - market.yes_bid),
-              probability: market.no_ask ?? (100 - market.yes_bid),
-              buyPrice: market.no_ask ?? (100 - market.yes_bid),
-              sellPrice: market.no_bid ?? (100 - market.yes_ask),
-              kalshiTicker: market.ticker,
-              kalshiOutcome: 'NO' as const,
-            },
-          ],
-        });
-      } else {
-        // Multi-market sports: each market is a separate outcome
-        markets.push({
-          id: 'moneyline',
-          title: 'Winner',
-          question: mlMarkets[0]?.title || 'Who will win?',
-          volume: this.formatVolume(mlMarkets.reduce((sum, m) => sum + (m.volume || 0), 0)),
-          liquidity: '$0',
-          outcomes: mlMarkets.map(m => ({
-            label: this.extractTeamFromTicker(m.ticker) || m.title,
-            price: m.yes_ask,
-            probability: m.yes_ask,
-            buyPrice: m.yes_ask,
-            sellPrice: m.yes_bid,
-            kalshiTicker: m.ticker,
-            kalshiOutcome: 'YES' as const,
-          })),
-        });
+    // Single-market sports (tennis, UFC, mwoh): one market with Yes/No for away/home
+    if (isSingleMarketSport && marketGroups.moneyline.length === 1) {
+      const m = marketGroups.moneyline[0];
+      markets.push(this.rowToYesNoMarket(m, 'Winner', m.title || 'Who will win?', [
+        { label: 'Yes', kalshiOutcome: 'YES' as const, teamAbbr: awayAbbr },
+        { label: 'No', kalshiOutcome: 'NO' as const, useNoPrices: true, teamAbbr: homeAbbr },
+      ]));
+    } else {
+      // All other markets: one market per Kalshi row with Yes/No outcomes
+      for (const row of kalshiRows) {
+        const marketType = this.getMarketType(row.ticker);
+        // Moneyline (GAME) only: add teamAbbr so frontend can show "Yes (CHA)" etc.
+        const marketTeamAbbr = row.ticker.toUpperCase().includes('GAME-')
+          ? this.extractTeamFromTicker(row.ticker)
+          : undefined;
+        markets.push(this.rowToYesNoMarket(row, marketType, row.title || 'Unknown', [
+          { label: 'Yes', kalshiOutcome: 'YES' as const },
+          { label: 'No', kalshiOutcome: 'NO' as const, useNoPrices: true },
+        ], marketTeamAbbr));
       }
-    }
-
-    // Add spread markets - group by point value and pair teams
-    if (marketGroups.spread.length > 0) {
-      const spreadMarkets = this.buildSpreadMarkets(
-        marketGroups.spread,
-        homeAbbr,
-        awayAbbr,
-        frontendGame.homeTeam?.name,
-        frontendGame.awayTeam?.name
-      );
-      markets.push(...spreadMarkets);
-    }
-
-    // Add total markets - each total value becomes a market with Over/Under outcomes
-    if (marketGroups.total.length > 0) {
-      const totalMarkets = this.buildTotalMarkets(marketGroups.total);
-      markets.push(...totalMarkets);
-    }
-
-    // Add team total markets
-    if (marketGroups.teamTotal.length > 0) {
-      markets.push({
-        id: 'teamTotal',
-        title: 'Team Totals',
-        question: 'Team Total Points',
-        volume: this.formatVolume(marketGroups.teamTotal.reduce((sum, m) => sum + (m.volume || 0), 0)),
-        liquidity: '$0',
-        outcomes: marketGroups.teamTotal.map(m => ({
-          label: m.title,
-          price: m.yes_ask,
-          probability: m.yes_ask,
-          buyPrice: m.yes_ask,
-          sellPrice: m.yes_bid,
-        })),
-      });
     }
 
     return {
@@ -293,6 +219,71 @@ class KalshiActivityService {
       kalshiTicker: kalshiRows[0]?.ticker,
       platform: 'kalshi',
     };
+  }
+
+  /**
+   * Extract team abbr from GAME ticker suffix (e.g. KXNBAGAME-26FEB19HOUCHA-CHA -> CHA)
+   */
+  private extractTeamFromTicker(ticker: string): string | undefined {
+    const match = ticker.match(/-([A-Z]{2,4})$/);
+    return match ? match[1] : undefined;
+  }
+
+  /**
+   * Convert a Kalshi row to one market with Yes/No outcomes (matches Kalshi display)
+   */
+  private rowToYesNoMarket(
+    row: { ticker: string; title: string; yes_bid: number; yes_ask: number; no_bid: number; no_ask: number; volume: number },
+    titleShort: string,
+    question: string,
+    outcomeSpecs: Array<{ label: string; kalshiOutcome: 'YES' | 'NO'; useNoPrices?: boolean; teamAbbr?: string }>,
+    marketTeamAbbr?: string
+  ): ActivityWatcherMarket {
+    const outcomes = outcomeSpecs.map(spec => {
+      const teamAbbr = spec.teamAbbr ?? marketTeamAbbr;
+      const base = {
+        label: spec.label,
+        kalshiTicker: row.ticker,
+        kalshiOutcome: spec.kalshiOutcome as 'YES' | 'NO',
+        ...(teamAbbr && { teamAbbr }),
+      };
+      if (spec.useNoPrices) {
+        return {
+          ...base,
+          price: row.no_ask,
+          probability: row.no_ask,
+          buyPrice: row.no_ask,
+          sellPrice: row.no_bid,
+        };
+      }
+      return {
+        ...base,
+        price: row.yes_ask,
+        probability: row.yes_ask,
+        buyPrice: row.yes_ask,
+        sellPrice: row.yes_bid,
+      };
+    });
+    return {
+      id: row.ticker,
+      title: titleShort,
+      question,
+      volume: this.formatVolume(Number(row.volume) || 0),
+      liquidity: '$0',
+      outcomes,
+    };
+  }
+
+  /**
+   * Derive short title from ticker type for grouping display
+   */
+  private getMarketType(ticker: string): string {
+    const t = ticker.toUpperCase();
+    if (t.includes('GAME-')) return 'Winner';
+    if (t.includes('SPREAD')) return 'Spread';
+    if (t.includes('TOTAL-') && !t.includes('TEAMTOTAL')) return 'Total Points';
+    if (t.includes('TEAMTOTAL')) return 'Team Total';
+    return 'Market';
   }
 
   /**
@@ -332,203 +323,23 @@ class KalshiActivityService {
   }
 
   /**
-   * Extract team name/abbr from ticker
-   */
-  private extractTeamFromTicker(ticker: string): string {
-    const match = ticker.match(/-([A-Z]{2,4})$/);
-    return match ? match[1] : '';
-  }
-
-  /**
-   * Extract point value from spread title (e.g., "Houston wins by over 3.5 Points?" -> 3.5)
-   */
-  private extractSpreadPoints(title: string): number | null {
-    const match = title.match(/wins by over (\d+\.?\d*) Points/i);
-    return match ? parseFloat(match[1]) : null;
-  }
-
-  /**
-   * Extract team name from spread title (e.g., "Houston wins by over 3.5 Points?" -> "Houston")
-   */
-  private extractTeamFromSpreadTitle(title: string): string | null {
-    const match = title.match(/^(\w+) wins by over/i);
-    return match ? match[1] : null;
-  }
-
-  /**
-   * Extract total value from ticker (e.g., "KXNBATOTAL-26FEB05CHAHOU-220" -> 220.5)
-   */
-  private extractTotalFromTicker(ticker: string): number | null {
-    const match = ticker.match(/-(\d+)$/);
-    return match ? parseFloat(match[1]) + 0.5 : null;
-  }
-
-  /**
    * Format volume for display
+   * PostgreSQL returns numeric as string — coerce to number before toFixed
    */
-  private formatVolume(value: number | null | undefined): string {
-    if (value == null || isNaN(value)) {
+  private formatVolume(value: number | string | null | undefined): string {
+    const num = Number(value);
+    if (value == null || value === undefined || isNaN(num)) {
       return '$0';
     }
-    if (value >= 1000000) {
-      return `$${(value / 1000000).toFixed(2)}M`;
+    if (num >= 1000000) {
+      return `$${(num / 1000000).toFixed(2)}M`;
     }
-    if (value >= 1000) {
-      return `$${(value / 1000).toFixed(1)}k`;
+    if (num >= 1000) {
+      return `$${(num / 1000).toFixed(1)}k`;
     }
-    return `$${value.toFixed(0)}`;
+    return `$${num.toFixed(0)}`;
   }
 
-  /**
-   * Build spread markets grouped by point value with paired team outcomes.
-   * For each spread value (e.g., 3.5), creates a market with:
-   * - Away team +X.5 (underdog covering)
-   * - Home team -X.5 (favorite covering)
-   * When Kalshi only has one market per spread (one row per point value), the
-   * complementary outcome is derived from the same row's NO side (no_ask/no_bid).
-   */
-  private buildSpreadMarkets(
-    spreadRows: Array<{ ticker: string; title: string; yes_bid: number; yes_ask: number; no_bid: number; no_ask: number; volume: number }>,
-    homeAbbr: string | undefined,
-    awayAbbr: string | undefined,
-    homeTeamName?: string | null,
-    awayTeamName?: string | null
-  ): ActivityWatcherMarket[] {
-    // Group spread markets by point value
-    const spreadByPoints = new Map<number, typeof spreadRows>();
-
-    for (const row of spreadRows) {
-      const points = this.extractSpreadPoints(row.title);
-      if (points !== null) {
-        const existing = spreadByPoints.get(points) || [];
-        existing.push(row);
-        spreadByPoints.set(points, existing);
-      }
-    }
-
-    const awayLabel = awayTeamName || awayAbbr || 'Away';
-    const homeLabel = homeTeamName || homeAbbr || 'Home';
-
-    // Sort by point value (ascending) and create markets
-    const sortedPoints = Array.from(spreadByPoints.keys()).sort((a, b) => a - b);
-    const markets: ActivityWatcherMarket[] = [];
-
-    for (const points of sortedPoints) {
-      const rows = spreadByPoints.get(points) || [];
-
-      // Find home and away team spread markets for this point value
-      let homeSpread: typeof rows[0] | undefined;
-      let awaySpread: typeof rows[0] | undefined;
-
-      for (const row of rows) {
-        const teamName = this.extractTeamFromSpreadTitle(row.title);
-        if (!teamName) continue;
-
-        const teamNameUpper = teamName.toUpperCase();
-        if (homeAbbr && (teamNameUpper.includes(homeAbbr) || row.ticker.toUpperCase().includes(`-${homeAbbr}`))) {
-          homeSpread = row;
-        } else if (awayAbbr && (teamNameUpper.includes(awayAbbr) || row.ticker.toUpperCase().includes(`-${awayAbbr}`))) {
-          awaySpread = row;
-        } else {
-          if (!awaySpread) {
-            awaySpread = row;
-          } else if (!homeSpread) {
-            homeSpread = row;
-          }
-        }
-      }
-
-      const outcomes: Array<{ label: string; price: number; probability: number; buyPrice: number; sellPrice: number }> = [];
-
-      if (awaySpread && homeSpread) {
-        // Both sides: use each row's YES prices
-        const awayName = this.extractTeamFromSpreadTitle(awaySpread.title) || awayLabel;
-        const homeName = this.extractTeamFromSpreadTitle(homeSpread.title) || homeLabel;
-        outcomes.push(
-          { label: `${awayName} +${points}`, price: awaySpread.yes_ask, probability: awaySpread.yes_ask, buyPrice: awaySpread.yes_ask, sellPrice: awaySpread.yes_bid },
-          { label: `${homeName} -${points}`, price: homeSpread.yes_ask, probability: homeSpread.yes_ask, buyPrice: homeSpread.yes_ask, sellPrice: homeSpread.yes_bid }
-        );
-      } else if (awaySpread) {
-        // Only away row: YES = away +points, NO = home -points
-        const awayName = this.extractTeamFromSpreadTitle(awaySpread.title) || awayLabel;
-        outcomes.push(
-          { label: `${awayName} +${points}`, price: awaySpread.yes_ask, probability: awaySpread.yes_ask, buyPrice: awaySpread.yes_ask, sellPrice: awaySpread.yes_bid },
-          { label: `${homeLabel} -${points}`, price: awaySpread.no_ask, probability: awaySpread.no_ask, buyPrice: awaySpread.no_ask, sellPrice: awaySpread.no_bid }
-        );
-      } else if (homeSpread) {
-        // Only home row: YES = home -points, NO = away +points (order: away first, home second)
-        const homeName = this.extractTeamFromSpreadTitle(homeSpread.title) || homeLabel;
-        outcomes.push(
-          { label: `${awayLabel} +${points}`, price: homeSpread.no_ask, probability: homeSpread.no_ask, buyPrice: homeSpread.no_ask, sellPrice: homeSpread.no_bid },
-          { label: `${homeName} -${points}`, price: homeSpread.yes_ask, probability: homeSpread.yes_ask, buyPrice: homeSpread.yes_ask, sellPrice: homeSpread.yes_bid }
-        );
-      }
-
-      if (outcomes.length > 0) {
-        const totalVolume = rows.reduce((sum, m) => sum + (m.volume || 0), 0);
-        markets.push({
-          id: `spread-${points}`,
-          title: 'Spread',
-          question: `Point Spread ${points}`,
-          volume: this.formatVolume(totalVolume),
-          liquidity: '$0',
-          outcomes,
-        });
-      }
-    }
-
-    return markets;
-  }
-
-  /**
-   * Build total markets with Over/Under outcomes
-   * For each total value (e.g., 217.5), creates a market with:
-   * - Over X.5 (Yes side)
-   * - Under X.5 (No side)
-   */
-  private buildTotalMarkets(
-    totalRows: Array<{ ticker: string; title: string; yes_bid: number; yes_ask: number; no_bid: number; no_ask: number; volume: number }>
-  ): ActivityWatcherMarket[] {
-    // Sort by total value (ascending)
-    const sortedRows = [...totalRows].sort((a, b) => {
-      const totalA = this.extractTotalFromTicker(a.ticker) || 0;
-      const totalB = this.extractTotalFromTicker(b.ticker) || 0;
-      return totalA - totalB;
-    });
-
-    const markets: ActivityWatcherMarket[] = [];
-
-    for (const row of sortedRows) {
-      const totalValue = this.extractTotalFromTicker(row.ticker);
-      if (totalValue === null) continue;
-
-      markets.push({
-        id: `total-${totalValue}`,
-        title: 'Total Points',
-        question: `Total Points ${totalValue}`,
-        volume: this.formatVolume(row.volume || 0),
-        liquidity: '$0',
-        outcomes: [
-          {
-            label: `Over ${totalValue}`,
-            price: row.yes_ask,
-            probability: row.yes_ask,
-            buyPrice: row.yes_ask,
-            sellPrice: row.yes_bid,
-          },
-          {
-            label: `Under ${totalValue}`,
-            price: row.no_ask,
-            probability: row.no_ask,
-            buyPrice: row.no_ask,
-            sellPrice: row.no_bid,
-          },
-        ],
-      });
-    }
-
-    return markets;
-  }
 }
 
 export const kalshiActivityService = new KalshiActivityService();

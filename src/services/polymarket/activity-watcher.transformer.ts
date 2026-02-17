@@ -15,6 +15,8 @@ export interface ActivityWatcherOutcome {
   // Trading fields (Kalshi)
   kalshiTicker?: string; // Kalshi market ticker for this outcome
   kalshiOutcome?: 'YES' | 'NO'; // Kalshi side for this outcome
+  /** Kalshi moneyline only: team abbr from ticker (e.g. CHA, HOU) so frontend can show "Yes (CHA)" */
+  teamAbbr?: string;
 }
 
 export interface ActivityWatcherMarket {
