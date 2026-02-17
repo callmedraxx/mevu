@@ -48,20 +48,24 @@ export function initRedisClusterBroadcast(): boolean {
     const redisOptions = {
       maxRetriesPerRequest: 3,
       connectTimeout: 10000,
-      commandTimeout: 15000,  // Increased from 5s to 15s for high throughput
-      enableOfflineQueue: true,  // Queue commands when disconnected
+      commandTimeout: 15000,
+      enableOfflineQueue: true,
       retryStrategy: (times: number) => {
         if (times > 10) return null;
         return Math.min(times * 500, 5000);
       },
+      // Only reconnect on READONLY (cluster failover). TCP errors are handled by retryStrategy.
       reconnectOnError: (err: Error) => {
-        const targetErrors = ['READONLY', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'];
-        return targetErrors.some((e) => err.message.includes(e));
+        return err.message.includes('READONLY');
       },
     };
 
     redisPub = new Redis(redisUrl, redisOptions);
     redisSub = new Redis(redisUrl, redisOptions);
+
+    // Prevent MaxListenersExceeded warning during reconnection cycles
+    redisPub.setMaxListeners(20);
+    redisSub.setMaxListeners(20);
 
     redisPub.on('error', (err) =>
       logger.warn({ message: 'Redis cluster broadcast (pub) error', error: err.message })

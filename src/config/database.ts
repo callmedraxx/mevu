@@ -32,8 +32,9 @@ let poolInstance: Pool | null = null;
 
 export const pool: Pool = (() => {
   const nodeEnv = process.env.NODE_ENV || 'development';
-  
-  if (nodeEnv === 'production') {
+  const hasDb = !!process.env.DATABASE_URL;
+
+  if (nodeEnv === 'production' || hasDb) {
     if (!poolInstance) {
       // Parse connection string to ensure no statement_timeout is in it
       const connectionString = process.env.DATABASE_URL || '';
@@ -117,8 +118,9 @@ export async function connectWithRetry(
   initialDelay: number = 100
 ): Promise<any> {
   const nodeEnv = process.env.NODE_ENV || 'development';
-  
-  if (nodeEnv !== 'production') {
+  const hasDb = !!process.env.DATABASE_URL;
+
+  if (nodeEnv !== 'production' && !hasDb) {
     throw new Error('Database pool not available in development mode. Use in-memory storage instead.');
   }
   

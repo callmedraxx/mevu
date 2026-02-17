@@ -65,7 +65,7 @@ describe('DFlow Client', () => {
     });
 
     expect(result.transaction).toBe('serialized-tx-base64');
-    expect(result.orderId).toBe('ord-123');
+    expect(result.outAmount).toBeDefined();
   });
 
   it('isConfigured should return true when DFLOW_API_KEY set', async () => {

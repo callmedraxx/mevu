@@ -21,6 +21,7 @@ import oceanRouter from './ocean';
 import kalshiTradingRouter from './kalshi-trading';
 import announcementsRouter from './announcements';
 import proofRouter from './proof';
+import cryptoMarketsRouter from './crypto-markets';
 
 const router = Router();
 
@@ -107,5 +108,6 @@ router.use('/ocean', oceanRouter);
 router.use('/kalshi-trading', kalshiTradingRouter);
 router.use('/announcements', announcementsRouter);
 router.use('/proof', proofRouter);
+router.use('/crypto-markets', cryptoMarketsRouter);
 
 export default router;

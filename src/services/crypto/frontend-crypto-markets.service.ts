@@ -338,3 +338,86 @@ export async function getCurrentMarketBySeriesSlug(
     client.release();
   }
 }
+
+/**
+ * Get a timeline of markets in a series around the current time.
+ * Returns `past` (most recent N ended) + `current` (if any) + `future` (next N upcoming).
+ * Each entry includes slug, start_time, end_date, and opening_price.
+ * Past markets also include outcome data via the SSR past-results.
+ */
+export interface TimelineMarket {
+  slug: string;
+  startTime: string;
+  endTime: string;
+  openingPrice: number | null;
+  status: 'past' | 'current' | 'future';
+  outcome: 'up' | 'down' | null; // null for current/future
+}
+
+export async function getSeriesTimeline(
+  seriesSlug: string,
+  pastCount = 4,
+  futureCount = 3,
+): Promise<TimelineMarket[]> {
+  if (!process.env.DATABASE_URL) return [];
+
+  const client = await connectWithRetry();
+  try {
+    // Single query: grab a window around NOW
+    const res = await client.query(
+      `(
+        SELECT slug, start_time, end_date, opening_price, markets, 'past' AS status
+        FROM crypto_markets
+        WHERE series_slug = $1 AND end_date <= NOW() AND start_time IS NOT NULL
+        ORDER BY start_time DESC
+        LIMIT $2
+      )
+      UNION ALL
+      (
+        SELECT slug, start_time, end_date, opening_price, markets, 'current' AS status
+        FROM crypto_markets
+        WHERE series_slug = $1 AND start_time <= NOW() AND end_date > NOW() AND start_time IS NOT NULL
+        ORDER BY start_time DESC
+        LIMIT 1
+      )
+      UNION ALL
+      (
+        SELECT slug, start_time, end_date, opening_price, markets, 'future' AS status
+        FROM crypto_markets
+        WHERE series_slug = $1 AND start_time > NOW() AND start_time IS NOT NULL
+        ORDER BY start_time ASC
+        LIMIT $3
+      )
+      ORDER BY start_time ASC`,
+      [seriesSlug, pastCount, futureCount]
+    );
+
+    return res.rows.map((r: Record<string, unknown>) => {
+      let outcome: 'up' | 'down' | null = null;
+      if (r.status === 'past') {
+        // Derive outcome from outcomePrices: [upPrice, downPrice]
+        try {
+          const mkts = typeof r.markets === 'string' ? JSON.parse(r.markets) : r.markets;
+          if (Array.isArray(mkts) && mkts.length > 0) {
+            const prices = mkts[0].outcomePrices;
+            if (Array.isArray(prices) && prices.length >= 2) {
+              const upPrice = parseFloat(prices[0]);
+              outcome = upPrice > 0.5 ? 'up' : 'down';
+            }
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      return {
+        slug: r.slug as string,
+        startTime: (r.start_time as Date).toISOString(),
+        endTime: (r.end_date as Date).toISOString(),
+        openingPrice: r.opening_price != null ? Number(r.opening_price) : null,
+        status: r.status as 'past' | 'current' | 'future',
+        outcome,
+      };
+    });
+  } finally {
+    client.release();
+  }
+}

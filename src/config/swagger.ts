@@ -73,6 +73,10 @@ const swaggerDefinition: SwaggerDefinition = {
       name: 'WhaleProfile',
       description: 'Whale trader profile data from Polymarket. Get stats, positions, trades, and charts for any wallet.',
     },
+    {
+      name: 'CryptoMarkets',
+      description: 'Crypto prediction markets (Polymarket) in frontend format. Paginated list with timeframe/asset filters, and single market by slug or id.',
+    },
   ],
   components: {
     schemas: {
@@ -282,6 +286,31 @@ const swaggerDefinition: SwaggerDefinition = {
         properties: {
           home: { type: 'number', example: 99 },
           away: { type: 'number', example: 82 },
+        },
+      },
+      PredictionMarket: {
+        type: 'object',
+        description: 'Frontend-formatted crypto/politics prediction market',
+        properties: {
+          id: { type: 'string', example: '0x123' },
+          slug: { type: 'string', example: 'will-bitcoin-exceed-120000' },
+          question: { type: 'string', example: 'Will Bitcoin exceed $120,000 by March 2026?' },
+          category: { type: 'string', enum: ['crypto', 'politics'] },
+          subcategory: { type: 'string', example: 'Bitcoin' },
+          timeframe: { type: 'string', example: 'monthly', description: '15min, hourly, 4hour, daily, weekly, monthly, pre-market, etf' },
+          yesPrice: { type: 'number', example: 67 },
+          noPrice: { type: 'number', example: 33 },
+          yesProbability: { type: 'number', example: 67 },
+          volume: { type: 'string', example: '$4.2M' },
+          liquidity: { type: 'string', example: '$890K' },
+          traders: { type: 'number', example: 12450 },
+          percentChange: { type: 'number', example: 3.2 },
+          endDate: { type: 'string', example: '2026-03-31' },
+          isLive: { type: 'boolean' },
+          icon: { type: 'string' },
+          tags: { type: 'array', items: { type: 'string' } },
+          kalshiYesPrice: { type: 'number', nullable: true },
+          kalshiNoPrice: { type: 'number', nullable: true },
         },
       },
       LiveStats: {

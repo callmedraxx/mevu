@@ -19,9 +19,15 @@ export interface LiveGameStored {
 }
 
 let redisClient: Redis | null = null;
+let redisDisabled = false; // Circuit breaker: true when Redis is unstable
 const inMemoryGames = new Map<string, string>(); // id -> JSON
 const inMemoryGidToEid = new Map<number, string>();
 const inMemorySlugToId = new Map<string, string>();
+
+// Track rapid reconnections to detect unstable connections
+const RECONNECT_WINDOW_MS = 30_000; // 30 second window
+const MAX_RECONNECTS_IN_WINDOW = 10; // Max reconnections before circuit-breaking
+let reconnectTimestamps: number[] = [];
 
 function reviveDates(json: Record<string, unknown>): void {
   if (json.createdAt && typeof json.createdAt === 'string') {
@@ -39,7 +45,7 @@ function parseGame(jsonStr: string): LiveGameStored {
 }
 
 function useRedis(): boolean {
-  return redisClient !== null;
+  return redisClient !== null && !redisDisabled;
 }
 
 /**
@@ -55,23 +61,26 @@ export function initRedisGamesCache(): boolean {
     redisClient = new Redis(redisUrl, {
       maxRetriesPerRequest: 3,
       connectTimeout: 10000,
-      commandTimeout: 15000,  // Increased for high throughput
-      enableOfflineQueue: true,  // Queue commands when disconnected
+      commandTimeout: 15000,
+      enableOfflineQueue: true,
       retryStrategy: (times) => {
         if (times > 10) {
           logger.error({ message: 'Redis games cache max retries reached, giving up' });
-          return null; // Stop retrying
+          return null;
         }
         const delay = Math.min(times * 500, 5000);
-        logger.info({ message: 'Redis games cache reconnecting', attempt: times, delayMs: delay });
+        logger.info({ message: 'Redis games cache retrying connection', attempt: times, delayMs: delay });
         return delay;
       },
+      // Only reconnect on READONLY (Redis cluster failover). TCP-level errors
+      // (ECONNRESET, ETIMEDOUT, ECONNREFUSED) are handled by retryStrategy.
       reconnectOnError: (err) => {
-        // Reconnect on connection reset or timeout errors
-        const targetErrors = ['READONLY', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'];
-        return targetErrors.some((e) => err.message.includes(e));
+        return err.message.includes('READONLY');
       },
     });
+
+    // Prevent MaxListenersExceeded warning during reconnection cycles
+    redisClient.setMaxListeners(20);
 
     redisClient.on('error', (err) =>
       logger.warn({ message: 'Redis games cache error', error: err.message })
@@ -81,9 +90,32 @@ export function initRedisGamesCache(): boolean {
       logger.info({ message: 'Redis games cache connected' })
     );
 
-    redisClient.on('ready', () =>
-      logger.info({ message: 'Redis games cache ready' })
-    );
+    redisClient.on('ready', () => {
+      logger.info({ message: 'Redis games cache ready' });
+      // Connection stabilized — re-enable Redis if it was circuit-broken
+      if (redisDisabled) {
+        redisDisabled = false;
+        reconnectTimestamps = [];
+        logger.info({ message: 'Redis games cache re-enabled after stable connection' });
+      }
+    });
+
+    redisClient.on('close', () => {
+      // Track rapid reconnection cycles to detect unstable connections
+      const now = Date.now();
+      reconnectTimestamps.push(now);
+      // Keep only timestamps within the window
+      reconnectTimestamps = reconnectTimestamps.filter(t => now - t < RECONNECT_WINDOW_MS);
+
+      if (reconnectTimestamps.length >= MAX_RECONNECTS_IN_WINDOW && !redisDisabled) {
+        redisDisabled = true;
+        logger.error({
+          message: 'Redis games cache circuit breaker triggered — too many rapid reconnections, falling back to in-memory',
+          reconnectsInWindow: reconnectTimestamps.length,
+          windowMs: RECONNECT_WINDOW_MS,
+        });
+      }
+    });
 
     redisClient.on('reconnecting', () =>
       logger.info({ message: 'Redis games cache reconnecting' })

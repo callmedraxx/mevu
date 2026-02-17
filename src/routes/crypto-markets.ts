@@ -11,8 +11,10 @@ import {
   getFrontendCryptoMarketByIdFromDatabase,
   getCryptoMarketDetailBySlug,
   getCurrentMarketBySeriesSlug,
+  getSeriesTimeline,
 } from '../services/crypto/frontend-crypto-markets.service';
 import { cryptoMarketsService } from '../services/crypto/crypto-markets.service';
+import { getCryptoTrades, getCryptoHolders, getCryptoWhales } from '../services/crypto/crypto-trading-data.service';
 
 const router = Router();
 
@@ -352,6 +354,118 @@ router.get('/series/:seriesSlug/current', async (req: Request, res: Response) =>
       success: false,
       error: 'Failed to fetch current market',
     });
+  }
+});
+
+/**
+ * @swagger
+ * /api/crypto-markets/series/{seriesSlug}/timeline:
+ *   get:
+ *     summary: Get a timeline of markets in a series
+ *     description: Returns past, current, and future markets around now for the time window selector widget.
+ *     tags: [CryptoMarkets]
+ *     parameters:
+ *       - in: path
+ *         name: seriesSlug
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: past
+ *         schema:
+ *           type: integer
+ *           default: 4
+ *       - in: query
+ *         name: future
+ *         schema:
+ *           type: integer
+ *           default: 3
+ *     responses:
+ *       200:
+ *         description: Timeline of markets
+ */
+router.get('/series/:seriesSlug/timeline', async (req: Request, res: Response) => {
+  try {
+    const { seriesSlug } = req.params;
+    const past = Math.min(Number(req.query.past) || 4, 20);
+    const future = Math.min(Number(req.query.future) || 3, 20);
+    const timeline = await getSeriesTimeline(seriesSlug, past, future);
+    return res.json({ success: true, timeline });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching series timeline',
+      seriesSlug: req.params.seriesSlug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({ success: false, error: 'Failed to fetch timeline' });
+  }
+});
+
+/**
+ * GET /api/crypto-markets/trades/:slug
+ * Trades for a crypto market (cached in DB, fetches from Polymarket with cooldown).
+ */
+router.get('/trades/:slug', async (req: Request, res: Response) => {
+  try {
+    const { slug } = req.params;
+    const limit = Math.min(parseInt(req.query.limit as string, 10) || 100, 500);
+    const result = await getCryptoTrades(slug, limit);
+    if (!result) {
+      return res.status(404).json({ success: false, error: 'Market not found' });
+    }
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching crypto trades',
+      slug: req.params.slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({ success: false, error: 'Failed to fetch trades' });
+  }
+});
+
+/**
+ * GET /api/crypto-markets/holders/:slug
+ * Top holders for a crypto market (cached in DB, fetches from Polymarket with cooldown).
+ */
+router.get('/holders/:slug', async (req: Request, res: Response) => {
+  try {
+    const { slug } = req.params;
+    const result = await getCryptoHolders(slug);
+    if (!result) {
+      return res.status(404).json({ success: false, error: 'Market not found' });
+    }
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching crypto holders',
+      slug: req.params.slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({ success: false, error: 'Failed to fetch holders' });
+  }
+});
+
+/**
+ * GET /api/crypto-markets/whales/:slug
+ * Whale trades (>= $1000) for a crypto market.
+ */
+router.get('/whales/:slug', async (req: Request, res: Response) => {
+  try {
+    const { slug } = req.params;
+    const limit = Math.min(parseInt(req.query.limit as string, 10) || 100, 500);
+    const result = await getCryptoWhales(slug, limit);
+    if (!result) {
+      return res.status(404).json({ success: false, error: 'Market not found' });
+    }
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching crypto whale trades',
+      slug: req.params.slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({ success: false, error: 'Failed to fetch whale trades' });
   }
 });
 

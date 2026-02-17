@@ -7,11 +7,14 @@ import { Router, Request, Response } from 'express';
 import { logger } from '../config/logger';
 import { geoDetectMiddleware, requireKalshiRegion } from '../middleware/geo-detect.middleware';
 import { executeKalshiBuy, executeKalshiSell } from '../services/kalshi/kalshi-trading.service';
+import { dflowMetadataService } from '../services/dflow/dflow-metadata.service';
 import { redeemKalshiPosition, getRedeemablePositions } from '../services/kalshi/kalshi-redemption.service';
 import { getUserByPrivyId } from '../services/privy/user.service';
 import { handleOnrampWebhook } from '../services/onramp/onramp-webhook.service';
 import { subscribeToKalshiUserBroadcast } from '../services/redis-cluster-broadcast.service';
 import { pool, getDatabaseConfig } from '../config/database';
+import { getSolanaUsdcBalance } from '../services/solana/solana-usdc-balance';
+import { setKalshiUsdcBalance } from '../services/privy/kalshi-user.service';
 
 function extractErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -24,6 +27,16 @@ const KALSHI_ENABLED = process.env.KALSHI_TRADING_ENABLED === 'true';
 
 router.use(geoDetectMiddleware);
 router.use(requireKalshiRegion);
+
+/**
+ * GET /api/kalshi-trading/available-markets
+ * Returns Kalshi tickers with cached DFlow mappings.
+ * Mappings are populated on-demand when users trade — no bulk sync needed.
+ */
+router.get('/available-markets', async (_req: Request, res: Response) => {
+  const tickers = await dflowMetadataService.listCachedTickers();
+  return res.json({ tickers, count: tickers.length });
+});
 
 router.post('/buy', async (req: Request, res: Response) => {
   if (!KALSHI_ENABLED) return res.status(503).json({ success: false, error: 'Kalshi trading disabled' });
@@ -95,7 +108,19 @@ router.get('/portfolio', async (req: Request, res: Response) => {
     });
   }
   const user = await getUserByPrivyId(privyUserId);
-  const balance = parseFloat(user?.kalshiUsdcBalance ?? '0') || 0;
+  let balance = parseFloat(user?.kalshiUsdcBalance ?? '0') || 0;
+
+  // Always use on-chain balance as source of truth
+  const solanaAddress = (user as any)?.solanaWalletAddress;
+  if (solanaAddress) {
+    const onChainBalance = await getSolanaUsdcBalance(solanaAddress);
+    const onChainNum = parseFloat(onChainBalance) || 0;
+    if (Math.abs(onChainNum - balance) > 0.001) {
+      await setKalshiUsdcBalance(privyUserId, onChainBalance);
+    }
+    balance = onChainNum;
+  }
+
   const client = await pool.connect();
   try {
     const r = await client.query(
@@ -147,8 +172,21 @@ router.get('/balance', async (req: Request, res: Response) => {
   const privyUserId = req.query.privyUserId as string;
   if (!privyUserId) return res.status(400).json({ success: false, error: 'Missing privyUserId' });
   const user = await getUserByPrivyId(privyUserId);
-  const balance = user?.kalshiUsdcBalance ?? '0';
-  return res.json({ balance });
+
+  // Always use on-chain balance as source of truth (Alchemy Solana webhooks are unreliable)
+  const solanaAddress = (user as any)?.solanaWalletAddress;
+  if (solanaAddress) {
+    const onChainBalance = await getSolanaUsdcBalance(solanaAddress);
+    const dbBalance = parseFloat(user?.kalshiUsdcBalance ?? '0') || 0;
+    const onChainNum = parseFloat(onChainBalance) || 0;
+    // Sync to DB if different (avoid unnecessary writes)
+    if (Math.abs(onChainNum - dbBalance) > 0.001) {
+      await setKalshiUsdcBalance(privyUserId, onChainBalance);
+    }
+    return res.json({ balance: onChainBalance });
+  }
+
+  return res.json({ balance: user?.kalshiUsdcBalance ?? '0' });
 });
 
 /**

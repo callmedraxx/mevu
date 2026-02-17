@@ -140,6 +140,32 @@ export async function subtractFromKalshiUsdcBalance(
   }
 }
 
+/**
+ * Set the user's Kalshi USDC balance to an absolute value.
+ * Used by the on-chain sync fallback.
+ */
+export async function setKalshiUsdcBalance(
+  privyUserId: string,
+  absoluteBalance: string
+): Promise<boolean> {
+  const dbConfig = getDatabaseConfig();
+  if (dbConfig.type !== 'postgres') return false;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users SET
+         kalshi_usdc_balance = $1::numeric,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE privy_user_id = $2`,
+      [absoluteBalance, privyUserId]
+    );
+    return (result.rowCount ?? 0) > 0;
+  } finally {
+    client.release();
+  }
+}
+
 export async function createUserWithRegion(
   privyUserId: string,
   username: string,

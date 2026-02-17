@@ -31,85 +31,24 @@ vi.mock('../polymarket/frontend-game.transformer', () => ({
 import { kalshiActivityService } from './kalshi-activity.service';
 
 // =============================================================================
-// UNIT TESTS: Helper Functions
+// UNIT TESTS: Helper Functions (getMarketType, rowToYesNoMarket via buildActivityGame)
 // =============================================================================
 
 describe('Kalshi Activity Service - Helper Functions', () => {
-  // Access private methods for testing
-  const extractSpreadPoints = (kalshiActivityService as any).extractSpreadPoints.bind(kalshiActivityService);
-  const extractTeamFromSpreadTitle = (kalshiActivityService as any).extractTeamFromSpreadTitle.bind(kalshiActivityService);
-  const extractTotalFromTicker = (kalshiActivityService as any).extractTotalFromTicker.bind(kalshiActivityService);
-  const extractTeamFromTicker = (kalshiActivityService as any).extractTeamFromTicker.bind(kalshiActivityService);
+  const getMarketType = (kalshiActivityService as any).getMarketType?.bind(kalshiActivityService);
 
-  describe('extractSpreadPoints', () => {
-    it('should extract point value from standard spread title', () => {
-      expect(extractSpreadPoints('Houston wins by over 3.5 Points?')).toBe(3.5);
-      expect(extractSpreadPoints('Charlotte wins by over 6.5 Points?')).toBe(6.5);
-      expect(extractSpreadPoints('Lakers wins by over 12.5 Points?')).toBe(12.5);
+  describe('getMarketType', () => {
+    it('should return Winner for GAME tickers', () => {
+      expect(getMarketType('KXNBAGAME-26FEB05CHAHOU-HOU')).toBe('Winner');
     });
-
-    it('should handle whole number spreads', () => {
-      expect(extractSpreadPoints('Houston wins by over 3 Points?')).toBe(3);
-      expect(extractSpreadPoints('Charlotte wins by over 10 Points?')).toBe(10);
+    it('should return Spread for SPREAD tickers', () => {
+      expect(getMarketType('KXNBASPREAD-26FEB05CHAHOU-CHA3')).toBe('Spread');
     });
-
-    it('should be case insensitive', () => {
-      expect(extractSpreadPoints('HOUSTON WINS BY OVER 3.5 POINTS?')).toBe(3.5);
-      expect(extractSpreadPoints('houston wins by over 3.5 points?')).toBe(3.5);
+    it('should return Total Points for TOTAL tickers (not TEAMTOTAL)', () => {
+      expect(getMarketType('KXNBATOTAL-26FEB05CHAHOU-220')).toBe('Total Points');
     });
-
-    it('should return null for invalid titles', () => {
-      expect(extractSpreadPoints('Houston vs Charlotte')).toBeNull();
-      expect(extractSpreadPoints('Over 220.5 points')).toBeNull();
-      expect(extractSpreadPoints('')).toBeNull();
-    });
-  });
-
-  describe('extractTeamFromSpreadTitle', () => {
-    it('should extract team name from spread title', () => {
-      expect(extractTeamFromSpreadTitle('Houston wins by over 3.5 Points?')).toBe('Houston');
-      expect(extractTeamFromSpreadTitle('Charlotte wins by over 6.5 Points?')).toBe('Charlotte');
-      expect(extractTeamFromSpreadTitle('Lakers wins by over 12.5 Points?')).toBe('Lakers');
-    });
-
-    it('should be case insensitive', () => {
-      expect(extractTeamFromSpreadTitle('HOUSTON wins by over 3.5 Points?')).toBe('HOUSTON');
-    });
-
-    it('should return null for invalid titles', () => {
-      expect(extractTeamFromSpreadTitle('Over 220.5 points')).toBeNull();
-      expect(extractTeamFromSpreadTitle('')).toBeNull();
-    });
-  });
-
-  describe('extractTotalFromTicker', () => {
-    it('should extract total value from ticker and add 0.5', () => {
-      expect(extractTotalFromTicker('KXNBATOTAL-26FEB05CHAHOU-220')).toBe(220.5);
-      expect(extractTotalFromTicker('KXNBATOTAL-26FEB05CHAHOU-217')).toBe(217.5);
-      expect(extractTotalFromTicker('KXNBATOTAL-26FEB05CHAHOU-205')).toBe(205.5);
-    });
-
-    it('should handle different sport prefixes', () => {
-      expect(extractTotalFromTicker('KXNFLTOTAL-26FEB05KCBUF-45')).toBe(45.5);
-      expect(extractTotalFromTicker('KXNHLTOTAL-26FEB05BOSNYY-6')).toBe(6.5);
-    });
-
-    it('should return null for tickers without trailing number', () => {
-      expect(extractTotalFromTicker('KXNBAGAME-26FEB05CHAHOU-CHA')).toBeNull();
-      expect(extractTotalFromTicker('KXNBASPREAD-26FEB05CHAHOU')).toBeNull();
-    });
-  });
-
-  describe('extractTeamFromTicker', () => {
-    it('should extract team abbreviation from ticker', () => {
-      expect(extractTeamFromTicker('KXNBAGAME-26FEB05CHAHOU-HOU')).toBe('HOU');
-      expect(extractTeamFromTicker('KXNBAGAME-26FEB05CHAHOU-CHA')).toBe('CHA');
-      expect(extractTeamFromTicker('KXNFLGAME-26FEB05KCBUF-KC')).toBe('KC');
-    });
-
-    it('should return empty string for invalid tickers', () => {
-      expect(extractTeamFromTicker('KXNBATOTAL-26FEB05CHAHOU-220')).toBe('');
-      expect(extractTeamFromTicker('invalid')).toBe('');
+    it('should return Team Total for TEAMTOTAL tickers', () => {
+      expect(getMarketType('KXNBATEAMTOTAL-26FEB05CHAHOU-CHA100')).toBe('Team Total');
     });
   });
 });
@@ -198,284 +137,81 @@ describe('Kalshi Activity Service - Market Grouping', () => {
 });
 
 // =============================================================================
-// UNIT TESTS: Spread Market Building
+// UNIT TESTS: One market per row, Yes/No outcomes (replaces spread/total grouping)
 // =============================================================================
 
-describe('Kalshi Activity Service - Spread Market Building', () => {
-  const buildSpreadMarkets = (kalshiActivityService as any).buildSpreadMarkets.bind(kalshiActivityService);
+describe('Kalshi Activity Service - One Market Per Row', () => {
+  const buildActivityGame = (kalshiActivityService as any).buildActivityGame.bind(kalshiActivityService);
+  const mockGame = {
+    id: '193462',
+    slug: 'nba-cha-hou-2026-02-05',
+    sport: 'nba',
+    league: 'nba',
+    homeTeam: { abbr: 'hou', name: 'Rockets', record: '31-18', probability: 58, buyPrice: 59, sellPrice: 58 },
+    awayTeam: { abbr: 'cha', name: 'Hornets', record: '23-28', probability: 42, buyPrice: 42, sellPrice: 41 },
+  };
 
-  const createSpreadRow = (team: string, points: number, yesAsk: number, yesBid: number) => ({
-    ticker: `KXNBASPREAD-26FEB05CHAHOU-${team}${points * 10}`,
-    title: `${team} wins by over ${points} Points?`,
-    yes_bid: yesBid,
-    yes_ask: yesAsk,
-    no_bid: 100 - yesAsk,
-    no_ask: 100 - yesBid,
-    volume: 1000,
-  });
-
-  it('should pair spread markets by point value', () => {
-    const spreadRows = [
-      createSpreadRow('Charlotte', 3.5, 34, 31),
-      createSpreadRow('Houston', 3.5, 51, 49),
+  it('should create one market per Kalshi row with ticker as id', () => {
+    const kalshiRows = [
+      { ticker: 'KXNBASPREAD-26FEB05CHAHOU-CHA3', title: 'Charlotte wins by over 3.5 Points?', yes_bid: 31, yes_ask: 34, no_bid: 66, no_ask: 69, volume: 0 },
+      { ticker: 'KXNBASPREAD-26FEB05CHAHOU-HOU3', title: 'Houston wins by over 3.5 Points?', yes_bid: 49, yes_ask: 51, no_bid: 49, no_ask: 51, volume: 0 },
     ];
-
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA');
-
-    expect(markets).toHaveLength(1);
-    expect(markets[0].id).toBe('spread-3.5');
-    expect(markets[0].outcomes).toHaveLength(2);
+    const result = buildActivityGame(mockGame, kalshiRows);
+    expect(result.markets).toHaveLength(2);
+    expect(result.markets[0].id).toBe('KXNBASPREAD-26FEB05CHAHOU-CHA3');
+    expect(result.markets[1].id).toBe('KXNBASPREAD-26FEB05CHAHOU-HOU3');
   });
 
-  it('should create correct outcome labels for spread markets', () => {
-    const spreadRows = [
-      createSpreadRow('Charlotte', 3.5, 34, 31),
-      createSpreadRow('Houston', 3.5, 51, 49),
+  it('should use actual Kalshi question for each market', () => {
+    const kalshiRows = [
+      { ticker: 'KXNBASPREAD-26FEB05CHAHOU-CHA3', title: 'Charlotte wins by over 3.5 Points?', yes_bid: 31, yes_ask: 34, no_bid: 66, no_ask: 69, volume: 0 },
     ];
-
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA');
-    const outcomes = markets[0].outcomes;
-
-    // Away team (Charlotte) should have +
-    const awayOutcome = outcomes.find((o: any) => o.label.includes('Charlotte'));
-    expect(awayOutcome?.label).toBe('Charlotte +3.5');
-
-    // Home team (Houston) should have -
-    const homeOutcome = outcomes.find((o: any) => o.label.includes('Houston'));
-    expect(homeOutcome?.label).toBe('Houston -3.5');
+    const result = buildActivityGame(mockGame, kalshiRows);
+    expect(result.markets[0].question).toBe('Charlotte wins by over 3.5 Points?');
   });
 
-  it('should use correct prices for each outcome', () => {
-    const spreadRows = [
-      createSpreadRow('Charlotte', 3.5, 34, 31),
-      createSpreadRow('Houston', 3.5, 51, 49),
+  it('should have Yes/No outcomes for each market', () => {
+    const kalshiRows = [
+      { ticker: 'KXNBATOTAL-26FEB05CHAHOU-217', title: 'Over 217.5 points?', yes_bid: 49, yes_ask: 50, no_bid: 50, no_ask: 51, volume: 0 },
     ];
-
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA');
-    const outcomes = markets[0].outcomes;
-
-    const charlotteOutcome = outcomes.find((o: any) => o.label.includes('Charlotte'));
-    expect(charlotteOutcome?.buyPrice).toBe(34);
-    expect(charlotteOutcome?.sellPrice).toBe(31);
-
-    const houstonOutcome = outcomes.find((o: any) => o.label.includes('Houston'));
-    expect(houstonOutcome?.buyPrice).toBe(51);
-    expect(houstonOutcome?.sellPrice).toBe(49);
+    const result = buildActivityGame(mockGame, kalshiRows);
+    const outcomes = result.markets[0].outcomes;
+    expect(outcomes).toHaveLength(2);
+    expect(outcomes[0].label).toBe('Yes');
+    expect(outcomes[1].label).toBe('No');
+    expect(outcomes[0].kalshiOutcome).toBe('YES');
+    expect(outcomes[1].kalshiOutcome).toBe('NO');
   });
 
-  it('should create multiple markets for different point values', () => {
-    const spreadRows = [
-      createSpreadRow('Charlotte', 3.5, 34, 31),
-      createSpreadRow('Houston', 3.5, 51, 49),
-      createSpreadRow('Charlotte', 6.5, 27, 22),
-      createSpreadRow('Houston', 6.5, 41, 38),
-      createSpreadRow('Charlotte', 9.5, 20, 15),
-      createSpreadRow('Houston', 9.5, 33, 29),
+  it('should include kalshiTicker and kalshiOutcome on each outcome for trading', () => {
+    const kalshiRows = [
+      { ticker: 'KXNBASPREAD-26FEB05CHAHOU-CHA3', title: 'Charlotte wins by over 3.5 Points?', yes_bid: 31, yes_ask: 34, no_bid: 66, no_ask: 69, volume: 0 },
     ];
-
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA');
-
-    expect(markets).toHaveLength(3);
-    expect(markets.map((m: any) => m.id)).toEqual(['spread-3.5', 'spread-6.5', 'spread-9.5']);
+    const result = buildActivityGame(mockGame, kalshiRows);
+    const yesOutcome = result.markets[0].outcomes.find((o: any) => o.kalshiOutcome === 'YES');
+    const noOutcome = result.markets[0].outcomes.find((o: any) => o.kalshiOutcome === 'NO');
+    expect(yesOutcome?.kalshiTicker).toBe('KXNBASPREAD-26FEB05CHAHOU-CHA3');
+    expect(noOutcome?.kalshiTicker).toBe('KXNBASPREAD-26FEB05CHAHOU-CHA3');
   });
 
-  it('should sort markets by point value ascending', () => {
-    const spreadRows = [
-      createSpreadRow('Charlotte', 9.5, 20, 15),
-      createSpreadRow('Houston', 9.5, 33, 29),
-      createSpreadRow('Charlotte', 3.5, 34, 31),
-      createSpreadRow('Houston', 3.5, 51, 49),
-      createSpreadRow('Charlotte', 6.5, 27, 22),
-      createSpreadRow('Houston', 6.5, 41, 38),
+  it('should add teamAbbr to moneyline (GAME) outcomes so frontend can show team', () => {
+    const kalshiRows = [
+      { ticker: 'KXNBAGAME-26FEB19HOUCHA-CHA', title: 'Houston at Charlotte Winner?', yes_bid: 44, yes_ask: 45, no_bid: 55, no_ask: 56, volume: 0 },
+      { ticker: 'KXNBAGAME-26FEB19HOUCHA-HOU', title: 'Houston at Charlotte Winner?', yes_bid: 57, yes_ask: 58, no_bid: 42, no_ask: 43, volume: 0 },
     ];
-
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA');
-
-    expect(markets[0].id).toBe('spread-3.5');
-    expect(markets[1].id).toBe('spread-6.5');
-    expect(markets[2].id).toBe('spread-9.5');
+    const result = buildActivityGame(mockGame, kalshiRows);
+    const chaMarket = result.markets.find((m: any) => m.id === 'KXNBAGAME-26FEB19HOUCHA-CHA');
+    const houMarket = result.markets.find((m: any) => m.id === 'KXNBAGAME-26FEB19HOUCHA-HOU');
+    expect(chaMarket?.outcomes.every((o: any) => o.teamAbbr === 'CHA')).toBe(true);
+    expect(houMarket?.outcomes.every((o: any) => o.teamAbbr === 'HOU')).toBe(true);
   });
 
-  it('should derive complementary outcome when only one team has a spread row (away only)', () => {
-    const spreadRows = [
-      createSpreadRow('Charlotte', 3.5, 34, 31),
-      // Missing Houston 3.5 - derive from same row NO side
+  it('should not add teamAbbr to non-moneyline markets', () => {
+    const kalshiRows = [
+      { ticker: 'KXNBASPREAD-26FEB05CHAHOU-CHA3', title: 'Charlotte wins by over 3.5 Points?', yes_bid: 31, yes_ask: 34, no_bid: 66, no_ask: 69, volume: 0 },
     ];
-
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA', 'Houston', 'Charlotte');
-
-    expect(markets).toHaveLength(1);
-    expect(markets[0].outcomes).toHaveLength(2);
-    expect(markets[0].outcomes[0].label).toBe('Charlotte +3.5');
-    expect(markets[0].outcomes[0].buyPrice).toBe(34);
-    expect(markets[0].outcomes[0].sellPrice).toBe(31);
-    expect(markets[0].outcomes[1].label).toBe('Houston -3.5');
-    expect(markets[0].outcomes[1].buyPrice).toBe(100 - 31);
-    expect(markets[0].outcomes[1].sellPrice).toBe(100 - 34);
-  });
-
-  it('should derive complementary outcome when only one team has a spread row (home only)', () => {
-    const spreadRows = [
-      createSpreadRow('Houston', 2.5, 86, 80),
-      // Missing Charlotte 2.5 - derive from same row NO side
-    ];
-
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA', 'Houston', 'Charlotte');
-
-    expect(markets).toHaveLength(1);
-    expect(markets[0].outcomes).toHaveLength(2);
-    expect(markets[0].outcomes[0].label).toBe('Charlotte +2.5');
-    expect(markets[0].outcomes[0].buyPrice).toBe(100 - 80);
-    expect(markets[0].outcomes[0].sellPrice).toBe(100 - 86);
-    expect(markets[0].outcomes[1].label).toBe('Houston -2.5');
-    expect(markets[0].outcomes[1].buyPrice).toBe(86);
-    expect(markets[0].outcomes[1].sellPrice).toBe(80);
-  });
-
-  it('should calculate total volume for paired markets', () => {
-    const spreadRows = [
-      { ...createSpreadRow('Charlotte', 3.5, 34, 31), volume: 500 },
-      { ...createSpreadRow('Houston', 3.5, 51, 49), volume: 750 },
-    ];
-
-    const markets = buildSpreadMarkets(spreadRows, 'HOU', 'CHA');
-
-    // Volume should be formatted as $1.3k (500 + 750 = 1250)
-    expect(markets[0].volume).toBe('$1.3k');
-  });
-
-  it('should handle empty spread rows', () => {
-    const markets = buildSpreadMarkets([], 'HOU', 'CHA');
-    expect(markets).toHaveLength(0);
-  });
-});
-
-// =============================================================================
-// UNIT TESTS: Total Market Building
-// =============================================================================
-
-describe('Kalshi Activity Service - Total Market Building', () => {
-  const buildTotalMarkets = (kalshiActivityService as any).buildTotalMarkets.bind(kalshiActivityService);
-
-  const createTotalRow = (total: number, yesAsk: number, yesBid: number, noAsk: number, noBid: number) => ({
-    ticker: `KXNBATOTAL-26FEB05CHAHOU-${total}`,
-    title: `Over ${total}.5 points scored?`,
-    yes_bid: yesBid,
-    yes_ask: yesAsk,
-    no_bid: noBid,
-    no_ask: noAsk,
-    volume: 1000,
-  });
-
-  it('should create Over/Under outcomes for each total', () => {
-    const totalRows = [
-      createTotalRow(217, 50, 49, 51, 50),
-    ];
-
-    const markets = buildTotalMarkets(totalRows);
-
-    expect(markets).toHaveLength(1);
-    expect(markets[0].id).toBe('total-217.5');
-    expect(markets[0].outcomes).toHaveLength(2);
-  });
-
-  it('should create correct labels for Over/Under', () => {
-    const totalRows = [
-      createTotalRow(217, 50, 49, 51, 50),
-    ];
-
-    const markets = buildTotalMarkets(totalRows);
-    const outcomes = markets[0].outcomes;
-
-    expect(outcomes[0].label).toBe('Over 217.5');
-    expect(outcomes[1].label).toBe('Under 217.5');
-  });
-
-  it('should use yes prices for Over and no prices for Under', () => {
-    const totalRows = [
-      createTotalRow(217, 52, 50, 48, 46),  // yes_ask=52, yes_bid=50, no_ask=48, no_bid=46
-    ];
-
-    const markets = buildTotalMarkets(totalRows);
-    const outcomes = markets[0].outcomes;
-
-    // Over uses Yes prices
-    expect(outcomes[0].buyPrice).toBe(52);   // yes_ask
-    expect(outcomes[0].sellPrice).toBe(50);  // yes_bid
-
-    // Under uses No prices
-    expect(outcomes[1].buyPrice).toBe(48);   // no_ask
-    expect(outcomes[1].sellPrice).toBe(46);  // no_bid
-  });
-
-  it('should create multiple markets for different totals', () => {
-    const totalRows = [
-      createTotalRow(217, 50, 49, 51, 50),
-      createTotalRow(220, 44, 42, 56, 54),
-      createTotalRow(214, 57, 56, 44, 43),
-    ];
-
-    const markets = buildTotalMarkets(totalRows);
-
-    expect(markets).toHaveLength(3);
-  });
-
-  it('should sort markets by total value ascending', () => {
-    const totalRows = [
-      createTotalRow(220, 44, 42, 56, 54),
-      createTotalRow(214, 57, 56, 44, 43),
-      createTotalRow(217, 50, 49, 51, 50),
-    ];
-
-    const markets = buildTotalMarkets(totalRows);
-
-    expect(markets[0].id).toBe('total-214.5');
-    expect(markets[1].id).toBe('total-217.5');
-    expect(markets[2].id).toBe('total-220.5');
-  });
-
-  it('should handle extreme price values', () => {
-    const totalRows = [
-      createTotalRow(200, 95, 93, 7, 5),  // Heavy over favorite
-    ];
-
-    const markets = buildTotalMarkets(totalRows);
-    const outcomes = markets[0].outcomes;
-
-    expect(outcomes[0].buyPrice).toBe(95);  // Over
-    expect(outcomes[1].buyPrice).toBe(7);   // Under
-  });
-
-  it('should include volume for each market', () => {
-    const totalRows = [
-      { ...createTotalRow(217, 50, 49, 51, 50), volume: 5000 },
-    ];
-
-    const markets = buildTotalMarkets(totalRows);
-
-    expect(markets[0].volume).toBe('$5.0k');
-  });
-
-  it('should handle empty total rows', () => {
-    const markets = buildTotalMarkets([]);
-    expect(markets).toHaveLength(0);
-  });
-
-  it('should skip rows with invalid tickers', () => {
-    const totalRows = [
-      {
-        ticker: 'INVALID-TICKER',  // No trailing number
-        title: 'Over 217.5 points?',
-        yes_bid: 49,
-        yes_ask: 50,
-        no_bid: 50,
-        no_ask: 51,
-        volume: 0,
-      },
-    ];
-
-    const markets = buildTotalMarkets(totalRows);
-    expect(markets).toHaveLength(0);
+    const result = buildActivityGame(mockGame, kalshiRows);
+    expect(result.markets[0].outcomes.every((o: any) => o.teamAbbr === undefined)).toBe(true);
   });
 });
 
@@ -509,30 +245,22 @@ describe('Kalshi Activity Service - Integration: Full Market Building', () => {
     },
   };
 
-  it('should build complete activity game with all market types', () => {
+  it('should build complete activity game with one market per Kalshi row', () => {
     const kalshiRows = [
-      // Moneyline
       { ticker: 'KXNBAGAME-26FEB05CHAHOU-CHA', title: 'Charlotte at Houston Winner?', yes_bid: 42, yes_ask: 43, no_bid: 57, no_ask: 58, volume: 0 },
       { ticker: 'KXNBAGAME-26FEB05CHAHOU-HOU', title: 'Charlotte at Houston Winner?', yes_bid: 58, yes_ask: 59, no_bid: 42, no_ask: 43, volume: 0 },
-      // Spreads
       { ticker: 'KXNBASPREAD-26FEB05CHAHOU-CHA3', title: 'Charlotte wins by over 3.5 Points?', yes_bid: 31, yes_ask: 34, no_bid: 66, no_ask: 69, volume: 0 },
       { ticker: 'KXNBASPREAD-26FEB05CHAHOU-HOU3', title: 'Houston wins by over 3.5 Points?', yes_bid: 49, yes_ask: 51, no_bid: 49, no_ask: 51, volume: 0 },
-      // Totals
       { ticker: 'KXNBATOTAL-26FEB05CHAHOU-217', title: 'Over 217.5 points?', yes_bid: 49, yes_ask: 50, no_bid: 50, no_ask: 51, volume: 0 },
     ];
 
     const result = buildActivityGame(mockFrontendGame, kalshiRows);
 
-    // Should have moneyline, spread, and total markets
-    expect(result.markets).toHaveLength(3);
-
-    const moneyline = result.markets.find((m: any) => m.id === 'moneyline');
-    const spread = result.markets.find((m: any) => m.id === 'spread-3.5');
-    const total = result.markets.find((m: any) => m.id === 'total-217.5');
-
-    expect(moneyline).toBeDefined();
-    expect(spread).toBeDefined();
-    expect(total).toBeDefined();
+    // One market per row, each with Yes/No outcomes
+    expect(result.markets).toHaveLength(5);
+    const spreadMarket = result.markets.find((m: any) => m.id === 'KXNBASPREAD-26FEB05CHAHOU-CHA3');
+    expect(spreadMarket?.question).toBe('Charlotte wins by over 3.5 Points?');
+    expect(spreadMarket?.outcomes.map((o: any) => o.label)).toEqual(['Yes', 'No']);
   });
 
   it('should set Kalshi prices on teams from moneyline markets', () => {
@@ -605,25 +333,21 @@ describe('Kalshi Activity Service - Regression: Real Data Format', () => {
     expect(result.platform).toBe('kalshi');
     expect(result.markets.length).toBeGreaterThan(0);
 
-    // Verify spread market format (paired teams at same point value)
-    const spread35 = result.markets.find((m: any) => m.id === 'spread-3.5');
-    expect(spread35).toBeDefined();
-    expect(spread35.outcomes).toHaveLength(2);
-    
-    // Should have "Charlotte +3.5" and "Houston -3.5" (not the raw Kalshi titles)
-    const spreadLabels = spread35.outcomes.map((o: any) => o.label);
-    expect(spreadLabels).toContain('Charlotte +3.5');
-    expect(spreadLabels).toContain('Houston -3.5');
+    // Each Kalshi row = one market with actual question and Yes/No outcomes
+    const spreadCha = result.markets.find((m: any) => m.id === 'KXNBASPREAD-26FEB05CHAHOU-CHA3');
+    expect(spreadCha).toBeDefined();
+    expect(spreadCha.question).toBe('Charlotte wins by over 3.5 Points?');
+    expect(spreadCha.outcomes.map((o: any) => o.label)).toEqual(['Yes', 'No']);
 
-    // Verify total market format (Over/Under at same total)
-    const total217 = result.markets.find((m: any) => m.id === 'total-217.5');
+    // Verify total market format (Yes/No outcomes)
+    const total217 = result.markets.find((m: any) => m.id === 'KXNBATOTAL-26FEB05CHAHOU-217');
     expect(total217).toBeDefined();
     expect(total217.outcomes).toHaveLength(2);
     
-    // Should have "Over 217.5" and "Under 217.5"
+    // Total market has Yes/No outcomes (Kalshi style)
     const totalLabels = total217.outcomes.map((o: any) => o.label);
-    expect(totalLabels).toContain('Over 217.5');
-    expect(totalLabels).toContain('Under 217.5');
+    expect(totalLabels).toContain('Yes');
+    expect(totalLabels).toContain('No');
   });
 
   it('should show both spread outcomes when Kalshi only has one row per spread (single-row spreads)', () => {
@@ -647,39 +371,21 @@ describe('Kalshi Activity Service - Regression: Real Data Format', () => {
 
     const result = buildActivityGame(mockFrontendGame, kalshiRows);
 
-    const spreadMarkets = result.markets.filter((m: any) => m.id?.startsWith('spread-'));
-    expect(spreadMarkets.length).toBeGreaterThanOrEqual(2);
+    // One market per row - find spread markets by ticker
+    const spreadWas1 = result.markets.find((m: any) => m.id === 'KXNBASPREAD-26FEB05WASDET-WAS1');
+    expect(spreadWas1).toBeDefined();
+    expect(spreadWas1.question).toBe('Washington wins by over 1.5 Points?');
+    expect(spreadWas1.outcomes).toHaveLength(2);
+    expect(spreadWas1.outcomes.map((o: any) => o.label)).toEqual(['Yes', 'No']);
+    const yesOutcome = spreadWas1.outcomes.find((o: any) => o.kalshiOutcome === 'YES');
+    expect(yesOutcome?.buyPrice).toBe(12);
+    expect(yesOutcome?.sellPrice).toBe(11);
 
-    for (const market of spreadMarkets) {
-      expect(market.outcomes).toHaveLength(2);
-      const [a, b] = market.outcomes;
-      expect(a.label).toBeDefined();
-      expect(b.label).toBeDefined();
-      expect(a.buyPrice).toBeGreaterThanOrEqual(0);
-      expect(a.sellPrice).toBeGreaterThanOrEqual(0);
-      expect(b.buyPrice).toBeGreaterThanOrEqual(0);
-      expect(b.sellPrice).toBeGreaterThanOrEqual(0);
-    }
-
-    const spread15 = result.markets.find((m: any) => m.id === 'spread-1.5');
-    expect(spread15).toBeDefined();
-    expect(spread15.outcomes).toHaveLength(2);
-    const labels15 = spread15.outcomes.map((o: any) => o.label);
-    expect(labels15).toContain('Washington +1.5');
-    expect(labels15).toContain('Pistons -1.5');
-    const was15 = spread15.outcomes.find((o: any) => o.label.includes('Washington'));
-    expect(was15?.buyPrice).toBe(12);
-    expect(was15?.sellPrice).toBe(11);
-
-    const spread25 = result.markets.find((m: any) => m.id === 'spread-2.5');
-    expect(spread25).toBeDefined();
-    expect(spread25.outcomes).toHaveLength(2);
-    const labels25 = spread25.outcomes.map((o: any) => o.label);
-    expect(labels25).toContain('Wizards +2.5');
-    expect(labels25).toContain('Detroit -2.5');
-    const det25 = spread25.outcomes.find((o: any) => o.label.includes('Detroit') && o.label.includes('-'));
-    expect(det25?.buyPrice).toBe(86);
-    expect(det25?.sellPrice).toBe(80);
+    const spreadDet2 = result.markets.find((m: any) => m.id === 'KXNBASPREAD-26FEB05WASDET-DET2');
+    expect(spreadDet2).toBeDefined();
+    const det2Yes = spreadDet2.outcomes.find((o: any) => o.kalshiOutcome === 'YES');
+    expect(det2Yes?.buyPrice).toBe(86);
+    expect(det2Yes?.sellPrice).toBe(80);
   });
 
   it('should build moneyline market for tennis (single-market sport)', () => {
@@ -707,28 +413,26 @@ describe('Kalshi Activity Service - Regression: Real Data Format', () => {
 
     const result = buildActivityGame(mockFrontendGame, kalshiRows);
 
-    // Verify structure
+    // Verify structure - single market with Yes/No
     expect(result.platform).toBe('kalshi');
     expect(result.kalshiTicker).toBe('KXATPMATCH-26FEB06MANGEA');
     expect(result.markets.length).toBe(1);
 
-    // Verify moneyline market
-    const moneyline = result.markets.find((m: any) => m.id === 'moneyline');
-    expect(moneyline).toBeDefined();
-    expect(moneyline.title).toBe('Winner');
+    const moneyline = result.markets[0];
+    expect(moneyline.id).toBe('KXATPMATCH-26FEB06MANGEA');
+    expect(moneyline.question).toBe('Mannarino vs Gea');
     expect(moneyline.outcomes).toHaveLength(2);
+    expect(moneyline.outcomes.map((o: any) => o.label)).toEqual(['Yes', 'No']);
 
-    // Verify away team (Mannarino) outcome - YES prices
-    const awayOutcome = moneyline.outcomes.find((o: any) => o.label === 'MANNARI');
-    expect(awayOutcome).toBeDefined();
-    expect(awayOutcome.buyPrice).toBe(38);
-    expect(awayOutcome.sellPrice).toBe(37);
+    // Yes = away (Mannarino) wins
+    const yesOutcome = moneyline.outcomes.find((o: any) => o.kalshiOutcome === 'YES');
+    expect(yesOutcome?.buyPrice).toBe(38);
+    expect(yesOutcome?.sellPrice).toBe(37);
 
-    // Verify home team (Gea) outcome - NO prices
-    const homeOutcome = moneyline.outcomes.find((o: any) => o.label === 'GEA');
-    expect(homeOutcome).toBeDefined();
-    expect(homeOutcome.buyPrice).toBe(63);
-    expect(homeOutcome.sellPrice).toBe(62);
+    // No = home (Gea) wins
+    const noOutcome = moneyline.outcomes.find((o: any) => o.kalshiOutcome === 'NO');
+    expect(noOutcome?.buyPrice).toBe(63);
+    expect(noOutcome?.sellPrice).toBe(62);
 
     // Verify team prices are set correctly
     expect(result.awayTeam.kalshiBuyPrice).toBe(38);
@@ -763,14 +467,12 @@ describe('Kalshi Activity Service - Regression: Real Data Format', () => {
 
     expect(result.markets.length).toBe(1);
     const moneyline = result.markets[0];
-    expect(moneyline.id).toBe('moneyline');
     expect(moneyline.outcomes).toHaveLength(2);
+    expect(moneyline.outcomes.map((o: any) => o.label)).toEqual(['Yes', 'No']);
 
     // Away = YES, Home = NO
-    expect(moneyline.outcomes[0].label).toBe('ZARAZUA');
-    expect(moneyline.outcomes[0].buyPrice).toBe(41);
-    expect(moneyline.outcomes[1].label).toBe('BIRRELL');
-    expect(moneyline.outcomes[1].buyPrice).toBe(60);
+    expect(moneyline.outcomes.find((o: any) => o.kalshiOutcome === 'YES')?.buyPrice).toBe(41);
+    expect(moneyline.outcomes.find((o: any) => o.kalshiOutcome === 'NO')?.buyPrice).toBe(60);
   });
 
   it('should build moneyline market for UFC (single-market sport)', () => {
@@ -799,19 +501,15 @@ describe('Kalshi Activity Service - Regression: Real Data Format', () => {
 
     expect(result.markets.length).toBe(1);
     const moneyline = result.markets[0];
-    expect(moneyline.id).toBe('moneyline');
     expect(moneyline.outcomes).toHaveLength(2);
+    expect(moneyline.outcomes.map((o: any) => o.label)).toEqual(['Yes', 'No']);
 
-    // Away fighter outcome (YES)
-    const awayOutcome = moneyline.outcomes[0];
-    expect(awayOutcome.label).toBe('MIC1');
-    expect(awayOutcome.buyPrice).toBe(81);
-    expect(awayOutcome.sellPrice).toBe(79);
+    // Away fighter = YES
+    expect(moneyline.outcomes.find((o: any) => o.kalshiOutcome === 'YES')?.buyPrice).toBe(81);
+    expect(moneyline.outcomes.find((o: any) => o.kalshiOutcome === 'YES')?.sellPrice).toBe(79);
 
-    // Home fighter outcome (NO)
-    const homeOutcome = moneyline.outcomes[1];
-    expect(homeOutcome.label).toBe('MAR14');
-    expect(homeOutcome.buyPrice).toBe(21);
-    expect(homeOutcome.sellPrice).toBe(19);
+    // Home fighter = NO
+    expect(moneyline.outcomes.find((o: any) => o.kalshiOutcome === 'NO')?.buyPrice).toBe(21);
+    expect(moneyline.outcomes.find((o: any) => o.kalshiOutcome === 'NO')?.sellPrice).toBe(19);
   });
 });

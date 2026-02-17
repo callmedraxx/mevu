@@ -10,7 +10,8 @@ import { dflowMetadataService } from '../dflow/dflow-metadata.service';
 import { dflowClient } from '../dflow/dflow.client';
 import { validateKalshiBuyRequest, validateKalshiSellRequest } from './kalshi-trade-validation';
 import { validateDFlowBuyOrder, validateDFlowSellOrder, SOLANA_USDC_MINT } from '../dflow/dflow-order-validation';
-import { subtractFromKalshiUsdcBalance, addToKalshiUsdcBalance } from '../privy/kalshi-user.service';
+import { setKalshiUsdcBalance } from '../privy/kalshi-user.service';
+import { getSolanaUsdcBalance } from '../solana/solana-usdc-balance';
 import { publishKalshiPositionUpdate } from '../redis-cluster-broadcast.service';
 import { checkVerification } from '../proof/proof.service';
 import { logger } from '../../config/logger';
@@ -64,7 +65,9 @@ export async function executeKalshiBuy(req: KalshiBuyRequest): Promise<KalshiTra
   });
   const skipBalanceCheck = process.env.KALSHI_SKIP_BALANCE_CHECK === 'true';
   if (!skipBalanceCheck) {
-    const balance = parseFloat((user as any).kalshiUsdcBalance ?? '0') || 0;
+    // Use on-chain balance as source of truth for pre-trade check
+    const onChainBalance = await getSolanaUsdcBalance(solanaWallet);
+    const balance = parseFloat(onChainBalance) || 0;
     if (balance < parseFloat(usdcAmountHuman)) {
       return { success: false, error: `Insufficient balance. You have $${balance.toFixed(2)} USDC. Need $${parseFloat(usdcAmountHuman).toFixed(2)}.` };
     }
@@ -118,8 +121,8 @@ export async function executeKalshiBuy(req: KalshiBuyRequest): Promise<KalshiTra
       txHash: hash,
     });
 
-    await subtractFromKalshiUsdcBalance(req.privyUserId, usdcAmountHuman);
-    publishKalshiPositionUpdate(req.privyUserId, { type: 'balance_update', amount: `-${usdcAmountHuman}`, source: 'kalshi_buy' });
+    // Sync on-chain balance after trade (delayed to allow Solana confirmation)
+    syncBalanceAfterTrade(req.privyUserId, solanaWallet, 'kalshi_buy');
 
     // Save trade with FILLED status and actual tx hash
     if (getDatabaseConfig().type === 'postgres') {
@@ -130,7 +133,7 @@ export async function executeKalshiBuy(req: KalshiBuyRequest): Promise<KalshiTra
            (privy_user_id, solana_wallet_address, kalshi_ticker, outcome_mint, outcome, side, input_amount, output_amount, dflow_order_id, status, solana_signature)
            VALUES ($1, $2, $3, $4, $5, 'BUY', $6, $7, $8, 'FILLED', $9)
            RETURNING id`,
-          [req.privyUserId, solanaWallet, req.kalshiTicker, outcomeMint, req.outcome, req.usdcAmount, orderResponse.outAmount ?? '0', orderResponse.orderId ?? null, hash]
+          [req.privyUserId, solanaWallet, req.kalshiTicker, outcomeMint, req.outcome, req.usdcAmount, orderResponse.outAmount ?? '0', null, hash]
         );
         return { success: true, tradeId: r.rows[0]?.id, solanaSignature: hash };
       } finally {
@@ -206,9 +209,8 @@ export async function executeKalshiSell(req: KalshiSellRequest): Promise<KalshiT
       txHash: hash,
     });
 
-    const usdcReceivedHuman = (Number(orderResponse.outAmount ?? '0') / 1e6).toFixed(6);
-    await addToKalshiUsdcBalance(req.privyUserId, usdcReceivedHuman);
-    publishKalshiPositionUpdate(req.privyUserId, { type: 'balance_update', amount: usdcReceivedHuman, source: 'kalshi_sell' });
+    // Sync on-chain balance after trade (delayed to allow Solana confirmation)
+    syncBalanceAfterTrade(req.privyUserId, solanaWallet, 'kalshi_sell');
 
     // Save trade with FILLED status and actual tx hash
     if (getDatabaseConfig().type === 'postgres') {
@@ -219,7 +221,7 @@ export async function executeKalshiSell(req: KalshiSellRequest): Promise<KalshiT
            (privy_user_id, solana_wallet_address, kalshi_ticker, outcome_mint, outcome, side, input_amount, output_amount, dflow_order_id, status, solana_signature)
            VALUES ($1, $2, $3, $4, $5, 'SELL', $6, $7, $8, 'FILLED', $9)
            RETURNING id`,
-          [req.privyUserId, solanaWallet, req.kalshiTicker, outcomeMint, req.outcome, req.tokenAmount, orderResponse.inAmount ?? '0', orderResponse.orderId ?? null, hash]
+          [req.privyUserId, solanaWallet, req.kalshiTicker, outcomeMint, req.outcome, req.tokenAmount, orderResponse.inAmount ?? '0', null, hash]
         );
         return { success: true, tradeId: r.rows[0]?.id, solanaSignature: hash };
       } finally {
@@ -237,4 +239,76 @@ export async function executeKalshiSell(req: KalshiSellRequest): Promise<KalshiT
     });
     return { success: false, error: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/**
+ * Post-trade on-chain balance sync (fallback for unreliable Alchemy Solana webhooks).
+ *
+ * Primary path: Alchemy webhook fires → updates DB balance in real time.
+ * Fallback: if the webhook doesn't fire, we check on-chain at 5s, 15s, 30s
+ * and sync only if the DB balance hasn't already been updated by the webhook.
+ *
+ * We record a snapshot of the DB balance before the trade. If any retry sees
+ * the DB balance has changed from that snapshot, the webhook already handled it.
+ */
+function syncBalanceAfterTrade(privyUserId: string, solanaWallet: string, source: string): void {
+  // Snapshot the current DB balance to detect webhook updates
+  import('../privy/user.service').then(({ getUserByPrivyId }) => {
+    getUserByPrivyId(privyUserId).then((user) => {
+      const preTradeBalance = parseFloat((user as any)?.kalshiUsdcBalance ?? '0') || 0;
+      const delays = [5000, 15000, 30000];
+
+      for (const delay of delays) {
+        setTimeout(async () => {
+          try {
+            // Check if webhook already updated the balance
+            const { getUserByPrivyId: getUser } = await import('../privy/user.service');
+            const currentUser = await getUser(privyUserId);
+            const dbBalance = parseFloat((currentUser as any)?.kalshiUsdcBalance ?? '0') || 0;
+
+            // If DB balance changed from pre-trade snapshot, webhook handled it
+            if (Math.abs(dbBalance - preTradeBalance) > 0.001) {
+              logger.debug({
+                message: 'Webhook already updated balance, skipping on-chain sync',
+                privyUserId,
+                preTradeBalance,
+                dbBalance,
+                delayMs: delay,
+              });
+              return;
+            }
+
+            // Webhook hasn't fired — sync from on-chain
+            const onChainBalance = await getSolanaUsdcBalance(solanaWallet);
+            const onChainNum = parseFloat(onChainBalance) || 0;
+
+            if (Math.abs(onChainNum - dbBalance) > 0.001) {
+              await setKalshiUsdcBalance(privyUserId, onChainBalance);
+              publishKalshiPositionUpdate(privyUserId, {
+                type: 'balance_update',
+                amount: onChainBalance,
+                source: `${source}_onchain_fallback`,
+              });
+              logger.info({
+                message: 'Post-trade on-chain balance synced (webhook fallback)',
+                privyUserId,
+                solanaWallet: solanaWallet.slice(0, 8) + '...',
+                balance: onChainBalance,
+                previousDbBalance: dbBalance,
+                source,
+                delayMs: delay,
+              });
+            }
+          } catch (err) {
+            logger.warn({
+              message: 'Post-trade balance sync attempt failed',
+              privyUserId,
+              delayMs: delay,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }, delay);
+      }
+    }).catch(() => {});
+  }).catch(() => {});
 }

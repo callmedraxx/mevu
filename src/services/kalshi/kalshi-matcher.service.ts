@@ -63,7 +63,7 @@ class KalshiMatcherService {
             AND LOWER(k.away_team_abbr) = sp.slug_away_abbr
           )
           WHERE k.live_game_id IS NULL
-            AND k.status = 'active'
+            AND k.status IN ('active', 'open', 'unopened', 'initialized')
             AND UPPER(k.ticker) NOT LIKE 'KXSB-%'
             AND UPPER(k.ticker) NOT LIKE 'KXUFCFIGHT-%'
             AND UPPER(k.ticker) NOT LIKE 'KXWTAMATCH-%'
@@ -117,7 +117,7 @@ class KalshiMatcherService {
             AND UPPER(k.ticker) NOT LIKE 'KXUFCFIGHT-%'
             AND UPPER(k.ticker) NOT LIKE 'KXWTAMATCH-%'
             AND UPPER(k.ticker) NOT LIKE 'KXATPMATCH-%'
-          ORDER BY k.ticker, ABS(EXTRACT(EPOCH FROM (k.game_date - sp.slug_date)))
+          ORDER BY k.ticker, ABS(k.game_date - sp.slug_date)
         )
         UPDATE kalshi_markets k
         SET live_game_id = m.live_game_id, updated_at = NOW()

@@ -629,6 +629,85 @@ export async function userExists(privyUserId: string): Promise<boolean> {
 }
 
 /**
+ * Delete a user by their embedded wallet address.
+ * Removes the user and all related data (CASCADE handles FK tables;
+ * manually deletes from tables without FK constraints).
+ */
+export async function deleteUserByEmbeddedWallet(embeddedWalletAddress: string): Promise<boolean> {
+  const dbConfig = getDatabaseConfig();
+  const normalizedAddress = embeddedWalletAddress.toLowerCase();
+
+  if (dbConfig.type !== 'postgres') {
+    const user = memoryStore.get(`user:wallet:${normalizedAddress}`) as UserProfile | undefined;
+    if (!user) return false;
+
+    memoryStore.delete(`user:${user.id}`);
+    memoryStore.delete(`user:privy:${user.privyUserId}`);
+    memoryStore.delete(`user:username:${user.username.toLowerCase()}`);
+    memoryStore.delete(`user:wallet:${normalizedAddress}`);
+
+    logger.info({ message: 'User deleted from in-memory storage', embeddedWalletAddress: normalizedAddress });
+    return true;
+  }
+
+  const client = await pool.connect();
+
+  try {
+    // 1. Find the user
+    const userResult = await client.query(
+      `SELECT id, privy_user_id FROM users WHERE LOWER(embedded_wallet_address) = $1`,
+      [normalizedAddress]
+    );
+
+    if (userResult.rows.length === 0) {
+      logger.warn({ message: 'User not found for embedded wallet', embeddedWalletAddress: normalizedAddress });
+      return false;
+    }
+
+    const { id: userId, privy_user_id: privyUserId } = userResult.rows[0];
+
+    await client.query('BEGIN');
+
+    // 2. Clear referred_by_user_id for users who were referred by this user (FK from users to users)
+    await client.query(
+      `UPDATE users SET referred_by_user_id = NULL WHERE referred_by_user_id = $1`,
+      [userId]
+    );
+
+    // 3. Delete from tables without FK to users (to avoid orphaned rows)
+    await client.query(`DELETE FROM deposit_progress WHERE privy_user_id = $1`, [privyUserId]);
+    await client.query(`DELETE FROM withdrawals WHERE privy_user_id = $1`, [privyUserId]);
+    await client.query(`DELETE FROM trades_history WHERE privy_user_id = $1`, [privyUserId]);
+    await client.query(`DELETE FROM user_pnl_history WHERE privy_user_id = $1`, [privyUserId]);
+    await client.query(`DELETE FROM kalshi_positions WHERE privy_user_id = $1`, [privyUserId]).catch(() => {});
+    await client.query(`DELETE FROM kalshi_trades_history WHERE privy_user_id = $1`, [privyUserId]).catch(() => {});
+
+    // 4. Delete user (CASCADE handles: embedded_wallet_balances, wallet_balances, wallet_usdc_transfers, user_positions, referral_earnings)
+    await client.query(`DELETE FROM users WHERE id = $1`, [userId]);
+
+    await client.query('COMMIT');
+
+    logger.info({
+      message: 'User deleted by embedded wallet',
+      embeddedWalletAddress: normalizedAddress,
+      privyUserId,
+    });
+
+    return true;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error({
+      message: 'Error deleting user by embedded wallet',
+      embeddedWalletAddress: normalizedAddress,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Delete all users from the database
  * WARNING: This will delete ALL users - use with caution!
  */

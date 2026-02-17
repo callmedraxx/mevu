@@ -26,6 +26,7 @@ export {
   markOnboardingComplete,
   isUsernameAvailable,
   userExists,
+  deleteUserByEmbeddedWallet,
   deleteAllUsers,
 } from './user.service';
 

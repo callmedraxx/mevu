@@ -134,8 +134,133 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Fetch transaction hash from CLOB trades endpoint and update trade record
- * The CLOB client's getTrades() returns trades with transaction_hash once settled on-chain
+ * Look up a matching trade from CLOB by orderId.
+ * Returns the matching trade object if found, or null.
+ */
+async function findMatchingClobTrade(
+  clobClient: any,
+  orderId: string,
+): Promise<any | null> {
+  const trades = await clobClient.getTrades();
+  return trades?.find((trade: any) =>
+    trade.taker_order_id === orderId || trade.id === orderId
+  ) ?? null;
+}
+
+/**
+ * Update the trade record with actual fill data from CLOB (tx hash, price, size).
+ */
+async function applyFillData(
+  matchingTrade: any,
+  tradeRecordId: string,
+  orderId: string,
+  privyUserId: string,
+  side?: string,
+  originalSize?: string,
+): Promise<void> {
+  const updateData: any = {
+    transactionHash: matchingTrade.transaction_hash,
+  };
+
+  if (matchingTrade.price && matchingTrade.size) {
+    const actualFillPrice = parseFloat(matchingTrade.price);
+    const actualFillSize = parseFloat(matchingTrade.size);
+    const actualCostUsdc = actualFillPrice * actualFillSize;
+    const actualFeeAmount = actualCostUsdc * FEE_CONFIG.RATE;
+
+    updateData.price = actualFillPrice.toFixed(18);
+    updateData.size = actualFillSize.toFixed(18);
+    updateData.costUsdc = actualCostUsdc.toFixed(18);
+    updateData.feeAmount = actualFeeAmount.toFixed(18);
+
+    logger.info({
+      message: `📊 ${side || 'UNKNOWN'} trade updated with actual fill data`,
+      privyUserId,
+      tradeId: tradeRecordId,
+      orderId,
+      originalSize,
+      actualFillPrice,
+      actualFillSize,
+      actualCostUsdc: actualCostUsdc.toFixed(6),
+      actualFeeAmount: actualFeeAmount.toFixed(6),
+    });
+  }
+
+  await updateTradeRecordById(tradeRecordId, updateData);
+
+  logger.info({
+    message: 'Transaction hash and fill data updated for trade',
+    privyUserId,
+    tradeId: tradeRecordId,
+    orderId,
+    transactionHash: matchingTrade.transaction_hash,
+  });
+}
+
+/**
+ * Verify whether a FOK/FAK order actually filled by checking for a tx hash.
+ * Polymarket CLOB returns status: 'DELAYED' for all orders — the only reliable
+ * way to confirm a fill is the presence of a matching trade with a transaction_hash.
+ *
+ * Returns { filled: true, matchingTrade } if confirmed, { filled: false } if not.
+ * Uses short polling (3 attempts, 2s/3s/4s delays) to keep user wait reasonable (~9s max).
+ */
+async function verifyFokFill(
+  clobClient: any,
+  orderId: string,
+  privyUserId: string,
+  tradeRecordId: string,
+): Promise<{ filled: boolean; matchingTrade?: any }> {
+  const maxAttempts = 3;
+  const baseDelayMs = 2000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await sleep(baseDelayMs * attempt);
+    try {
+      const matchingTrade = await findMatchingClobTrade(clobClient, orderId);
+      if (matchingTrade?.transaction_hash) {
+        logger.info({
+          message: 'FOK/FAK fill verified via tx hash',
+          privyUserId,
+          tradeId: tradeRecordId,
+          orderId,
+          transactionHash: matchingTrade.transaction_hash,
+          attempt,
+        });
+        return { filled: true, matchingTrade };
+      }
+      logger.debug({
+        message: 'FOK/FAK verification - tx hash not yet available',
+        privyUserId,
+        tradeId: tradeRecordId,
+        orderId,
+        attempt,
+      });
+    } catch (error) {
+      logger.warn({
+        message: 'Error during FOK/FAK fill verification',
+        privyUserId,
+        tradeId: tradeRecordId,
+        orderId,
+        attempt,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  logger.warn({
+    message: 'FOK/FAK order not verified after polling - likely not filled',
+    privyUserId,
+    tradeId: tradeRecordId,
+    orderId,
+    maxAttempts,
+  });
+  return { filled: false };
+}
+
+/**
+ * Fetch transaction hash from CLOB trades endpoint and update trade record (background).
+ * Used for limit orders and as a secondary update for already-verified FOK/FAK orders.
  */
 async function fetchAndUpdateTransactionHash(
   clobClient: any,
@@ -146,89 +271,15 @@ async function fetchAndUpdateTransactionHash(
   originalSize?: string
 ): Promise<void> {
   const maxAttempts = 5;
-  const delayMs = 2000; // 2 seconds between attempts
+  const delayMs = 2000;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await sleep(delayMs * attempt);
     try {
-      // Wait before fetching (give time for on-chain settlement)
-      await sleep(delayMs * attempt);
-
-      // Fetch trades from CLOB
-      const trades = await clobClient.getTrades();
-      
-      // Find the trade matching our order ID
-      const matchingTrade = trades?.find((trade: any) => 
-        trade.taker_order_id === orderId || trade.id === orderId
-      );
+      const matchingTrade = await findMatchingClobTrade(clobClient, orderId);
 
       if (matchingTrade?.transaction_hash) {
-        // Build update object with transaction hash
-        const updateData: any = {
-          transactionHash: matchingTrade.transaction_hash,
-        };
-
-        // For SELL orders, update with actual fill price and recalculate costUsdc
-        // CLOB returns actual fill data: price, size
-        if (side === 'SELL' && matchingTrade.price && matchingTrade.size) {
-          const actualFillPrice = parseFloat(matchingTrade.price);
-          const actualFillSize = parseFloat(matchingTrade.size);
-          const actualCostUsdc = actualFillPrice * actualFillSize;
-          const actualFeeAmount = actualCostUsdc * FEE_CONFIG.RATE;
-
-          updateData.price = actualFillPrice.toFixed(18);
-          updateData.size = actualFillSize.toFixed(18);
-          updateData.costUsdc = actualCostUsdc.toFixed(18);
-          updateData.feeAmount = actualFeeAmount.toFixed(18);
-
-          logger.info({
-            message: '📊 SELL trade updated with actual fill data',
-            privyUserId,
-            tradeId: tradeRecordId,
-            orderId,
-            originalSize,
-            actualFillPrice,
-            actualFillSize,
-            actualCostUsdc: actualCostUsdc.toFixed(6),
-            actualFeeAmount: actualFeeAmount.toFixed(6),
-          });
-        }
-
-        // For BUY orders, also capture actual fill data for accuracy
-        if (side === 'BUY' && matchingTrade.price && matchingTrade.size) {
-          const actualFillPrice = parseFloat(matchingTrade.price);
-          const actualFillSize = parseFloat(matchingTrade.size);
-          // Recalculate actual cost based on fill data (for partial fills or price changes)
-          const actualCostUsdc = actualFillPrice * actualFillSize;
-          const actualFeeAmount = actualCostUsdc * FEE_CONFIG.RATE;
-
-          updateData.price = actualFillPrice.toFixed(18);
-          updateData.size = actualFillSize.toFixed(18);
-          updateData.costUsdc = actualCostUsdc.toFixed(18);
-          updateData.feeAmount = actualFeeAmount.toFixed(18);
-
-          logger.info({
-            message: '📊 BUY trade updated with actual fill data',
-            privyUserId,
-            tradeId: tradeRecordId,
-            orderId,
-            actualFillPrice,
-            actualFillSize,
-            actualCostUsdc: actualCostUsdc.toFixed(6),
-            actualFeeAmount: actualFeeAmount.toFixed(6),
-          });
-        }
-
-        // Update trade record
-        await updateTradeRecordById(tradeRecordId, updateData);
-
-        logger.info({
-          message: 'Transaction hash and fill data updated for trade',
-          privyUserId,
-          tradeId: tradeRecordId,
-          orderId,
-          transactionHash: matchingTrade.transaction_hash,
-          attempt,
-        });
+        await applyFillData(matchingTrade, tradeRecordId, orderId, privyUserId, side, originalSize);
         return;
       }
 
@@ -238,7 +289,6 @@ async function fetchAndUpdateTransactionHash(
         tradeId: tradeRecordId,
         orderId,
         attempt,
-        tradesCount: trades?.length || 0,
       });
     } catch (error) {
       logger.warn({
@@ -443,7 +493,7 @@ export async function executeTrade(
             } else {
               // For SELL: Use shares directly (not USDC)
               orderAmount = parseFloat(size);
-              
+
               logger.info({
                 message: 'Using shares for SELL order',
                 privyUserId,
@@ -453,13 +503,32 @@ export async function executeTrade(
               });
             }
 
+            // Polymarket CLOB rejects prices outside 0.01-0.99.
+            // For SELL market orders, clamp the price so sells aren't blocked on near-certain markets.
+            // The clamped price acts as a floor — the order still fills at the actual book price.
+            const marketOrderParams: any = {
+              tokenID: marketInfo.clobTokenId,
+              amount: orderAmount, // BUY: USDC amount | SELL: shares
+              side: side === TradeSide.BUY ? Side.BUY : Side.SELL,
+            };
+
+            if (side === TradeSide.SELL && price) {
+              const clampedPrice = Math.max(0.01, Math.min(0.99, parseFloat(price)));
+              marketOrderParams.price = clampedPrice;
+
+              if (clampedPrice !== parseFloat(price)) {
+                logger.warn({
+                  message: 'SELL order price clamped to CLOB valid range',
+                  privyUserId,
+                  originalPrice: price,
+                  clampedPrice,
+                });
+              }
+            }
+
             const orderStartTime = Date.now();
             orderResponse = await clobClient.createAndPostMarketOrder(
-              {
-                tokenID: marketInfo.clobTokenId,
-                amount: orderAmount, // BUY: USDC amount | SELL: shares
-                side: side === TradeSide.BUY ? Side.BUY : Side.SELL,
-              },
+              marketOrderParams,
               {}, // Options (tickSize, negativeRisk, etc.)
               clobOrderType
             );
@@ -673,9 +742,51 @@ export async function executeTrade(
         status: finalStatus,
       });
 
-      // Fetch transaction hash and actual fill data from CLOB trades endpoint (async, don't block response)
-      // This also updates price/size/costUsdc for SELL orders with actual fill data
-      if (finalStatus === 'FILLED' && orderResponse.orderID) {
+      // For FOK/FAK orders with DELAYED status: verify fill via tx hash before proceeding.
+      // The CLOB always returns DELAYED — the only way to confirm a fill is the tx hash.
+      // This blocks the response for ~2-9s but gives the user an accurate result.
+      if (
+        finalStatus === 'FILLED' &&
+        orderResponse.orderID &&
+        clobStatus === 'DELAYED' &&
+        (orderType === OrderType.FOK || orderType === OrderType.FAK)
+      ) {
+        const tradeSide = side === TradeSide.BUY ? 'BUY' : 'SELL';
+        const verification = await verifyFokFill(
+          clobClient,
+          orderResponse.orderID,
+          privyUserId,
+          tradeRecord.id,
+        );
+
+        if (verification.filled && verification.matchingTrade) {
+          // Confirmed filled — apply actual fill data (tx hash, price, size)
+          await applyFillData(
+            verification.matchingTrade,
+            tradeRecord.id,
+            orderResponse.orderID,
+            privyUserId,
+            tradeSide,
+            size,
+          );
+        } else {
+          // Not filled — downgrade status
+          finalStatus = 'NOT_FILLED';
+          await updateTradeRecordById(tradeRecord.id, {
+            status: 'NOT_FILLED',
+            feeStatus: undefined,
+          });
+          logger.warn({
+            message: 'FOK/FAK order not filled - no tx hash after verification',
+            privyUserId,
+            tradeId: tradeRecord.id,
+            orderId: orderResponse.orderID,
+            orderType,
+            side: tradeSide,
+          });
+        }
+      } else if (finalStatus === 'FILLED' && orderResponse.orderID) {
+        // Non-FOK/FAK filled orders (e.g. explicit MATCHED status): fetch tx hash in background
         const tradeSide = side === TradeSide.BUY ? 'BUY' : 'SELL';
         fetchAndUpdateTransactionHash(clobClient, orderResponse.orderID, tradeRecord.id, privyUserId, tradeSide, size).catch((err) => {
           logger.warn({
@@ -766,6 +877,21 @@ export async function executeTrade(
             error: importError instanceof Error ? importError.message : String(importError),
           });
         }
+      }
+
+      // If FOK/FAK order was verified as not filled, return failure to user
+      if (finalStatus === 'NOT_FILLED') {
+        timings.total = Date.now() - tradeStartTime;
+        return {
+          success: false,
+          orderId: orderResponse.orderID,
+          status: 'NOT_FILLED',
+          errorCode: 'NOT_FILLED',
+          userMessage: 'Order could not be filled. There may not be enough liquidity at this price. Please try again.',
+          message: 'Order was not filled - no matching liquidity found',
+          retryable: true,
+          trade: { ...finalTrade, status: 'NOT_FILLED' },
+        };
       }
 
       // If order was explicitly CANCELLED by CLOB, return failure

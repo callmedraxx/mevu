@@ -23,6 +23,9 @@ import { logger } from '../config/logger';
 import { getFrontendGamesFromDatabase, getFrontendGameByIdFromDatabase, getFrontendGameBySlugFromDatabase } from '../services/polymarket/frontend-games.service';
 import { initRedisGamesBroadcast, subscribeToGamesBroadcast, isRedisGamesBroadcastReady } from '../services/redis-games-broadcast.service';
 import { subscribeToKalshiPriceBroadcast } from '../services/redis-cluster-broadcast.service';
+import { connectWithRetry } from '../config/database';
+import { kalshiService } from '../services/kalshi/kalshi.service';
+import { kalshiMatcherService } from '../services/kalshi/kalshi-matcher.service';
 
 const router = Router();
 
@@ -545,6 +548,119 @@ router.get('/slug/:slug/frontend', async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       error: 'Failed to fetch game',
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/games/slug/{slug}/kalshi-debug:
+ *   get:
+ *     summary: Kalshi markets debug for a game (diagnostic)
+ *     tags: [Games]
+ */
+router.get('/slug/:slug/kalshi-debug', async (req: Request, res: Response) => {
+  try {
+    const { slug } = req.params;
+    const game = await getLiveGameBySlug(slug);
+
+    if (!game) {
+      return res.status(404).json({
+        success: false,
+        error: 'Game not found',
+      });
+    }
+
+    const parts = slug.split('-');
+    const slugAway = parts[1]?.toLowerCase() || '';
+    const slugHome = parts[2]?.toLowerCase() || '';
+    const slugDate = parts[4] && parts[5] && parts[6] ? `${parts[4]}-${parts[5]}-${parts[6]}` : null;
+
+    const client = await connectWithRetry();
+    try {
+      const [matchedRes, unmatchedRes] = await Promise.all([
+        client.query(
+          `SELECT COUNT(*) as c, array_agg(ticker) FILTER (WHERE ticker IS NOT NULL) as tickers
+           FROM kalshi_markets
+           WHERE live_game_id = $1`,
+          [game.id]
+        ),
+        slugDate
+          ? client.query(
+              `SELECT COUNT(*) as c, array_agg(ticker) FILTER (WHERE ticker IS NOT NULL) as tickers
+               FROM kalshi_markets
+               WHERE live_game_id IS NULL
+                 AND LOWER(sport) = $1
+                 AND LOWER(home_team_abbr) = $2
+                 AND LOWER(away_team_abbr) = $3
+                 AND game_date::date = $4::date
+                 AND status IN ('active', 'open', 'unopened', 'initialized')`,
+              [game.sport || parts[0], slugHome, slugAway, slugDate]
+            )
+          : Promise.resolve({ rows: [{ c: 0, tickers: [] }] }),
+      ]);
+
+      const matchedCount = parseInt(matchedRes.rows[0]?.c ?? '0', 10);
+      const unmatchedCount = parseInt(unmatchedRes.rows[0]?.c ?? '0', 10);
+      const matchedTickers = (matchedRes.rows[0]?.tickers || []).slice(0, 10);
+      const unmatchedTickers = (unmatchedRes.rows[0]?.tickers || []).slice(0, 10);
+
+      return res.json({
+        success: true,
+        slug,
+        gameId: game.id,
+        sport: game.sport,
+        slugParsed: { away: slugAway, home: slugHome, date: slugDate },
+        matched: { count: matchedCount, sampleTickers: matchedTickers },
+        unmatched: { count: unmatchedCount, sampleTickers: unmatchedTickers },
+        hint:
+          unmatchedCount > 0
+            ? 'Run POST /api/games/refresh to run matcher and link unmatched markets.'
+            : matchedCount === 0
+              ? 'No Kalshi markets found. Run POST /api/games/refresh to fetch from Kalshi API.'
+              : undefined,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    logger.error({
+      message: 'Error in Kalshi debug',
+      slug: req.params.slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/games/slug/{slug}/kalshi-refresh:
+ *   post:
+ *     summary: Force Kalshi markets refresh and matcher
+ *     tags: [Games]
+ */
+router.post('/slug/:slug/kalshi-refresh', async (req: Request, res: Response) => {
+  try {
+    await kalshiService.refreshKalshiMarkets();
+    const matchCount = await kalshiMatcherService.matchAllUnmatched();
+    return res.json({
+      success: true,
+      message: 'Kalshi refresh and matcher completed',
+      marketsMatched: matchCount,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error refreshing Kalshi markets',
+      slug: req.params.slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
 });

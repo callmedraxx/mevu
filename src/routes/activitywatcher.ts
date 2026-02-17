@@ -118,10 +118,11 @@ router.get('/:slug', async (req: Request, res: Response) => {
 
     // If Kalshi platform requested, use Kalshi activity service
     if (platform === 'kalshi') {
-      const kalshiGame = await kalshiActivityService.getActivityForSlug(slug);
+      const kalshiGame = await kalshiActivityService.getActivityForSlug(slug, req.query.debug === '1');
       if (!kalshiGame) {
         return res.status(404).json({ success: false, error: 'Game not found' });
       }
+      res.set('Cache-Control', 'no-store');
       return res.json({ success: true, game: kalshiGame });
     }
 

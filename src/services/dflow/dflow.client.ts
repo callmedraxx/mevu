@@ -20,14 +20,24 @@ export interface DFlowOrderParams {
 
 export interface DFlowOrderResponse {
   transaction: string;
-  orderId?: string;
-  outAmount?: string;
+  inputMint?: string;
   inAmount?: string;
+  outputMint?: string;
+  outAmount?: string;
+  otherAmountThreshold?: string;
+  minOutAmount?: string;
+  slippageBps?: number;
+  priceImpactPct?: string;
+  lastValidBlockHeight?: number;
+  executionMode?: string;
 }
 
 export interface DFlowOrderStatusResponse {
-  status: 'pending' | 'filled' | 'failed' | 'cancelled';
-  signature?: string;
+  status: 'pending' | 'expired' | 'failed' | 'open' | 'pendingClose' | 'closed';
+  inAmount?: string;
+  outAmount?: string;
+  fills?: Array<{ signature: string; inputMint: string; inAmount: string; outputMint: string; outAmount: string }>;
+  reverts?: Array<{ signature: string; inputMint: string; inAmount: string; outputMint: string; outAmount: string }>;
   error?: string;
 }
 
@@ -66,9 +76,13 @@ class DFlowClient {
     });
   }
 
-  async getOrderStatus(orderId: string): Promise<DFlowOrderStatusResponse> {
+  async getOrderStatus(signature: string, lastValidBlockHeight?: number): Promise<DFlowOrderStatusResponse> {
+    const params = new URLSearchParams({ signature });
+    if (lastValidBlockHeight != null) {
+      params.set('lastValidBlockHeight', String(lastValidBlockHeight));
+    }
     const response = await this.client.get<DFlowOrderStatusResponse>(
-      '/order-status?orderId=' + encodeURIComponent(orderId)
+      '/order-status?' + params.toString()
     );
     return response.data;
   }

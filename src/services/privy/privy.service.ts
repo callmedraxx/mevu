@@ -1784,7 +1784,6 @@ class PrivyService {
         walletId,
         {
           message,
-          caip2: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', // Solana mainnet
           authorization_context: authorizationContext,
         }
       );
