@@ -138,13 +138,13 @@ export class GamesWebSocketService {
   private setupKalshiPriceBroadcast(): void {
     this.kalshiRedisUnsubscribe = subscribeToKalshiPriceBroadcast((msg: KalshiPriceBroadcastMessage) => {
       try {
-        const clientCount = this.clients.size;
-        logger.info({
-          message: '[Kalshi broadcast] Games WebSocket received kalshi_price_update, sending to frontend',
-          gameId: msg.gameId,
-          ticker: msg.ticker,
-          clientCount,
-        });
+        // const clientCount = this.clients.size;
+        // logger.info({
+        //   message: '[Kalshi broadcast] Games WebSocket received kalshi_price_update, sending to frontend',
+        //   gameId: msg.gameId,
+        //   ticker: msg.ticker,
+        //   clientCount,
+        // });
 
         const payload: WSMessage = {
           type: 'kalshi_price_update',
@@ -161,14 +161,14 @@ export class GamesWebSocketService {
           ...(msg.updatedSides?.length && { updatedSides: msg.updatedSides }),
         };
         this.broadcast(payload);
-        const sent = Array.from(this.clients).filter((c) => c.readyState === 1).length;
-        if (sent > 0) {
-          logger.info({
-            message: '[Kalshi broadcast] Games WebSocket sent kalshi_price_update to client(s)',
-            gameId: msg.gameId,
-            sentToCount: sent,
-          });
-        }
+        // const sent = Array.from(this.clients).filter((c) => c.readyState === 1).length;
+        // if (sent > 0) {
+        //   logger.info({
+        //     message: '[Kalshi broadcast] Games WebSocket sent kalshi_price_update to client(s)',
+        //     gameId: msg.gameId,
+        //     sentToCount: sent,
+        //   });
+        // }
       } catch (err) {
         logger.warn({
           message: 'Failed to broadcast Kalshi price update',

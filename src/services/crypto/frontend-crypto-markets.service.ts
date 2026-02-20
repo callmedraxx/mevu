@@ -10,7 +10,7 @@ import {
   PredictionMarketFrontend,
   CryptoMarketRow,
 } from './crypto-market.transformer';
-import { fetchOpeningPrice } from './crypto-opening-price.service';
+import { fetchOpeningPrice, fetchClosingPrice } from './crypto-opening-price.service';
 
 interface CacheEntry {
   data: PredictionMarketFrontend[];
@@ -67,6 +67,23 @@ function normalizeAsset(v: string | null | undefined): string | null {
   if (!v) return null;
   const s = v.toLowerCase().trim();
   return s || null;
+}
+
+/** Infer start_time from end_date and timeframe when Gamma API doesn't provide startTime. */
+const TIMEFRAME_DURATIONS_MS: Record<string, number> = {
+  '5m': 5 * 60 * 1000,
+  '15m': 15 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '4h': 4 * 60 * 60 * 1000,
+  'daily': 24 * 60 * 60 * 1000,
+};
+
+function inferStartTime(endDate: string, timeframe: string): string | null {
+  const durationMs = TIMEFRAME_DURATIONS_MS[timeframe.toLowerCase()];
+  if (!durationMs) return null;
+  const endMs = new Date(endDate).getTime();
+  if (isNaN(endMs)) return null;
+  return new Date(endMs - durationMs).toISOString();
 }
 
 /** Timeframes where we deduplicate by series_slug, showing only the current/active window.
@@ -237,7 +254,7 @@ export async function getCryptoMarketDetailBySlug(
          enable_order_book, liquidity_clob, neg_risk,
          comment_count, is_live,
          timeframe, asset, series_slug,
-         opening_price,
+         opening_price, closing_price,
          markets, series, tags_data AS tags
        FROM crypto_markets
        WHERE LOWER(slug) = LOWER($1)
@@ -247,13 +264,30 @@ export async function getCryptoMarketDetailBySlug(
     if (res.rows.length === 0) return null;
     const row = res.rows[0] as Record<string, unknown>;
 
+    // Infer start_time from end_date + timeframe when Gamma API doesn't provide it
+    if (row.start_time == null && row.end_date && row.timeframe) {
+      const inferred = inferStartTime(row.end_date as string, row.timeframe as string);
+      if (inferred) {
+        row.start_time = inferred;
+        client.query(
+          'UPDATE crypto_markets SET start_time = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+          [inferred, row.id]
+        ).catch(() => {});
+      }
+    }
+
     // On-demand: if opening_price is missing and market has started, fetch from Polymarket SSR
-    if (row.opening_price == null && row.start_time && new Date(row.start_time as string) <= new Date()) {
+    const marketStarted = row.start_time
+      ? new Date(row.start_time as string) <= new Date()
+      : row.end_date
+        ? new Date(row.end_date as string) <= new Date() // If no start_time, check if ended
+        : false;
+
+    if (row.opening_price == null && marketStarted) {
       try {
         const price = await fetchOpeningPrice(row.slug as string);
         if (price != null) {
           row.opening_price = price;
-          // Persist in background (don't block response)
           client.query(
             'UPDATE crypto_markets SET opening_price = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
             [price, row.id]
@@ -261,6 +295,23 @@ export async function getCryptoMarketDetailBySlug(
         }
       } catch {
         // Non-critical — return row without opening_price
+      }
+    }
+
+    // On-demand: if closing_price is missing and market has ended, fetch from Polymarket SSR
+    const endDate = row.end_date as string | undefined;
+    if (endDate && new Date(endDate) <= new Date() && row.closing_price == null) {
+      try {
+        const closePrice = await fetchClosingPrice(row.slug as string);
+        if (closePrice != null) {
+          row.closing_price = closePrice;
+          client.query(
+            'UPDATE crypto_markets SET closing_price = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+            [closePrice, row.id]
+          ).catch(() => {});
+        }
+      } catch {
+        // Non-critical
       }
     }
 

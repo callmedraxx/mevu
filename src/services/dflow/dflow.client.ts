@@ -6,7 +6,7 @@
 import axios, { AxiosInstance } from 'axios';
 
 const DFLOW_TRADE_API_URL =
-  process.env.DFLOW_TRADE_API_URL || 'https://quote-api.dflow.net';
+  process.env.DFLOW_TRADE_API_URL || 'https://d.quote-api.dflow.net';
 const DFLOW_API_KEY = process.env.DFLOW_API_KEY || '';
 
 export interface DFlowOrderParams {
@@ -16,6 +16,14 @@ export interface DFlowOrderParams {
   userPublicKey: string;
   slippageBps?: number;
   platformFeeBps?: number;
+}
+
+export interface DFlowPlatformFee {
+  amount: string;
+  feeBps: number;
+  feeAccount: string;
+  segmenterFeeAmount?: string;
+  segmenterFeePct?: number;
 }
 
 export interface DFlowOrderResponse {
@@ -30,6 +38,8 @@ export interface DFlowOrderResponse {
   priceImpactPct?: string;
   lastValidBlockHeight?: number;
   executionMode?: string;
+  /** Platform fee applied to the quote, if any. Include in total cost for avg entry. */
+  platformFee?: DFlowPlatformFee | null;
 }
 
 export interface DFlowOrderStatusResponse {

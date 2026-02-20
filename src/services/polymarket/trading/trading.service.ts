@@ -359,69 +359,64 @@ export async function executeTrade(
     if (!user.proxyWalletAddress) {
       throw new Error('User does not have a proxy wallet. Please deploy proxy wallet first.');
     }
+    const proxyWalletAddress = user.proxyWalletAddress;
 
     // Validate token approvals
     if (!user.usdcApprovalEnabled || !user.ctfApprovalEnabled) {
       throw new Error('Token approvals not set up. Please approve tokens first.');
     }
 
-    // Pre-check: Validate balance is sufficient for BUY orders using Alchemy
-    if (side === TradeSide.BUY) {
-      // Frontend sends 'size' as number of shares for all order types
-      // Backend calculates USDC amount = shares * price
-      if (!price || parseFloat(price) <= 0 || parseFloat(price) > 1) {
-        throw new Error('Price is required and must be between 0 and 1.');
-      }
-      const estimatedCost = parseFloat(size) * parseFloat(price); // shares * price = USDC amount
-      try {
-        const { fetchBalanceFromAlchemy } = await import('../../alchemy/balance.service');
-        const balanceResult = await fetchBalanceFromAlchemy(user.proxyWalletAddress);
-        const balanceUsdc = parseFloat(balanceResult.balanceHuman);
-        
-        // Calculate fee and total required
-        const feeAmount = estimatedCost * FEE_CONFIG.RATE;
-        const totalRequired = estimatedCost + feeAmount;
-        
-        logger.info({
-          message: 'Pre-trade balance check (Alchemy)',
-          privyUserId,
-          proxyWalletAddress: user.proxyWalletAddress,
-          balanceUsdc,
-          estimatedCost,
-          feeAmount,
-          totalRequired,
-          hasSufficientBalance: balanceUsdc >= totalRequired,
-        });
-        
-        if (balanceUsdc < totalRequired) {
-          throw new Error(
-            `Insufficient balance. You have $${balanceUsdc.toFixed(2)} but need ` +
-            `$${estimatedCost.toFixed(2)} for trade + $${feeAmount.toFixed(2)} fee = $${totalRequired.toFixed(2)} total.`
-          );
-        }
-      } catch (balanceError: any) {
-        // If balance check fails but it's our custom error, re-throw it
-        if (balanceError.message?.includes('Insufficient balance')) {
-          throw balanceError;
-        }
-        // Otherwise log warning and continue (let CLOB reject if insufficient)
-        logger.warn({
-          message: 'Could not pre-check balance, proceeding with trade',
-          privyUserId,
-          error: balanceError instanceof Error ? balanceError.message : String(balanceError),
-        });
-      }
-    }
-
-    // Save trade record FIRST with PENDING status (before CLOB call)
-    // This ensures we track the trade attempt even if CLOB fails
-    // Frontend sends 'size' as shares, backend calculates USDC = shares * price
+    // Price validation (required for cost calculation and BUY balance check)
     if (!price || parseFloat(price) <= 0 || parseFloat(price) > 1) {
       throw new Error('Price is required and must be between 0 and 1.');
     }
+
+    // Precompute order cost (pure math, no async needed)
     const costUsdc = (parseFloat(size) * parseFloat(price)).toFixed(18);
-    
-    const tradeRecord = await saveTradeRecord({
+
+    // Run balance check (BUY only), CLOB client setup, and trade record save in parallel
+    const balanceCheckPromise =
+      side === TradeSide.BUY
+        ? (async () => {
+            const estimatedCost = parseFloat(size) * parseFloat(price);
+            try {
+              const { fetchBalanceFromAlchemy } = await import('../../alchemy/balance.service');
+              const balanceResult = await fetchBalanceFromAlchemy(proxyWalletAddress);
+              const balanceUsdc = parseFloat(balanceResult.balanceHuman);
+              const feeAmount = estimatedCost * FEE_CONFIG.RATE;
+              const totalRequired = estimatedCost + feeAmount;
+
+              logger.info({
+                message: 'Pre-trade balance check (Alchemy)',
+                privyUserId,
+                proxyWalletAddress,
+                balanceUsdc,
+                estimatedCost,
+                feeAmount,
+                totalRequired,
+                hasSufficientBalance: balanceUsdc >= totalRequired,
+              });
+
+              if (balanceUsdc < totalRequired) {
+                throw new Error(
+                  `Insufficient balance. You have $${balanceUsdc.toFixed(2)} but need ` +
+                    `$${estimatedCost.toFixed(2)} for trade + $${feeAmount.toFixed(2)} fee = $${totalRequired.toFixed(2)} total.`
+                );
+              }
+            } catch (balanceError: any) {
+              if (balanceError.message?.includes('Insufficient balance')) {
+                throw balanceError;
+              }
+              logger.warn({
+                message: 'Could not pre-check balance, proceeding with trade',
+                privyUserId,
+                error: balanceError instanceof Error ? balanceError.message : String(balanceError),
+              });
+            }
+          })()
+        : Promise.resolve();
+
+    const tradeRecordPromise = saveTradeRecord({
       privyUserId,
       proxyWalletAddress: user.proxyWalletAddress,
       marketId: marketInfo.marketId,
@@ -439,6 +434,14 @@ export async function executeTrade(
       metadata: marketInfo.metadata,
     });
 
+    const clobClientStartTime = Date.now();
+    const [, clobClient, tradeRecord] = await Promise.all([
+      balanceCheckPromise,
+      getClobClientForUser(privyUserId, request.userJwt, user),
+      tradeRecordPromise,
+    ]);
+    timings.getClobClient = Date.now() - clobClientStartTime;
+
     logger.info({
       message: 'Trade record created with PENDING status',
       privyUserId,
@@ -446,10 +449,6 @@ export async function executeTrade(
     });
 
     try {
-      // Get CLOB client
-      const clobClientStartTime = Date.now();
-      const clobClient = await getClobClientForUser(privyUserId, request.userJwt);
-      timings.getClobClient = Date.now() - clobClientStartTime;
 
       // For FOK and FAK orders, use market order method
       // For LIMIT orders, use limit order method
@@ -584,7 +583,49 @@ export async function executeTrade(
           }
         } catch (error: any) {
           lastError = error;
-          
+
+          // FOK sell failed due to insufficient liquidity — fallback to GTC limit order
+          const fokNotFilled = error?.response?.status === 400 &&
+            typeof error?.response?.data?.error === 'string' &&
+            error.response.data.error.includes('fully filled');
+
+          if (fokNotFilled && side === TradeSide.SELL && (orderType === OrderType.FOK || orderType === OrderType.FAK)) {
+            logger.info({
+              message: 'FOK sell insufficient liquidity — falling back to GTC limit order',
+              privyUserId,
+              price,
+              size,
+              attempt,
+            });
+
+            try {
+              orderResponse = await clobClient.createAndPostOrder({
+                tokenID: marketInfo.clobTokenId,
+                price: parseFloat(price),
+                size: parseFloat(size),
+                side: Side.SELL,
+              });
+
+              logger.info({
+                message: 'GTC limit sell order created (FOK fallback)',
+                privyUserId,
+                orderId: orderResponse?.orderID,
+              });
+
+              if (orderResponse?.orderID || orderResponse?.status) {
+                break;
+              }
+            } catch (gtcError: any) {
+              logger.error({
+                message: 'GTC fallback also failed',
+                privyUserId,
+                error: gtcError?.message,
+              });
+              lastError = gtcError;
+              throw gtcError;
+            }
+          }
+
           if (isRetryableError(error) && attempt < MAX_RETRIES) {
             const delayMs = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
             logger.warn({
@@ -599,7 +640,7 @@ export async function executeTrade(
             await sleep(delayMs);
             continue;
           }
-          
+
           // Non-retryable error or max retries reached
           throw error;
         }
@@ -799,40 +840,39 @@ export async function executeTrade(
         });
       }
 
-      // Transfer fee if trade was filled successfully
-      let feeTransferResult: { success: boolean; txHash?: string; error?: string } | null = null;
+      // Transfer fee if trade was filled successfully (fire-and-forget; retry job covers failures)
       if (finalStatus === 'FILLED') {
-        try {
-          const { transferFee } = await import('./fee.service');
-          feeTransferResult = await transferFee(privyUserId, feeAmount, tradeRecord.id);
-          
-          if (feeTransferResult.success) {
-            logger.info({
-              message: 'Fee transferred successfully',
-              privyUserId,
-              tradeId: tradeRecord.id,
-              feeAmount,
-              txHash: feeTransferResult.txHash,
+        import('./fee.service').then(({ transferFee }) => {
+          transferFee(privyUserId, feeAmount, tradeRecord.id)
+            .then((result) => {
+              if (result.success) {
+                logger.info({
+                  message: 'Fee transferred successfully',
+                  privyUserId,
+                  tradeId: tradeRecord.id,
+                  feeAmount,
+                  txHash: result.txHash,
+                });
+              } else {
+                logger.warn({
+                  message: 'Fee transfer failed, will retry via background job',
+                  privyUserId,
+                  tradeId: tradeRecord.id,
+                  feeAmount,
+                  error: result.error,
+                });
+              }
+            })
+            .catch((feeError) => {
+              logger.error({
+                message: 'Error during fee transfer',
+                privyUserId,
+                tradeId: tradeRecord.id,
+                feeAmount,
+                error: feeError instanceof Error ? feeError.message : String(feeError),
+              });
             });
-          } else {
-            logger.warn({
-              message: 'Fee transfer failed, will retry via background job',
-              privyUserId,
-              tradeId: tradeRecord.id,
-              feeAmount,
-              error: feeTransferResult.error,
-            });
-          }
-        } catch (feeError) {
-          logger.error({
-            message: 'Error during fee transfer',
-            privyUserId,
-            tradeId: tradeRecord.id,
-            feeAmount,
-            error: feeError instanceof Error ? feeError.message : String(feeError),
-          });
-          // Don't fail the trade if fee transfer fails - background job will retry
-        }
+        });
       }
 
       // Fetch updated trade record with fee status
@@ -859,24 +899,8 @@ export async function executeTrade(
           });
         }
 
-        // Refresh USDC balance from Alchemy after trade
-        try {
-          const { refreshAndUpdateBalance } = await import('../../alchemy/balance.service');
-          refreshAndUpdateBalance(user.proxyWalletAddress, privyUserId).catch((balanceError) => {
-            logger.warn({
-              message: 'Failed to refresh balance after trade',
-              privyUserId,
-              tradeId: tradeRecord.id,
-              error: balanceError instanceof Error ? balanceError.message : String(balanceError),
-            });
-          });
-        } catch (importError) {
-          logger.warn({
-            message: 'Failed to import balance service for refresh',
-            privyUserId,
-            error: importError instanceof Error ? importError.message : String(importError),
-          });
-        }
+        // Balance: Alchemy webhook updates wallet_balances when trade tx is confirmed.
+        // Do not call refreshAndUpdateBalance here — it runs before the tx is mined and overwrites DB with stale balance.
       }
 
       // If FOK/FAK order was verified as not filled, return failure to user

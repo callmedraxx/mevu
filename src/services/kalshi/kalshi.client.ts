@@ -134,3 +134,45 @@ export async function fetchAllMarketsForSeries(
 
   return allMarkets;
 }
+
+/** Response from GET /markets/{ticker} */
+export interface KalshiMarketResponse {
+  market: {
+    ticker: string;
+    yes_bid?: number;
+    yes_ask?: number;
+    no_bid?: number;
+    no_ask?: number;
+    [key: string]: unknown;
+  };
+}
+
+/**
+ * Fetch a single market by ticker (for position current price lookup)
+ */
+export async function fetchKalshiMarketByTicker(
+  ticker: string
+): Promise<KalshiMarketResponse['market'] | null> {
+  try {
+    const response = await rateLimitedRequest(() =>
+      axios.get<KalshiMarketResponse>(`${KALSHI_BASE_URL}/markets/${encodeURIComponent(ticker)}`, {
+        timeout: REQUEST_TIMEOUT,
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'mevu-backend/1.0',
+        },
+      })
+    );
+    return response?.data?.market ?? null;
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      return null;
+    }
+    logger.warn({
+      message: 'Kalshi fetch market by ticker failed',
+      ticker,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}

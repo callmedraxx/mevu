@@ -420,6 +420,139 @@ async function storePriceHistory(
 }
 
 /**
+ * Fetch price history for multiple CLOB tokens in parallel.
+ * All Polymarket API calls run concurrently via Promise.all.
+ * Database inserts are done in one bulk transaction.
+ */
+export async function fetchAndStorePriceHistoryBulk(
+  clobTokenIds: string[],
+  interval: string,
+  fidelity?: number
+): Promise<Record<string, StoredPriceHistoryPoint[]>> {
+  if (clobTokenIds.length === 0) return {};
+
+  const minFidelity = getMinFidelityForInterval(interval);
+  let effectiveFidelity = fidelity;
+  if (effectiveFidelity === undefined && minFidelity !== undefined) {
+    effectiveFidelity = minFidelity;
+  }
+  if (effectiveFidelity !== undefined && minFidelity !== undefined && effectiveFidelity < minFidelity) {
+    effectiveFidelity = minFidelity;
+  }
+
+  const params: { interval: string; fidelity?: number } = { interval };
+  if (effectiveFidelity !== undefined) params.fidelity = effectiveFidelity;
+
+  // 1. Fetch all in parallel: check cache first, else fetch from Polymarket
+  const results = await Promise.all(
+    clobTokenIds.map(async (clobTokenId) => {
+      const cached = await getCachedPriceHistory(clobTokenId, interval);
+      if (cached?.history?.length) {
+        return {
+          clobTokenId,
+          history: cached.history.map((p) => ({ timestamp: p.t, price: p.p })),
+          fromCache: true,
+          rawHistory: null as PriceHistoryPoint[] | null,
+        };
+      }
+      const response = await polymarketClient.getClobPriceHistory(clobTokenId, params);
+      const rawHistory = response.history ?? [];
+      return {
+        clobTokenId,
+        history: rawHistory.map((p) => ({ timestamp: p.t, price: p.p })),
+        fromCache: false,
+        rawHistory,
+      };
+    })
+  );
+
+  // 2. Collect those that need DB storage (fetched from API, not cache)
+  const toStore = results
+    .filter((r) => !r.fromCache && r.rawHistory && r.rawHistory.length > 0)
+    .map((r) => ({ clobTokenId: r.clobTokenId, history: r.rawHistory! }));
+
+  // 3. One bulk insert for all tokens
+  if (toStore.length > 0) {
+    await storePriceHistoryBulk(toStore);
+  }
+
+  // 4. Return normalized result
+  const out: Record<string, StoredPriceHistoryPoint[]> = {};
+  for (const r of results) {
+    out[r.clobTokenId] = r.history;
+  }
+  return out;
+}
+
+/**
+ * Bulk store price history for multiple tokens in a single transaction.
+ */
+async function storePriceHistoryBulk(
+  entries: Array<{ clobTokenId: string; history: PriceHistoryPoint[] }>
+): Promise<void> {
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (!isProduction) {
+    logger.debug({
+      message: 'storePriceHistoryBulk skipped in dev',
+      tokenCount: entries.length,
+      totalPoints: entries.reduce((s, e) => s + e.history.length, 0),
+    });
+    return;
+  }
+
+  const allRows: Array<{ clobTokenId: string; t: number; p: number }> = [];
+  for (const { clobTokenId, history } of entries) {
+    const deduped = new Map<number, PriceHistoryPoint>();
+    for (const p of history) deduped.set(p.t, p);
+    for (const p of deduped.values()) {
+      allRows.push({ clobTokenId, t: p.t, p: p.p });
+    }
+  }
+  if (allRows.length === 0) return;
+
+  await acquireDbWriteLock();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const BATCH_SIZE = 500;
+    for (let i = 0; i < allRows.length; i += BATCH_SIZE) {
+      const batch = allRows.slice(i, i + BATCH_SIZE);
+      const values: any[] = [];
+      const placeholders: string[] = [];
+      let paramIndex = 1;
+      for (const row of batch) {
+        placeholders.push(`($${paramIndex++}, $${paramIndex++}, $${paramIndex++}, CURRENT_TIMESTAMP)`);
+        values.push(row.clobTokenId, row.t, row.p);
+      }
+      await client.query(
+        `INSERT INTO clob_price_history (clob_token_id, timestamp, price, created_at)
+         VALUES ${placeholders.join(', ')}
+         ON CONFLICT (clob_token_id, timestamp) DO UPDATE SET price = EXCLUDED.price, created_at = EXCLUDED.created_at`,
+        values
+      );
+    }
+    await client.query('COMMIT');
+    logger.debug({
+      message: 'Bulk price history stored',
+      tokenCount: entries.length,
+      totalRows: allRows.length,
+    });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {}
+    logger.error({
+      message: 'Error in bulk price history store',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  } finally {
+    client.release();
+    releaseDbWriteLock();
+  }
+}
+
+/**
  * Get price history from database by clobTokenId
  * Optional startTs and endTs for filtering by time range
  */

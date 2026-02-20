@@ -581,12 +581,27 @@ export async function getPortfolioSummary(privyUserId: string): Promise<Portfoli
 }
 
 /**
- * Refresh positions and portfolio (public API)
+ * Refresh positions and portfolio (public API).
+ * Publishes to Redis when done so portfolio SSE streams on all workers receive the update.
  */
 export async function refreshPositions(
   privyUserId: string,
   params: PositionsQueryParams = {}
 ): Promise<PortfolioSummary> {
   await fetchAndStorePositions(privyUserId, params);
-  return await getPortfolioSummary(privyUserId);
+  const summary = await getPortfolioSummary(privyUserId);
+  // Publish so SSE connections on other workers (e.g. the one with user's stream) receive the update
+  try {
+    const { isRedisClusterBroadcastReady, publishPortfolioUpdate } = await import('../redis-cluster-broadcast.service');
+    if (isRedisClusterBroadcastReady()) {
+      publishPortfolioUpdate(privyUserId, summary.portfolio);
+    }
+  } catch (err) {
+    logger.warn({
+      message: 'Failed to publish portfolio update to Redis',
+      privyUserId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return summary;
 }

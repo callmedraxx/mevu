@@ -14,8 +14,15 @@ import { logger } from '../../config/logger';
 import { getCache, setCache } from '../../utils/cache';
 import { SOLANA_USDC_MINT } from './dflow-order-validation';
 
+/** Market returned by DFlow POST /api/v1/markets/batch */
+export interface DFlowMarketBatchItem {
+  ticker?: string;
+  title?: string;
+  accounts?: Record<string, { yesMint?: string; noMint?: string; marketLedger?: string; isInitialized?: boolean }>;
+}
+
 const DFLOW_METADATA_API_URL =
-  process.env.DFLOW_METADATA_API_URL || 'https://dev-prediction-markets-api.dflow.net';
+  process.env.DFLOW_METADATA_API_URL || 'https://d.prediction-markets-api.dflow.net';
 const REDIS_TICKER_PREFIX = 'dflow:ticker_to_mint:';
 const CACHE_TTL = 3600;
 
@@ -47,7 +54,7 @@ class DFlowMetadataService {
         ...(apiKey && { 'x-api-key': apiKey }),
       },
     });
-    this.enabled = !!apiKey || process.env.DFLOW_USE_DEV_METADATA === 'true';
+    this.enabled = !!apiKey;
   }
 
   async getOutcomeMint(
@@ -118,10 +125,11 @@ class DFlowMetadataService {
       }>(`/api/v1/market/${encodeURIComponent(kalshiTicker)}`);
 
       const usdcAccount = response.data?.accounts?.[SOLANA_USDC_MINT];
-      if (usdcAccount?.yesMint && usdcAccount?.noMint && usdcAccount?.isInitialized) {
+      if (usdcAccount?.yesMint && usdcAccount?.noMint) {
         logger.info({
           message: 'DFlow mapping found by ticker',
           kalshiTicker,
+          isInitialized: usdcAccount.isInitialized,
         });
         return {
           kalshiTicker,
@@ -132,9 +140,9 @@ class DFlowMetadataService {
         };
       }
 
-      // Market exists but not initialized for USDC — not tradeable
+      // No USDC account or missing yes/no mints
       logger.info({
-        message: 'DFlow ticker found but not initialized for USDC',
+        message: 'DFlow ticker found but no USDC yes/no mints',
         kalshiTicker,
         status: response.data?.status,
       });
@@ -209,6 +217,56 @@ class DFlowMetadataService {
       );
     } finally {
       client.release();
+    }
+  }
+
+  /**
+   * Filter wallet mint addresses down to prediction market outcome mints.
+   * POST /api/v1/filter_outcome_mints — max 200 addresses.
+   */
+  async filterOutcomeMints(addresses: string[]): Promise<string[]> {
+    if (addresses.length === 0) return [];
+    if (addresses.length > 200) {
+      logger.warn({ message: 'filterOutcomeMints: truncating to 200 addresses', count: addresses.length });
+      addresses = addresses.slice(0, 200);
+    }
+    if (!this.enabled) return [];
+
+    try {
+      const response = await this.client.post<{ outcomeMints?: string[] }>(
+        '/api/v1/filter_outcome_mints',
+        { addresses }
+      );
+      return response.data?.outcomeMints ?? [];
+    } catch (error) {
+      logger.error({
+        message: 'DFlow filterOutcomeMints failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Fetch market metadata for outcome mints.
+   * POST /api/v1/markets/batch — returns markets with ticker, title, accounts (yesMint, noMint).
+   */
+  async getMarketsBatch(mints: string[]): Promise<DFlowMarketBatchItem[]> {
+    if (mints.length === 0) return [];
+    if (!this.enabled) return [];
+
+    try {
+      const response = await this.client.post<{ markets?: DFlowMarketBatchItem[] }>(
+        '/api/v1/markets/batch',
+        { mints }
+      );
+      return response.data?.markets ?? [];
+    } catch (error) {
+      logger.error({
+        message: 'DFlow getMarketsBatch failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
     }
   }
 

@@ -376,13 +376,13 @@ export class ActivityWatcherWebSocketService {
           }
         }
       }
-      logger.info({
-        message: '[Kalshi broadcast] Activity watcher received kalshi_price_update',
-        gameId: msg.gameId,
-        ticker: msg.ticker,
-        slugResolved: slug ?? null,
-        clientsSentTo: sentCount,
-      });
+      // logger.info({
+      //   message: '[Kalshi broadcast] Activity watcher received kalshi_price_update',
+      //   gameId: msg.gameId,
+      //   ticker: msg.ticker,
+      //   slugResolved: slug ?? null,
+      //   clientsSentTo: sentCount,
+      // });
     };
 
     this.kalshiRedisUnsubscribe = subscribeToKalshiPriceBroadcast(onKalshiMessage);

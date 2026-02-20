@@ -2,12 +2,18 @@
  * On-chain Solana USDC balance check.
  * Fallback for when Alchemy webhooks miss a deposit.
  * Uses JSON-RPC getTokenAccountsByOwner — no SDK needed.
+ *
+ * Uses Alchemy Solana RPC when ALCHEMY_SOLANA_API_KEY or ALCHEMY_API_KEY is set (avoids 429 rate limits).
  */
 
 import axios from 'axios';
 import { logger } from '../../config/logger';
 
-const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+function getSolanaRpcUrl(): string {
+  const key = process.env.ALCHEMY_SOLANA_API_KEY || process.env.ALCHEMY_API_KEY;
+  if (key) return `https://solana-mainnet.g.alchemy.com/v2/${key}`;
+  return process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+}
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
 /**
@@ -17,7 +23,7 @@ const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 export async function getSolanaUsdcBalance(walletAddress: string): Promise<string> {
   try {
     const response = await axios.post(
-      SOLANA_RPC_URL,
+      getSolanaRpcUrl(),
       {
         jsonrpc: '2.0',
         id: 1,

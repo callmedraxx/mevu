@@ -7,6 +7,7 @@ import { Router, Request, Response } from 'express';
 import { logger } from '../config/logger';
 import { geoDetectMiddleware, requireKalshiRegion } from '../middleware/geo-detect.middleware';
 import { executeKalshiBuy, executeKalshiSell } from '../services/kalshi/kalshi-trading.service';
+import { getKalshiPositions } from '../services/kalshi/kalshi-positions.service';
 import { dflowMetadataService } from '../services/dflow/dflow-metadata.service';
 import { redeemKalshiPosition, getRedeemablePositions } from '../services/kalshi/kalshi-redemption.service';
 import { getUserByPrivyId } from '../services/privy/user.service';
@@ -77,17 +78,11 @@ router.get('/history', async (req: Request, res: Response) => {
 router.get('/positions', async (req: Request, res: Response) => {
   const privyUserId = req.query.privyUserId as string;
   if (!privyUserId) return res.status(400).json({ success: false, error: 'Missing privyUserId' });
-  if (getDatabaseConfig().type !== 'postgres') return res.json({ positions: [] });
-  const client = await pool.connect();
-  try {
-    const r = await client.query(
-      'SELECT * FROM kalshi_positions WHERE privy_user_id = $1',
-      [privyUserId]
-    );
-    return res.json({ positions: r.rows });
-  } finally {
-    client.release();
-  }
+  const user = await getUserByPrivyId(privyUserId);
+  const solanaAddress = (user as any)?.solanaWalletAddress;
+  if (!solanaAddress) return res.json({ positions: [] });
+  const positions = await getKalshiPositions(solanaAddress);
+  return res.json({ positions });
 });
 
 /**
@@ -98,20 +93,10 @@ router.get('/positions', async (req: Request, res: Response) => {
 router.get('/portfolio', async (req: Request, res: Response) => {
   const privyUserId = req.query.privyUserId as string;
   if (!privyUserId) return res.status(400).json({ success: false, error: 'Missing privyUserId' });
-  if (getDatabaseConfig().type !== 'postgres') {
-    return res.json({
-      success: true,
-      portfolio: 0,
-      balance: '0',
-      positions: [],
-      totalPositions: 0,
-    });
-  }
   const user = await getUserByPrivyId(privyUserId);
   let balance = parseFloat(user?.kalshiUsdcBalance ?? '0') || 0;
-
-  // Always use on-chain balance as source of truth
   const solanaAddress = (user as any)?.solanaWalletAddress;
+
   if (solanaAddress) {
     const onChainBalance = await getSolanaUsdcBalance(solanaAddress);
     const onChainNum = parseFloat(onChainBalance) || 0;
@@ -121,28 +106,17 @@ router.get('/portfolio', async (req: Request, res: Response) => {
     balance = onChainNum;
   }
 
-  const client = await pool.connect();
-  try {
-    const r = await client.query(
-      'SELECT * FROM kalshi_positions WHERE privy_user_id = $1',
-      [privyUserId]
-    );
-    const positions = r.rows;
-    const positionsCost = positions.reduce((sum: number, p: { total_cost_usdc?: string | number }) => {
-      const v = p.total_cost_usdc;
-      return sum + (typeof v === 'string' ? parseFloat(v) : Number(v) || 0);
-    }, 0);
-    const portfolio = balance + positionsCost;
-    return res.json({
-      success: true,
-      portfolio,
-      balance: String(balance),
-      positions,
-      totalPositions: positions.length,
-    });
-  } finally {
-    client.release();
-  }
+  const positions = solanaAddress ? await getKalshiPositions(solanaAddress) : [];
+  const positionsCost = positions.reduce((sum, p) => sum + parseFloat(p.totalCostUsdc || '0'), 0);
+  const portfolio = balance + positionsCost;
+
+  return res.json({
+    success: true,
+    portfolio,
+    balance: String(balance),
+    positions,
+    totalPositions: positions.length,
+  });
 });
 
 router.get('/positions/redeemable', async (req: Request, res: Response) => {

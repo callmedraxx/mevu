@@ -27,6 +27,7 @@ export class ClobWebSocketService {
   private maxOrderBookHistory: number = 50;
   private orderBookUpdateCallbacks: Set<(updates: ClobOrderBookUpdate[]) => void> = new Set();
   private pendingSubscriptions: string[] = []; // Store subscriptions to re-apply after reconnect
+  private addAssetsTimer: NodeJS.Timeout | null = null;
 
   /**
    * Connect to the CLOB WebSocket endpoint
@@ -248,11 +249,10 @@ export class ClobWebSocketService {
     // Check if this is a price_change event (the format we want)
     const msg = message as any;
     if (msg && typeof msg === 'object' && msg.event_type === 'price_change' && msg.price_changes) {
-      // logger.info({
+      // logger.debug({
       //   message: 'CLOB price_change event received',
       //   market: msg.market?.substring(0, 20) + '...',
       //   priceChangeCount: msg.price_changes.length,
-      //   timestamp: msg.timestamp,
       // });
 
       // Notify callbacks with the price changes
@@ -272,64 +272,24 @@ export class ClobWebSocketService {
       return;
     }
 
-    // Check if this is an array of order book updates (legacy format)
+    // Check if this is an array of order book updates
     if (Array.isArray(message) && message.length > 0 && 'market' in message[0] && 'bids' in message[0]) {
       // This is an array of order book updates
       const updates = message as ClobOrderBookUpdate[];
-      
-      logger.info({
-        message: 'CLOB order book update received',
-        updateCount: updates.length,
-        firstAssetId: updates[0]?.asset_id?.substring(0, 20) + '...',
-      });
+      this.processBookUpdates(updates);
+      return;
+    }
 
-      // Store order book updates
-      for (const update of updates) {
-        this.orderBookUpdates.push(update);
-        if (this.orderBookUpdates.length > this.maxOrderBookHistory) {
-          this.orderBookUpdates.shift();
-        }
-
-        // Log order book summary
-        this.logOrderBookSummary(update);
-      }
-
-      // Also store in general message history
-      this.messageHistory.push(message as any);
-      if (this.messageHistory.length > this.maxHistorySize) {
-        this.messageHistory.shift();
-      }
-
-      // Notify all registered callbacks about the order book updates
-      if (this.orderBookUpdateCallbacks.size > 0) {
-        logger.debug({
-          message: 'Calling order book update callbacks',
-          callbackCount: this.orderBookUpdateCallbacks.size,
-          updateCount: updates.length,
-        });
-        for (const callback of this.orderBookUpdateCallbacks) {
-          try {
-            callback(updates);
-          } catch (error) {
-            logger.error({
-              message: 'Error in order book update callback',
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-      } else {
-        logger.debug({
-          message: 'No callbacks registered for order book updates',
-          updateCount: updates.length,
-        });
-      }
-
+    // Check if this is a SINGLE book object (event_type: 'book') — Polymarket can send
+    // book events as individual objects instead of arrays
+    if (msg && !Array.isArray(msg) && msg.event_type === 'book' && msg.bids && msg.asks && msg.asset_id) {
+      this.processBookUpdates([msg as ClobOrderBookUpdate]);
       return;
     }
 
     // Handle single message object
     const singleMsg = message as ClobWebSocketMessage;
-    
+
     // Store message in history
     this.messageHistory.push(singleMsg);
     if (this.messageHistory.length > this.maxHistorySize) {
@@ -338,6 +298,46 @@ export class ClobWebSocketService {
 
     // Try to identify message structure
     this.analyzeMessage(singleMsg);
+  }
+
+  /**
+   * Centralized handler for book updates (array or single-object form).
+   */
+  private processBookUpdates(updates: ClobOrderBookUpdate[]): void {
+    logger.debug({
+      message: 'CLOB book event',
+      updateCount: updates.length,
+      assetId: updates[0]?.asset_id?.substring(0, 20) + '...',
+      eventType: updates[0]?.event_type,
+    });
+
+    // Store order book updates
+    for (const update of updates) {
+      this.orderBookUpdates.push(update);
+      if (this.orderBookUpdates.length > this.maxOrderBookHistory) {
+        this.orderBookUpdates.shift();
+      }
+      this.logOrderBookSummary(update);
+    }
+
+    this.messageHistory.push(updates as any);
+    if (this.messageHistory.length > this.maxHistorySize) {
+      this.messageHistory.shift();
+    }
+
+    // Notify all registered callbacks about the order book updates
+    if (this.orderBookUpdateCallbacks.size > 0) {
+      for (const callback of this.orderBookUpdateCallbacks) {
+        try {
+          callback(updates);
+        } catch (error) {
+          logger.error({
+            message: 'Error in order book update callback',
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
   }
 
   /**
@@ -398,15 +398,19 @@ export class ClobWebSocketService {
   }
 
   /**
-   * Subscribe to market updates for specific asset IDs (clobTokenIds)
+   * Subscribe to market updates for specific asset IDs (clobTokenIds).
+   * Merges with existing pendingSubscriptions so crypto tokens registered before CLOB connect
+   * are preserved when sports subscribeToAllGames runs.
    */
   subscribeToAssets(assetIds: string[]): void {
     if (!assetIds || assetIds.length === 0) {
       return;
     }
 
-    // Store subscriptions for reconnect
-    this.pendingSubscriptions = assetIds;
+    // Merge with existing (e.g. crypto tokens added before CLOB connected)
+    const existing = new Set(this.pendingSubscriptions);
+    const merged = [...this.pendingSubscriptions, ...assetIds.filter((id) => !existing.has(id))];
+    this.pendingSubscriptions = merged;
 
     // Check if WebSocket is actually ready to send
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -414,20 +418,21 @@ export class ClobWebSocketService {
         message: 'CLOB WebSocket not ready for subscription, will retry on reconnect',
         readyState: this.ws?.readyState,
         isConnected: this.isConnected,
-        assetCount: assetIds.length,
+        assetCount: this.pendingSubscriptions.length,
       });
       return;
     }
 
+    // Send full merged list so pre-connect crypto tokens are included
     const subscriptionMessage = {
-      assets_ids: assetIds,
+      assets_ids: this.pendingSubscriptions,
       type: 'market',
     };
 
     logger.info({
       message: 'Subscribing to CLOB assets',
-      count: assetIds.length,
-      firstAsset: assetIds[0]?.substring(0, 20) + '...',
+      count: this.pendingSubscriptions.length,
+      firstAsset: this.pendingSubscriptions[0]?.substring(0, 20) + '...',
     });
 
     this.send(subscriptionMessage);
@@ -472,6 +477,10 @@ export class ClobWebSocketService {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.addAssetsTimer) {
+      clearTimeout(this.addAssetsTimer);
+      this.addAssetsTimer = null;
     }
   }
 
@@ -618,6 +627,121 @@ export class ClobWebSocketService {
 //       bidCount: update.bids.length,
 //       askCount: update.asks.length,
 //     });
+  }
+
+  /**
+   * Add assets to the CLOB subscription.
+   * Merges into pendingSubscriptions, then forces a CLOB WS reconnect.
+   *
+   * Polymarket's CLOB WS locks subscriptions after the initial message —
+   * subsequent subscription messages on the same connection are ignored.
+   * The only reliable way to add new tokens is to reconnect and re-subscribe
+   * with the full list. Uses a 200ms debounce to batch rapid calls.
+   */
+  addAssets(assetIds: string[]): void {
+    if (!assetIds || assetIds.length === 0) return;
+
+    // Merge into pendingSubscriptions (for reconnect recovery)
+    const existing = new Set(this.pendingSubscriptions);
+    const newAssets = assetIds.filter((id) => !existing.has(id));
+    if (newAssets.length === 0) return; // Already subscribed to all
+
+    this.pendingSubscriptions = [...this.pendingSubscriptions, ...newAssets];
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      logger.warn({
+        message: 'CLOB WebSocket not ready for addAssets, will subscribe on reconnect',
+        newAssetCount: newAssets.length,
+      });
+      return;
+    }
+
+    // Debounce: batch rapid addAssets calls (e.g. orderbook + price service both call for same market)
+    if (this.addAssetsTimer) return; // Already scheduled
+    this.addAssetsTimer = setTimeout(() => {
+      this.addAssetsTimer = null;
+      this.forceReconnect();
+    }, 200);
+  }
+
+  /**
+   * Force a reconnect to re-subscribe with updated pendingSubscriptions.
+   *
+   * Uses a **hot-swap** strategy to avoid disrupting existing streams:
+   * 1. Keep old WS alive and forwarding data via its 'message' handler.
+   * 2. Open a NEW connection in parallel.
+   * 3. Subscribe on the new connection with the full token list.
+   * 4. Swap this.ws to the new connection.
+   * 5. Close the old connection.
+   *
+   * During the overlap window both connections fire callbacks — downstream
+   * services deduplicate (lastPublishedPrices / idempotent orderbook events)
+   * so this is harmless.
+   */
+  private async forceReconnect(): Promise<void> {
+    logger.info({
+      message: 'CLOB WS: hot-swap reconnect for updated subscriptions',
+      totalAssets: this.pendingSubscriptions.length,
+    });
+
+    // 1. Save old connection — it keeps forwarding data while we set up the new one.
+    const oldWs = this.ws;
+    const oldPingInterval = this.pingInterval;
+
+    // Detach lifecycle handlers from old WS so a spurious close doesn't trigger
+    // scheduleReconnect while we're swapping. The 'message' handler stays active
+    // so callbacks keep firing during the transition.
+    if (oldWs) {
+      oldWs.removeAllListeners('close');
+      oldWs.removeAllListeners('error');
+    }
+
+    // 2. Reset instance state so connect() creates a fresh connection on this.ws.
+    this.ws = null;
+    this.pingInterval = null;
+    this.isConnected = false;
+    this.isConnecting = false;
+    this.reconnectAttempts = 0;
+
+    let swapSucceeded = false;
+    try {
+      // 3. Connect creates a new this.ws with full event handlers.
+      await this.connect();
+
+      // 4. Subscribe on the new connection with the complete token list.
+      if (this.pendingSubscriptions.length > 0) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+        logger.info({
+          message: 'CLOB WS: subscribing on new connection',
+          assetCount: this.pendingSubscriptions.length,
+        });
+        this.subscribeToAssets(this.pendingSubscriptions);
+      }
+
+      swapSucceeded = true;
+      logger.info({
+        message: 'CLOB WS: hot-swap complete',
+        totalAssets: this.pendingSubscriptions.length,
+      });
+    } catch (error) {
+      logger.error({
+        message: 'CLOB WS: hot-swap failed, scheduling retry',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // 5. Clean up old connection (data has been flowing through it until this point).
+    if (oldWs) {
+      oldWs.removeAllListeners();
+      try { oldWs.close(4000, 'Hot swap complete'); } catch {}
+    }
+    if (oldPingInterval) {
+      clearInterval(oldPingInterval);
+    }
+
+    if (!swapSucceeded) {
+      this.scheduleReconnect();
+    }
   }
 
   /**

@@ -21,7 +21,14 @@ const KALSHI_PRICES_CHANNEL = 'kalshi:prices';
 const KALSHI_PRICES_ACTIVITY_CHANNEL = 'kalshi:prices:activity';
 const DEPOSITS_PROGRESS_CHANNEL = 'deposits:progress';
 const DEPOSITS_BALANCE_CHANNEL = 'deposits:balance';
+const PORTFOLIO_UPDATE_CHANNEL = 'portfolio:update';
 const KALSHI_USER_CHANNEL = 'kalshi:user';
+const CRYPTO_PRICES_CHANNEL = 'crypto:prices';
+const CRYPTO_CLOB_SUBSCRIBE_CHANNEL = 'crypto:clob:subscribe';
+const CRYPTO_ORDERBOOK_CHANNEL = 'crypto:orderbook';
+const CRYPTO_ORDERBOOK_SUBSCRIBE_CHANNEL = 'crypto:orderbook:subscribe';
+const CRYPTO_CHAINLINK_PRICES_CHANNEL = 'crypto:chainlink_prices';
+const CRYPTO_CHAINLINK_SUBSCRIBE_CHANNEL = 'crypto:chainlink:subscribe';
 
 let redisPub: Redis | null = null;
 let redisSub: Redis | null = null;
@@ -31,7 +38,14 @@ const kalshiPricesCallbacks: Set<(msg: unknown) => void> = new Set();
 const kalshiPricesActivityCallbacks: Set<(msg: unknown) => void> = new Set();
 const depositsProgressCallbacks: Set<(msg: unknown) => void> = new Set();
 const depositsBalanceCallbacks: Set<(msg: unknown) => void> = new Set();
+const portfolioUpdateCallbacks: Set<(msg: unknown) => void> = new Set();
 const kalshiUserCallbacks: Set<(msg: unknown) => void> = new Set();
+const cryptoPricesCallbacks: Set<(msg: unknown) => void> = new Set();
+const cryptoClobSubscribeCallbacks: Set<(msg: unknown) => void> = new Set();
+const cryptoOrderbookCallbacks: Set<(msg: unknown) => void> = new Set();
+const cryptoOrderbookSubscribeCallbacks: Set<(msg: unknown) => void> = new Set();
+const cryptoChainlinkPricesCallbacks: Set<(msg: unknown) => void> = new Set();
+const cryptoChainlinkSubscribeCallbacks: Set<(msg: unknown) => void> = new Set();
 
 /**
  * Initialize Redis connection. Idempotent - safe to call multiple times.
@@ -93,8 +107,22 @@ export function initRedisClusterBroadcast(): boolean {
           depositsProgressCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
         } else if (channel === DEPOSITS_BALANCE_CHANNEL) {
           depositsBalanceCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === PORTFOLIO_UPDATE_CHANNEL) {
+          portfolioUpdateCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
         } else if (channel === KALSHI_USER_CHANNEL) {
           kalshiUserCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === CRYPTO_PRICES_CHANNEL) {
+          cryptoPricesCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === CRYPTO_CLOB_SUBSCRIBE_CHANNEL) {
+          cryptoClobSubscribeCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === CRYPTO_ORDERBOOK_CHANNEL) {
+          cryptoOrderbookCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === CRYPTO_ORDERBOOK_SUBSCRIBE_CHANNEL) {
+          cryptoOrderbookSubscribeCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === CRYPTO_CHAINLINK_PRICES_CHANNEL) {
+          cryptoChainlinkPricesCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
+        } else if (channel === CRYPTO_CHAINLINK_SUBSCRIBE_CHANNEL) {
+          cryptoChainlinkSubscribeCallbacks.forEach((cb) => { try { cb(parsed); } catch (e) { /* ignore */ } });
         }
       } catch (err) {
         logger.warn({
@@ -105,7 +133,7 @@ export function initRedisClusterBroadcast(): boolean {
       }
     });
 
-    redisSub.subscribe(GAMES_CHANNEL, ACTIVITY_CHANNEL, KALSHI_PRICES_CHANNEL, KALSHI_PRICES_ACTIVITY_CHANNEL, DEPOSITS_PROGRESS_CHANNEL, DEPOSITS_BALANCE_CHANNEL, KALSHI_USER_CHANNEL);
+    redisSub.subscribe(GAMES_CHANNEL, ACTIVITY_CHANNEL, KALSHI_PRICES_CHANNEL, KALSHI_PRICES_ACTIVITY_CHANNEL, DEPOSITS_PROGRESS_CHANNEL, DEPOSITS_BALANCE_CHANNEL, PORTFOLIO_UPDATE_CHANNEL, KALSHI_USER_CHANNEL, CRYPTO_PRICES_CHANNEL, CRYPTO_CLOB_SUBSCRIBE_CHANNEL, CRYPTO_ORDERBOOK_CHANNEL, CRYPTO_ORDERBOOK_SUBSCRIBE_CHANNEL, CRYPTO_CHAINLINK_PRICES_CHANNEL, CRYPTO_CHAINLINK_SUBSCRIBE_CHANNEL);
     return true;
   } catch (error) {
     logger.warn({
@@ -362,6 +390,16 @@ export function publishDepositsBalance(notification: unknown): void {
   publish(DEPOSITS_BALANCE_CHANNEL, notification);
 }
 
+// --- Portfolio updates (SSE stream for positions/portfolio) ---
+export function subscribeToPortfolioUpdate(callback: (msg: { privyUserId: string; portfolio: number }) => void): () => void {
+  portfolioUpdateCallbacks.add(callback as (msg: unknown) => void);
+  return () => portfolioUpdateCallbacks.delete(callback as (msg: unknown) => void);
+}
+
+export function publishPortfolioUpdate(privyUserId: string, portfolio: number): void {
+  publish(PORTFOLIO_UPDATE_CHANNEL, { privyUserId, portfolio });
+}
+
 // --- Kalshi trade/position updates (for US users) ---
 export interface KalshiTradeUpdateMessage {
   type: 'kalshi_trade_update';
@@ -394,6 +432,131 @@ export function isRedisClusterBroadcastReady(): boolean {
   return redisPub !== null;
 }
 
+// --- Crypto market real-time prices (CLOB WebSocket -> HTTP workers -> frontend clients) ---
+
+/**
+ * Published by CLOB worker when it receives a price_change for a crypto market token.
+ * One message per token — frontend matches clobTokenId to the correct Up/Down button.
+ * Uses best_bid (not last-trade price) for stable, accurate market pricing.
+ */
+export interface CryptoPriceBroadcastMessage {
+  type: 'crypto_price_update';
+  slug: string;
+  clobTokenId: string;  // The specific token that changed
+  price: number;        // 0-100 cents (best_bid)
+  timestamp: number;
+}
+
+/** Published by HTTP worker when a frontend client subscribes to a crypto market slug. */
+export interface CryptoClobSubscribeMessage {
+  slug: string;
+  upClobTokenId: string;
+  downClobTokenId: string;
+}
+
+export function subscribeToCryptoPrices(callback: (msg: CryptoPriceBroadcastMessage) => void): () => void {
+  cryptoPricesCallbacks.add(callback as (msg: unknown) => void);
+  return () => cryptoPricesCallbacks.delete(callback as (msg: unknown) => void);
+}
+
+export function publishCryptoPriceUpdate(message: CryptoPriceBroadcastMessage): void {
+  publish(CRYPTO_PRICES_CHANNEL, message);
+}
+
+export function subscribeToCryptoClobSubscribe(callback: (msg: CryptoClobSubscribeMessage) => void): () => void {
+  cryptoClobSubscribeCallbacks.add(callback as (msg: unknown) => void);
+  return () => cryptoClobSubscribeCallbacks.delete(callback as (msg: unknown) => void);
+}
+
+export function publishCryptoClobSubscribe(message: CryptoClobSubscribeMessage): void {
+  publish(CRYPTO_CLOB_SUBSCRIBE_CHANNEL, message);
+}
+
+// --- Polymarket orderbook real-time updates (book events from CLOB WS) ---
+
+/** A single level in the orderbook (price string, size string). */
+export interface OrderBookLevel {
+  price: string;
+  size: string;
+}
+
+/** Published by CLOB worker when a `book` event arrives for a registered token. */
+export interface CryptoOrderbookBroadcastMessage {
+  type: 'orderbook_update';
+  clobTokenId: string;      // asset_id from CLOB
+  conditionId: string;      // market from CLOB (condition ID / market address)
+  bids: OrderBookLevel[];   // Descending by price
+  asks: OrderBookLevel[];   // Ascending by price
+  lastTradePrice: string | null;
+  timestamp: number;
+}
+
+/** Published by HTTP worker when a frontend client wants orderbook data for a token. */
+export interface CryptoOrderbookSubscribeMessage {
+  clobTokenId: string;
+}
+
+export function subscribeToCryptoOrderbook(
+  callback: (msg: CryptoOrderbookBroadcastMessage) => void
+): () => void {
+  cryptoOrderbookCallbacks.add(callback as (msg: unknown) => void);
+  return () => cryptoOrderbookCallbacks.delete(callback as (msg: unknown) => void);
+}
+
+export function publishCryptoOrderbookUpdate(message: CryptoOrderbookBroadcastMessage): void {
+  publish(CRYPTO_ORDERBOOK_CHANNEL, message);
+}
+
+export function subscribeToCryptoOrderbookSubscribe(
+  callback: (msg: CryptoOrderbookSubscribeMessage) => void
+): () => void {
+  cryptoOrderbookSubscribeCallbacks.add(callback as (msg: unknown) => void);
+  return () => cryptoOrderbookSubscribeCallbacks.delete(callback as (msg: unknown) => void);
+}
+
+export function publishCryptoOrderbookSubscribe(message: CryptoOrderbookSubscribeMessage): void {
+  publish(CRYPTO_ORDERBOOK_SUBSCRIBE_CHANNEL, message);
+}
+
+// --- Crypto Chainlink live prices (Polymarket live-data WS -> HTTP workers -> frontend) ---
+
+/** A single chainlink price data point. */
+export interface ChainlinkPricePoint {
+  price: number;
+  timestamp: number;
+}
+
+/** Published by CLOB worker when it receives a chainlink price update from Polymarket live-data WS. */
+export interface CryptoChainlinkPriceBroadcastMessage {
+  type: 'chainlink_price_update';
+  symbol: string;       // e.g. "btc/usd"
+  price: number;        // e.g. 66220.17
+  timestamp: number;    // ms epoch from Polymarket
+}
+
+/** Published by HTTP worker when a frontend client subscribes to a crypto symbol. */
+export interface CryptoChainlinkSubscribeMessage {
+  symbol: string;  // e.g. "btc/usd"
+}
+
+export function subscribeToCryptoChainlinkPrices(callback: (msg: CryptoChainlinkPriceBroadcastMessage) => void): () => void {
+  cryptoChainlinkPricesCallbacks.add(callback as (msg: unknown) => void);
+  return () => cryptoChainlinkPricesCallbacks.delete(callback as (msg: unknown) => void);
+}
+
+export function publishCryptoChainlinkPriceUpdate(message: CryptoChainlinkPriceBroadcastMessage): void {
+  publish(CRYPTO_CHAINLINK_PRICES_CHANNEL, message);
+}
+
+export function subscribeToCryptoChainlinkSubscribe(callback: (msg: CryptoChainlinkSubscribeMessage) => void): () => void {
+  cryptoChainlinkSubscribeCallbacks.add(callback as (msg: unknown) => void);
+  return () => cryptoChainlinkSubscribeCallbacks.delete(callback as (msg: unknown) => void);
+}
+
+export function publishCryptoChainlinkSubscribe(message: CryptoChainlinkSubscribeMessage): void {
+  publish(CRYPTO_CHAINLINK_SUBSCRIBE_CHANNEL, message);
+}
+
 export async function shutdownRedisClusterBroadcast(): Promise<void> {
   if (redisPub) {
     await redisPub.quit();
@@ -409,5 +572,12 @@ export async function shutdownRedisClusterBroadcast(): Promise<void> {
   kalshiPricesActivityCallbacks.clear();
   depositsProgressCallbacks.clear();
   depositsBalanceCallbacks.clear();
+  portfolioUpdateCallbacks.clear();
   kalshiUserCallbacks.clear();
+  cryptoPricesCallbacks.clear();
+  cryptoClobSubscribeCallbacks.clear();
+  cryptoOrderbookCallbacks.clear();
+  cryptoOrderbookSubscribeCallbacks.clear();
+  cryptoChainlinkPricesCallbacks.clear();
+  cryptoChainlinkSubscribeCallbacks.clear();
 }

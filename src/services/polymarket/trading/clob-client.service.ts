@@ -10,7 +10,8 @@ import { logger } from '../../../config/logger';
 import { privyConfig } from '../../privy/privy.config';
 import { createPrivySigner } from '../../privy/privy-signer.adapter';
 import { privyService } from '../../privy/privy.service';
-import { getUserByPrivyId } from '../../privy/user.service';
+import { getUserByPrivyId, updateUserEmbeddedWalletId } from '../../privy/user.service';
+import { UserProfile } from '../../privy/privy.types';
 
 // Cache for CLOB client instances per user
 const clobClientCache = new Map<string, {
@@ -29,7 +30,8 @@ const SIGNATURE_TYPE = 2; // Deployed Safe proxy wallet signature type (for gasl
  */
 export async function getClobClientForUser(
   privyUserId: string,
-  userJwt?: string
+  userJwt?: string,
+  preloadedUser?: UserProfile
 ): Promise<ClobClient> {
   const startTime = Date.now();
   
@@ -45,9 +47,9 @@ export async function getClobClientForUser(
     return cached.clobClient;
   }
 
-  // Get user info
+  // Get user info (use pre-fetched user if available to avoid redundant DB query)
   const userStartTime = Date.now();
-  const user = await getUserByPrivyId(privyUserId);
+  const user = preloadedUser || await getUserByPrivyId(privyUserId);
   const userTimeMs = Date.now() - userStartTime;
   
   if (!user) {
@@ -65,12 +67,25 @@ export async function getClobClientForUser(
     userQueryTimeMs: userTimeMs,
   });
 
-  // Get wallet ID for faster signing
+  // Get wallet ID for faster signing — use cached DB value if available
   const walletIdStartTime = Date.now();
-  const walletId = await privyService.getWalletIdByAddress(
-    privyUserId,
-    user.embeddedWalletAddress
-  );
+  let walletId = user.embeddedWalletId || null;
+  if (!walletId) {
+    walletId = await privyService.getWalletIdByAddress(
+      privyUserId,
+      user.embeddedWalletAddress
+    );
+    // Cache wallet ID in DB for future lookups
+    if (walletId) {
+      updateUserEmbeddedWalletId(privyUserId, walletId).catch((err) => {
+        logger.warn({
+          message: 'Failed to cache embedded wallet ID in DB',
+          privyUserId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+  }
   const walletIdTimeMs = Date.now() - walletIdStartTime;
 
   // Create Privy signer adapter

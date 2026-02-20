@@ -5,9 +5,7 @@
  * Mappings are now populated on-demand when users trade (direct ticker lookup).
  * This script is optional — use it to pre-warm the cache for tickers you expect users to trade.
  *
- * Requires: DATABASE_URL
- * For dev (no API key): set DFLOW_USE_DEV_METADATA=true in .env
- * For prod: set DFLOW_API_KEY in .env
+ * Requires: DATABASE_URL, DFLOW_API_KEY
  */
 
 import 'dotenv/config';
@@ -15,7 +13,7 @@ import { dflowMetadataService } from '../services/dflow/dflow-metadata.service';
 
 async function main() {
   if (!dflowMetadataService.isEnabled()) {
-    console.error('Add DFLOW_USE_DEV_METADATA=true (dev) or DFLOW_API_KEY (prod) to .env');
+    console.error('Add DFLOW_API_KEY to .env for production metadata API access');
     process.exit(1);
   }
 

@@ -13,6 +13,7 @@ import {
   getCurrentMarketBySeriesSlug,
   getSeriesTimeline,
 } from '../services/crypto/frontend-crypto-markets.service';
+import { transformCryptoDetailToActivity } from '../services/crypto/crypto-activity.transformer';
 import { cryptoMarketsService } from '../services/crypto/crypto-markets.service';
 import { getCryptoTrades, getCryptoHolders, getCryptoWhales } from '../services/crypto/crypto-trading-data.service';
 
@@ -247,6 +248,59 @@ router.get('/detail/:slug', async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       error: 'Failed to fetch crypto market detail',
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/crypto-markets/activity/{slug}:
+ *   get:
+ *     summary: Get crypto market in activity-watcher format (markets + outcomes, no teams)
+ *     description: |
+ *       Returns crypto market detail in activity-watcher style for the Active Markets widget.
+ *       No team data — just parent metadata and sub-markets with outcomes, volume, liquidity.
+ *       Same API contract as /api/activitywatcher/{slug} for games but simplified for crypto.
+ *     tags: [CryptoMarkets]
+ *     parameters:
+ *       - in: path
+ *         name: slug
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Market slug (e.g., what-price-will-bitcoin-hit-in-february-2026)
+ *     responses:
+ *       200:
+ *         description: Activity-style payload with markets and outcomes
+ *       404:
+ *         description: Market not found
+ *       500:
+ *         description: Server error
+ */
+router.get('/activity/:slug', async (req: Request, res: Response) => {
+  try {
+    const { slug } = req.params;
+    const detail = await getCryptoMarketDetailBySlug(slug);
+
+    if (!detail) {
+      return res.status(404).json({
+        success: false,
+        error: 'Market not found',
+      });
+    }
+
+    const activity = transformCryptoDetailToActivity(detail);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ success: true, market: activity });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching crypto market activity',
+      slug: req.params.slug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch crypto market activity',
     });
   }
 });
@@ -530,6 +584,58 @@ router.get('/:id', async (req: Request, res: Response) => {
       success: false,
       error: 'Failed to fetch crypto market',
     });
+  }
+});
+
+/**
+ * GET /api/crypto-markets/orderbook/:clobTokenId
+ * Proxies the Polymarket CLOB REST API for the initial orderbook snapshot.
+ * Returns bids, asks, and lastTradePrice before the WebSocket stream starts.
+ * No auth required on the CLOB API side — we proxy to avoid CORS issues.
+ */
+router.get('/orderbook/:clobTokenId', async (req: Request, res: Response) => {
+  const { clobTokenId } = req.params;
+  if (!clobTokenId) {
+    return res.status(400).json({ success: false, error: 'Missing clobTokenId' });
+  }
+
+  try {
+    const url = `https://clob.polymarket.com/book?token_id=${encodeURIComponent(clobTokenId)}`;
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; MevuBot/1.0)',
+        'Accept': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        success: false,
+        error: `CLOB API returned ${response.status}`,
+      });
+    }
+
+    const data = await response.json() as any;
+
+    return res.json({
+      success: true,
+      book: {
+        clobTokenId: data.asset_id || clobTokenId,
+        conditionId: data.market || '',
+        bids: data.bids || [],
+        asks: data.asks || [],
+        lastTradePrice: data.last_trade_price ?? null,
+        minOrderSize: data.min_order_size ?? null,
+        tickSize: data.tick_size ?? null,
+      },
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Failed to fetch orderbook from CLOB API',
+      clobTokenId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({ success: false, error: 'Failed to fetch orderbook' });
   }
 });
 

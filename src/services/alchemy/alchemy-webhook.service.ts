@@ -157,6 +157,14 @@ class AlchemyWebhookService extends EventEmitter {
   }
 
   /**
+   * Forward balance notification to local listeners (used when receiving from Redis in cluster mode).
+   * Called by the Redis bridge so SSE connections on other workers receive updates.
+   */
+  forwardBalanceNotification(notification: BalanceNotification): void {
+    this.notifyDepositLocally(notification);
+  }
+
+  /**
    * Notify local listeners only (used when receiving from Redis or when Redis unavailable)
    */
   private notifyDepositLocally(notification: DepositNotification): void {
@@ -208,7 +216,22 @@ class AlchemyWebhookService extends EventEmitter {
 
       // Sync all existing user addresses to the webhook
       await this.syncAllAddresses();
-      
+
+      // Redis bridge: when running in cluster mode, webhook may hit a different worker than the one with SSE.
+      // Subscribe to Redis so this worker receives balance updates and can forward to local SSE listeners.
+      if (isRedisClusterBroadcastReady()) {
+        subscribeToDepositsBalance((msg) => {
+          try {
+            this.forwardBalanceNotification(msg as BalanceNotification);
+          } catch (err) {
+            logger.warn({
+              message: 'Error forwarding balance notification from Redis',
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        });
+      }
+
       this.isInitialized = true;
       // logger.info({
       //   message: 'Alchemy webhook service initialized',

@@ -21,6 +21,7 @@ import { activityWatcherWebSocketService } from './services/polymarket/activity-
 import { clobPriceUpdateService } from './services/polymarket/clob-price-update.service';
 import { positionsWebSocketService } from './services/positions/positions-websocket.service';
 import { initRedisGamesBroadcast, shutdownRedisGamesBroadcast } from './services/redis-games-broadcast.service';
+import { initRedisClusterBroadcast, shutdownRedisClusterBroadcast } from './services/redis-cluster-broadcast.service';
 import { initRedisGamesCache, shutdownRedisGamesCache } from './services/polymarket/redis-games-cache.service';
 import { initializeProbabilityHistoryTable, cleanupOldProbabilityHistory } from './services/polymarket/probability-history.service';
 import { logger } from './config/logger';
@@ -34,6 +35,12 @@ import { depositProgressService } from './services/privy/deposit-progress.servic
 import { kalshiService, kalshiPriceUpdateService } from './services/kalshi';
 import { registerOnGamesRefreshed } from './services/polymarket/live-games.service';
 import { cryptoMarketsService } from './services/crypto/crypto-markets.service';
+import { cryptoClobPriceService } from './services/crypto/crypto-clob-price.service';
+import { cryptoOrderbookService } from './services/crypto/crypto-orderbook.service';
+import { cryptoMarketWebSocketService } from './services/crypto/crypto-market-websocket.service';
+import { orderbookWebSocketService } from './services/crypto/orderbook-websocket.service';
+import { cryptoChainlinkPriceService } from './services/crypto/crypto-chainlink-price.service';
+import { cryptoLivePriceWebSocketService } from './services/crypto/crypto-live-price-websocket.service';
 
 // Load environment variables
 dotenv.config();
@@ -342,6 +349,16 @@ async function initializeSportsServices() {
 // Initialize CLOB services only (for CLOB background worker)
 async function initializeClobServices() {
   try {
+    // Start crypto Redis subscriptions immediately so we don't miss early client subscribe messages.
+    // They use addAssets which merges into pendingSubscriptions; when CLOB connects we'll send all.
+    logger.info({ message: 'Initializing crypto CLOB Redis subscriptions (early, before games delay)...' });
+    cryptoClobPriceService.initialize();
+    cryptoOrderbookService.initialize();
+
+    // Connect to Polymarket live-data WS for Chainlink oracle prices (BTC, ETH, SOL, XRP)
+    logger.info({ message: 'Initializing Chainlink price service...' });
+    cryptoChainlinkPriceService.initialize();
+
     // Wait a bit for sports worker to populate games cache first
     logger.info({ message: 'CLOB worker waiting for games cache to populate...' });
     await new Promise(resolve => setTimeout(resolve, 10000)); // 10 second delay
@@ -373,6 +390,14 @@ async function initializeClobServices() {
     } else {
       logger.info({ message: 'Kalshi WebSocket disabled via KALSHI_WS_ENABLED=false' });
     }
+
+    // Crypto services already initialized above (before games delay)
+    const cryptoStatus = cryptoClobPriceService.getStatus();
+    logger.info({
+      message: 'CLOB crypto pipeline ready',
+      trackedCryptoTokens: cryptoStatus.trackedTokens,
+      trackedSlugs: cryptoStatus.trackedSlugs,
+    });
 
     logger.info({ message: 'CLOB services initialized successfully' });
   } catch (error) {
@@ -479,6 +504,9 @@ function startClobBackgroundWorker() {
   const shutdownClob = async () => {
     logger.info({ message: 'CLOB worker shutting down gracefully' });
     clobPriceUpdateService.shutdown();
+    cryptoClobPriceService.shutdown();
+    cryptoOrderbookService.shutdown();
+    cryptoChainlinkPriceService.shutdown();
     await kalshiPriceUpdateService.shutdown().catch(() => {});
     await shutdownRedisGamesBroadcast().catch(() => {});
     await shutdownRedisGamesCache().catch(() => {});
@@ -506,6 +534,27 @@ function startHttpWorker() {
   // Initialize Privy for API requests (signing, verification, etc.)
   privyService.initialize();
 
+  // Initialize Redis cluster broadcast (required for crypto/orderbook WebSocket Redis pub/sub)
+  const broadcastInitialized = initRedisClusterBroadcast();
+  if (broadcastInitialized) {
+    logger.info({ message: 'Redis cluster broadcast initialized for HTTP worker (crypto/orderbook WS)' });
+    // Bridge Redis deposits:balance → Alchemy webhook service so SSE balance streams receive updates
+    // (webhook may hit a different HTTP worker than the one with the user's SSE connection)
+    import('./services/redis-cluster-broadcast.service').then(({ subscribeToDepositsBalance }) => {
+      subscribeToDepositsBalance((msg: unknown) => {
+        alchemyWebhookService.forwardBalanceNotification(msg as import('./services/alchemy/alchemy-webhook.service').BalanceNotification);
+      });
+    });
+    import('./routes/positions').then(({ initPortfolioRedisBridge }) => {
+      initPortfolioRedisBridge();
+    });
+  } else {
+    logger.warn({
+      message: 'Redis cluster broadcast not available - crypto/orderbook WebSockets will not receive price updates',
+      hint: 'Set REDIS_URL for multi-worker broadcasting',
+    });
+  }
+
   // Initialize Redis games cache (reads data written by background worker)
   const redisInitialized = initRedisGamesCache();
   if (redisInitialized) {
@@ -529,6 +578,9 @@ function startHttpWorker() {
   gamesWebSocketService.initialize(server, '/ws/games');
   activityWatcherWebSocketService.initialize(server, '/ws/activity');
   positionsWebSocketService.initialize(server);
+  cryptoMarketWebSocketService.initialize(server, '/ws/crypto');
+  orderbookWebSocketService.initialize(server, '/ws/orderbook');
+  cryptoLivePriceWebSocketService.initialize(server, '/ws/crypto-prices');
 
   // Start server
   server.listen(PORT, () => {
@@ -542,6 +594,10 @@ function startHttpWorker() {
     gamesWebSocketService.shutdown();
     activityWatcherWebSocketService.shutdown();
     positionsWebSocketService.shutdown();
+    cryptoMarketWebSocketService.shutdown();
+    orderbookWebSocketService.shutdown();
+    cryptoLivePriceWebSocketService.shutdown();
+    shutdownRedisClusterBroadcast().catch(() => {});
     shutdownRedisGamesCache().catch(() => {});
     if (server) {
       server.close(() => {
@@ -563,11 +619,15 @@ function startHttpWorker() {
 function startDevelopmentServer() {
   privyService.initialize();
   initRedisGamesCache();
+  initRedisClusterBroadcast();
 
   server = http.createServer(app);
   gamesWebSocketService.initialize(server, '/ws/games');
   activityWatcherWebSocketService.initialize(server, '/ws/activity');
   positionsWebSocketService.initialize(server);
+  cryptoMarketWebSocketService.initialize(server, '/ws/crypto');
+  orderbookWebSocketService.initialize(server, '/ws/orderbook');
+  cryptoLivePriceWebSocketService.initialize(server, '/ws/crypto-prices');
 
   server.listen(PORT, () => {
     console.log(`Development server running on port ${PORT}`);

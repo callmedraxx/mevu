@@ -6,6 +6,11 @@
 import { Router, Request, Response } from 'express';
 import { logger } from '../config/logger';
 import {
+  isRedisClusterBroadcastReady,
+  publishPortfolioUpdate,
+  subscribeToPortfolioUpdate,
+} from '../services/redis-cluster-broadcast.service';
+import {
   fetchAndStorePositions,
   getPositions,
   getPortfolioSummary,
@@ -24,9 +29,10 @@ const router = Router();
 const portfolioSSEClients: Map<string, Set<Response>> = new Map();
 
 /**
- * Broadcast portfolio update to SSE clients for a specific user
+ * Broadcast portfolio update to local SSE clients for a specific user.
+ * Called directly when Redis is not used, or from Redis subscriber when cluster mode.
  */
-function broadcastPortfolioUpdate(privyUserId: string, portfolio: number): void {
+export function broadcastPortfolioUpdate(privyUserId: string, portfolio: number): void {
   const clients = portfolioSSEClients.get(privyUserId);
   if (!clients || clients.size === 0) return;
 
@@ -49,6 +55,28 @@ function broadcastPortfolioUpdate(privyUserId: string, portfolio: number): void 
     privyUserId,
     clientCount: clients.size,
     portfolio,
+  });
+}
+
+/**
+ * Broadcast portfolio update to local clients AND publish to Redis for cluster mode.
+ * Ensures all HTTP workers (including the one with the user's SSE connection) receive the update.
+ */
+function broadcastPortfolioUpdateWithRedis(privyUserId: string, portfolio: number): void {
+  broadcastPortfolioUpdate(privyUserId, portfolio);
+  if (isRedisClusterBroadcastReady()) {
+    publishPortfolioUpdate(privyUserId, portfolio);
+  }
+}
+
+/**
+ * Register Redis subscriber so this worker receives portfolio updates from other workers.
+ * Call from HTTP worker startup after initRedisClusterBroadcast.
+ */
+export function initPortfolioRedisBridge(): void {
+  if (!isRedisClusterBroadcastReady()) return;
+  subscribeToPortfolioUpdate((msg: { privyUserId: string; portfolio: number }) => {
+    broadcastPortfolioUpdate(msg.privyUserId, msg.portfolio);
   });
 }
 
@@ -151,8 +179,8 @@ router.get('/:privyUserId', async (req: Request, res: Response) => {
     // Get portfolio summary
     const summary = await getPortfolioSummary(privyUserId);
 
-    // Broadcast portfolio update to SSE clients
-    broadcastPortfolioUpdate(privyUserId, summary.portfolio);
+    // Broadcast portfolio update to SSE clients (and Redis for cluster mode)
+    broadcastPortfolioUpdateWithRedis(privyUserId, summary.portfolio);
 
     res.json({
       success: true,

@@ -7,12 +7,16 @@
  * Deep link: https://dflow.net/proof?wallet={addr}&signature={sig}&timestamp={ts}&redirect_uri={uri}
  * Message format: "Proof KYC verification: {timestamp}" where timestamp is Unix milliseconds
  *
+ * IMPORTANT: DFlow expects signature as base58 (per https://pond.dflow.net/build/proof/partner-integration).
+ * Privy's Solana signMessage returns base64 — we must convert before passing to the deep link.
+ *
  * Best practices (per https://pond.dflow.net/build/proof/partner-integration):
  * - Cache verified status (stable post-confirmation); do NOT cache unverified (may change externally)
  * - Always verify server-side for sensitive operations (trade gate)
  * - Generate fresh signatures near redirect time
  */
 
+import bs58 from 'bs58';
 import { logger } from '../../config/logger';
 import { privyService } from '../privy/privy.service';
 
@@ -72,11 +76,16 @@ export async function generateProofDeepLink(
   const timestamp = Date.now().toString();
   const message = `Proof KYC verification: ${timestamp}`;
 
-  // Sign message via Privy server SDK
-  const { signature } = await privyService.signSolanaMessage(
+  // Sign message via Privy server SDK (returns base64 per Privy API)
+  const { signature: signatureBase64 } = await privyService.signSolanaMessage(
     walletId,
     new TextEncoder().encode(message)
   );
+
+  // DFlow expects base58-encoded signature (per partner-integration docs).
+  // Privy returns base64 — decode and re-encode as base58.
+  const signatureBytes = Buffer.from(signatureBase64, 'base64');
+  const signature = bs58.encode(signatureBytes);
 
   // Construct deep link URL
   const params = new URLSearchParams({

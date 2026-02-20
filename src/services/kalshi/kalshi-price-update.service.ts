@@ -489,12 +489,12 @@ export class KalshiPriceUpdateService extends EventEmitter {
     this.tickerMessageCount++;
     const now = Date.now();
     if (now - this.lastTickerLogTime > 30000) { // Log every 30 seconds
-      logger.info({
-        message: 'Kalshi ticker messages received',
-        count: this.tickerMessageCount,
-        queueSize: this.priceQueue.size,
-        allMarketsQueueSize: this.allMarketsQueue.size,
-      });
+      // logger.info({
+      //   message: 'Kalshi ticker messages received',
+      //   count: this.tickerMessageCount,
+      //   queueSize: this.priceQueue.size,
+      //   allMarketsQueueSize: this.allMarketsQueue.size,
+      // });
       this.lastTickerLogTime = now;
     }
     
@@ -502,25 +502,25 @@ export class KalshiPriceUpdateService extends EventEmitter {
 
     const ticker = message.msg.market_ticker;
 
-    // Debug: Log all tennis ticker messages to trace the flow
-    if (ticker.toUpperCase().includes('ATPMATCH') || ticker.toUpperCase().includes('WTAMATCH')) {
-      logger.info({
-        message: 'Tennis ticker message received',
-        ticker,
-        yesBid: message.msg.yes_bid,
-        yesAsk: message.msg.yes_ask,
-      });
-    }
+    // // Debug: Log all tennis ticker messages to trace the flow
+    // if (ticker.toUpperCase().includes('ATPMATCH') || ticker.toUpperCase().includes('WTAMATCH')) {
+    //   logger.info({
+    //     message: 'Tennis ticker message received',
+    //     ticker,
+    //     yesBid: message.msg.yes_bid,
+    //     yesAsk: message.msg.yes_ask,
+    //   });
+    // }
 
-    // Debug: Log mwoh ticker messages
-    if (ticker.toUpperCase().startsWith('KXWOMHOCKEY-')) {
-      logger.info({
-        message: 'MWOH ticker message received',
-        ticker,
-        yesBid: message.msg.yes_bid,
-        yesAsk: message.msg.yes_ask,
-      });
-    }
+    // // Debug: Log mwoh ticker messages
+    // if (ticker.toUpperCase().startsWith('KXWOMHOCKEY-')) {
+    //   logger.info({
+    //     message: 'MWOH ticker message received',
+    //     ticker,
+    //     yesBid: message.msg.yes_bid,
+    //     yesAsk: message.msg.yes_ask,
+    //   });
+    // }
 
     const mapping = this.tickerMapper.getMappingForTicker(ticker);
     if (!mapping) {
@@ -615,18 +615,18 @@ export class KalshiPriceUpdateService extends EventEmitter {
     // Spread and total prices would overwrite the moneyline price if we didn't filter
     if (this.isMoneylineMarket(ticker)) {
       // Debug: log EPL ticker team detection
-      if (ticker.includes('EPLGAME')) {
-        logger.info({
-          message: 'EPL moneyline ticker queued',
-          ticker,
-          tickerTeam,
-          homeAbbr,
-          awayAbbr,
-          isAwayTeamTicker,
-          isHomeTeamTicker,
-          sport: mapping.sport,
-        });
-      }
+      // if (ticker.includes('EPLGAME')) {
+      //   logger.info({
+      //     message: 'EPL moneyline ticker queued',
+      //     ticker,
+      //     tickerTeam,
+      //     homeAbbr,
+      //     awayAbbr,
+      //     isAwayTeamTicker,
+      //     isHomeTeamTicker,
+      //     sport: mapping.sport,
+      //   });
+      // }
       this.queuePriceUpdate(priceUpdate);
     } else {
       // For non-moneyline markets, still check if we need to force flush
@@ -825,13 +825,13 @@ export class KalshiPriceUpdateService extends EventEmitter {
         } else if (update.isHomeTeamTicker) {
           if (isSoccer) {
             // Soccer: only update home team prices, don't touch away
-            logger.info({
-              message: 'Soccer home team update queued',
-              ticker: update.ticker,
-              liveGameId: update.liveGameId,
-              homeBuy: update.yesAsk,
-              homeSell: update.yesBid,
-            });
+            // logger.info({
+            //   message: 'Soccer home team update queued',
+            //   ticker: update.ticker,
+            //   liveGameId: update.liveGameId,
+            //   homeBuy: update.yesAsk,
+            //   homeSell: update.yesBid,
+            // });
             homeOnlyUpdates.push({
               liveGameId: update.liveGameId,
               homeBuy: update.yesAsk,
@@ -849,14 +849,14 @@ export class KalshiPriceUpdateService extends EventEmitter {
           }
         } else {
           // Unknown team - skip frontend_games update
-          logger.debug({
-            message: 'Cannot determine team for frontend_games update, skipping (kalshi_markets still updated)',
-            ticker: update.ticker,
-            liveGameId: update.liveGameId,
-            tickerTeam: this.extractTeamFromTicker(update.ticker),
-            mappedHomeTeam: update.homeTeam,
-            mappedAwayTeam: update.awayTeam,
-          });
+          // logger.debug({
+          //   message: 'Cannot determine team for frontend_games update, skipping (kalshi_markets still updated)',
+          //   ticker: update.ticker,
+          //   liveGameId: update.liveGameId,
+          //   tickerTeam: this.extractTeamFromTicker(update.ticker),
+          //   mappedHomeTeam: update.homeTeam,
+          //   mappedAwayTeam: update.awayTeam,
+          // });
           continue;
         }
       }
@@ -961,11 +961,11 @@ export class KalshiPriceUpdateService extends EventEmitter {
         await this.publishAllMarketUpdates(allMarketUpdates);
       }
 
-      logger.info({
-        message: 'Kalshi price flush completed',
-        moneylineCount: updates.length,
-        allMarketsCount: allMarketUpdates.length,
-      });
+      // logger.info({
+      //   message: 'Kalshi price flush completed',
+      //   moneylineCount: updates.length,
+      //   allMarketsCount: allMarketUpdates.length,
+      // });
     } catch (error) {
       if (client) {
         try {
@@ -1030,10 +1030,10 @@ export class KalshiPriceUpdateService extends EventEmitter {
       WHERE km.ticker = u.ticker
     `, values);
 
-    logger.debug({
-      message: 'Kalshi markets prices updated',
-      count: updates.length,
-    });
+    // logger.debug({
+    //   message: 'Kalshi markets prices updated',
+    //   count: updates.length,
+    // });
   }
 
   /**
@@ -1161,13 +1161,13 @@ export class KalshiPriceUpdateService extends EventEmitter {
           }
         }
         if (hasClusterBroadcast) {
-          logger.info({
-            message: '[Kalshi broadcast] Publishing kalshi_price_update to Redis',
-            gameId: message.gameId,
-            updatedSides: message.updatedSides,
-            awayBuy: message.awayTeam.kalshiBuyPrice,
-            homeBuy: message.homeTeam.kalshiBuyPrice,
-          });
+          // logger.info({
+          //   message: '[Kalshi broadcast] Publishing kalshi_price_update to Redis',
+          //   gameId: message.gameId,
+          //   updatedSides: message.updatedSides,
+          //   awayBuy: message.awayTeam.kalshiBuyPrice,
+          //   homeBuy: message.homeTeam.kalshiBuyPrice,
+          // });
           publishKalshiPriceBroadcast(message);
         }
       }
@@ -1248,10 +1248,10 @@ export class KalshiPriceUpdateService extends EventEmitter {
     // Subscribe to all mapped tickers
     await this.wsClient.subscribeToMarkets(tickers);
 
-    logger.info({
-      message: 'Kalshi subscriptions refreshed',
-      tickerCount: tickers.length,
-    });
+    // logger.info({
+    //   message: 'Kalshi subscriptions refreshed',
+    //   tickerCount: tickers.length,
+    // });
   }
 
   /**

@@ -33,9 +33,18 @@ async function getRelayerClientForFee(privyUserId: string): Promise<any> {
   // Import RelayerClient and utilities
   const { RelayClient, RelayerTxType } = await import('@polymarket/builder-relayer-client');
   const { createViemWalletForRelayer } = await import('../../privy/wallet-deployment.service');
-  const { privyService } = await import('../../privy/privy.service');
 
-  const walletId = await privyService.getWalletIdByAddress(privyUserId, user.embeddedWalletAddress);
+  // Use cached wallet ID from DB if available, fallback to Privy API lookup
+  let walletId: string | null = user.embeddedWalletId || null;
+  if (!walletId) {
+    const { privyService } = await import('../../privy/privy.service');
+    walletId = await privyService.getWalletIdByAddress(privyUserId, user.embeddedWalletAddress);
+    // Cache for future lookups
+    if (walletId) {
+      const { updateUserEmbeddedWalletId } = await import('../../privy/user.service');
+      updateUserEmbeddedWalletId(privyUserId, walletId).catch(() => {});
+    }
+  }
   const { wallet, builderConfig } = await createViemWalletForRelayer(
     privyUserId,
     user.embeddedWalletAddress,

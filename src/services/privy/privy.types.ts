@@ -80,6 +80,7 @@ export interface UserProfile {
   solanaWalletId?: string | null;
   kalshiOnboardingCompleted?: boolean;
   kalshiUsdcBalance?: string;
+  embeddedWalletId?: string | null;
 }
 
 export interface CreateUserRequest {

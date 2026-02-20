@@ -129,11 +129,21 @@ async function getWalletAndConfig(privyUserId: string, embeddedWalletAddress: st
   const { createViemWalletForRelayer } = await import('../../privy/wallet-deployment.service');
   const { privyService } = await import('../../privy/privy.service');
 
+  // Use cached embedded_wallet_id from DB if available, fall back to Privy API
   let walletId: string | undefined = undefined;
   try {
-    const fetchedWalletId = await privyService.getWalletIdByAddress(privyUserId, embeddedWalletAddress);
-    if (fetchedWalletId) {
-      walletId = fetchedWalletId;
+    const { getUserByPrivyId: getUser } = await import('../../privy/user.service');
+    const user = await getUser(privyUserId);
+    if (user?.embeddedWalletId) {
+      walletId = user.embeddedWalletId;
+    } else {
+      const fetchedWalletId = await privyService.getWalletIdByAddress(privyUserId, embeddedWalletAddress);
+      if (fetchedWalletId) {
+        walletId = fetchedWalletId;
+        // Cache for future use
+        const { updateUserEmbeddedWalletId } = await import('../../privy/user.service');
+        updateUserEmbeddedWalletId(privyUserId, fetchedWalletId).catch(() => {});
+      }
     }
   } catch {
     logger.warn({
@@ -209,10 +219,9 @@ function splitAndPackSafeSignature(sig: string): string {
 }
 
 /**
- * Execute a Safe transaction with on-chain nonce, bypassing the relayer's /nonce endpoint.
- * Signs the Safe TX locally and submits directly to the relayer's /submit endpoint.
+ * @deprecated Replaced by submitRedemptionTransaction + pollAndFinalizeRedemption
  */
-async function executeWithOnChainNonce(
+async function _executeWithOnChainNonce_UNUSED(
   wallet: any,
   builderConfig: any,
   transaction: { to: string; data: `0x${string}`; value: string },
@@ -368,6 +377,191 @@ async function executeWithOnChainNonce(
 }
 
 /**
+ * Submit a Safe transaction (sign + relayer submit) WITHOUT polling for mining.
+ * Returns immediately after the relayer accepts the transaction.
+ */
+async function submitRedemptionTransaction(
+  wallet: any,
+  builderConfig: any,
+  transaction: { to: string; data: `0x${string}`; value: string },
+  metadata: string,
+): Promise<{ transactionHash: string; transactionID: string }> {
+  const ownerAddress = wallet.account.address as `0x${string}`;
+  const safeAddress = deriveSafeAddress(ownerAddress);
+  const chainId = privyConfig.chainId;
+
+  // 1. Read nonce from on-chain
+  const onChainNonce = await getOnChainSafeNonce(safeAddress);
+
+  logger.info({
+    message: 'On-chain Safe nonce fetched for redemption',
+    ownerAddress,
+    safeAddress,
+    onChainNonce: onChainNonce.toString(),
+  });
+
+  // 2. Build EIP-712 SafeTx hash
+  const structHash = hashTypedData({
+    primaryType: 'SafeTx',
+    domain: { chainId, verifyingContract: safeAddress },
+    types: {
+      SafeTx: [
+        { name: 'to', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'data', type: 'bytes' },
+        { name: 'operation', type: 'uint8' },
+        { name: 'safeTxGas', type: 'uint256' },
+        { name: 'baseGas', type: 'uint256' },
+        { name: 'gasPrice', type: 'uint256' },
+        { name: 'gasToken', type: 'address' },
+        { name: 'refundReceiver', type: 'address' },
+        { name: 'nonce', type: 'uint256' },
+      ],
+    },
+    message: {
+      to: transaction.to as `0x${string}`,
+      value: BigInt(0),
+      data: transaction.data,
+      operation: 0,
+      safeTxGas: BigInt(0),
+      baseGas: BigInt(0),
+      gasPrice: BigInt(0),
+      gasToken: zeroAddress,
+      refundReceiver: zeroAddress,
+      nonce: onChainNonce,
+    },
+  });
+
+  // 3. Sign
+  const rawSig = await wallet.signMessage({
+    account: wallet.account,
+    message: { raw: toBytes(structHash) },
+  });
+  const packedSig = splitAndPackSafeSignature(rawSig);
+
+  // 4. Submit to relayer
+  const request = {
+    from: ownerAddress,
+    to: transaction.to,
+    proxyWallet: safeAddress,
+    data: transaction.data,
+    nonce: onChainNonce.toString(),
+    signature: packedSig,
+    signatureParams: {
+      gasPrice: '0',
+      operation: '0',
+      safeTxnGas: '0',
+      baseGas: '0',
+      gasToken: zeroAddress,
+      refundReceiver: zeroAddress,
+    },
+    type: 'SAFE',
+    metadata,
+  };
+
+  const relayerUrl = privyConfig.relayerUrl.endsWith('/')
+    ? privyConfig.relayerUrl.slice(0, -1)
+    : privyConfig.relayerUrl;
+
+  const body = JSON.stringify(request);
+  let headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+  if (builderConfig && builderConfig.isValid()) {
+    const builderHeaders = await builderConfig.generateBuilderHeaders('POST', '/submit', body);
+    if (builderHeaders) {
+      headers = { ...headers, ...builderHeaders };
+    }
+  }
+
+  const submitResponse = await axios.post(`${relayerUrl}/submit`, body, { headers });
+  const { transactionID, transactionHash } = submitResponse.data;
+
+  logger.info({
+    message: 'Relayer submit response received',
+    transactionID,
+    transactionHash,
+  });
+
+  return { transactionHash, transactionID };
+}
+
+/**
+ * Background: poll relayer for mining confirmation, then refresh balance + positions.
+ * Runs after the HTTP response has been sent to the user.
+ */
+async function pollAndFinalizeRedemption(
+  transactionID: string,
+  tradeRecordId: string,
+  privyUserId: string,
+  conditionId: string,
+  proxyWalletAddress: string,
+): Promise<void> {
+  const relayerUrl = privyConfig.relayerUrl.endsWith('/')
+    ? privyConfig.relayerUrl.slice(0, -1)
+    : privyConfig.relayerUrl;
+
+  const maxPolls = 100;
+  const pollFrequency = 2000;
+  const targetStates = ['STATE_MINED', 'STATE_CONFIRMED'];
+
+  for (let i = 0; i < maxPolls; i++) {
+    try {
+      const txnResponse = await axios.get(`${relayerUrl}/transaction`, {
+        params: { id: transactionID },
+      });
+      const txns = txnResponse.data;
+
+      if (Array.isArray(txns) && txns.length > 0) {
+        const txn = txns[0];
+        if (targetStates.includes(txn.state)) {
+          logger.info({
+            message: 'Redemption transaction confirmed (background)',
+            privyUserId,
+            conditionId,
+            transactionHash: txn.transactionHash,
+            state: txn.state,
+          });
+
+          await updateTradeRecordById(tradeRecordId, {
+            transactionHash: txn.transactionHash,
+            status: 'FILLED',
+          });
+
+          // Refresh balance and positions in parallel
+          await Promise.allSettled([
+            refreshAndUpdateBalance(proxyWalletAddress, privyUserId).then(() =>
+              logger.info({ message: 'Balance refreshed after redemption', privyUserId })
+            ),
+            refreshPositions(privyUserId).then(() =>
+              logger.info({ message: 'Positions refreshed after redemption', privyUserId })
+            ),
+          ]);
+          return;
+        }
+
+        if (txn.state === 'STATE_FAILED') {
+          logger.error({
+            message: 'Redemption transaction failed on-chain (background)',
+            privyUserId,
+            conditionId,
+            transactionHash: txn.transactionHash,
+          });
+          await updateTradeRecordById(tradeRecordId, { status: 'FAILED' });
+          return;
+        }
+      }
+    } catch {
+      // Retry on network errors
+    }
+
+    await new Promise(resolve => setTimeout(resolve, pollFrequency));
+  }
+
+  logger.error({ message: 'Redemption polling timed out (background)', privyUserId, transactionID });
+  await updateTradeRecordById(tradeRecordId, { status: 'FAILED' });
+}
+
+/**
  * Get redeemable positions for a user
  */
 export async function getRedeemablePositions(privyUserId: string): Promise<RedeemablePosition[]> {
@@ -410,8 +604,24 @@ export async function redeemPosition(
     conditionId,
   });
 
-  // Get user
-  const user = await getUserByPrivyId(privyUserId);
+  // Fetch user and position in parallel
+  const [user, positionResult] = await Promise.all([
+    getUserByPrivyId(privyUserId),
+    (async () => {
+      const client = await pool.connect();
+      try {
+        return await client.query(
+          `SELECT asset, condition_id, size, cur_price, current_value, title, outcome, event_id, negative_risk, outcome_index
+           FROM user_positions
+           WHERE privy_user_id = $1 AND condition_id = $2`,
+          [privyUserId, conditionId]
+        );
+      } finally {
+        client.release();
+      }
+    })(),
+  ]);
+
   if (!user) {
     return { success: false, error: 'User not found' };
   }
@@ -424,29 +634,14 @@ export async function redeemPosition(
     return { success: false, error: 'User does not have an embedded wallet' };
   }
 
-  // Get position details from database (including negative_risk flag and outcome_index)
-  const client = await pool.connect();
-  let position: any;
+  if (positionResult.rows.length === 0) {
+    return { success: false, error: 'Position not found' };
+  }
 
-  try {
-    const result = await client.query(
-      `SELECT asset, condition_id, size, cur_price, current_value, title, outcome, event_id, negative_risk, outcome_index
-       FROM user_positions
-       WHERE privy_user_id = $1 AND condition_id = $2`,
-      [privyUserId, conditionId]
-    );
+  const position = positionResult.rows[0];
 
-    if (result.rows.length === 0) {
-      return { success: false, error: 'Position not found' };
-    }
-
-    position = result.rows[0];
-
-    if (parseFloat(position.size) <= 0) {
-      return { success: false, error: 'Position has no tokens to redeem' };
-    }
-  } finally {
-    client.release();
+  if (parseFloat(position.size) <= 0) {
+    return { success: false, error: 'Position has no tokens to redeem' };
   }
 
   // Determine if this is a negative risk market
@@ -455,32 +650,33 @@ export async function redeemPosition(
   // Calculate expected redemption amount (winning positions redeem at $1 per share)
   const redeemAmount = parseFloat(position.size); // In USDC
 
-  // Save redemption record to trades history
-  const redemptionRecord = await saveTradeRecord({
-    privyUserId,
-    proxyWalletAddress: user.proxyWalletAddress,
-    marketId: position.event_id || 'unknown',
-    marketQuestion: position.title,
-    clobTokenId: position.asset,
-    outcome: position.outcome,
-    side: 'REDEEM',
-    orderType: 'REDEEM',
-    size: position.size,
-    price: '1.000000', // Redemption is always at $1
-    costUsdc: '0', // No cost for redemption
-    feeUsdc: '0',
-    status: 'PENDING',
-    metadata: {
-      conditionId,
-      redeemAmount: redeemAmount.toFixed(6),
-      type: 'redemption',
-      negativeRisk: isNegativeRisk,
-    },
-  });
+  // Save trade record and initialize wallet in parallel (independent operations)
+  const [redemptionRecord, { wallet, builderConfig }] = await Promise.all([
+    saveTradeRecord({
+      privyUserId,
+      proxyWalletAddress: user.proxyWalletAddress,
+      marketId: position.event_id || 'unknown',
+      marketQuestion: position.title,
+      clobTokenId: position.asset,
+      outcome: position.outcome,
+      side: 'REDEEM',
+      orderType: 'REDEEM',
+      size: position.size,
+      price: '1.000000', // Redemption is always at $1
+      costUsdc: '0', // No cost for redemption
+      feeUsdc: '0',
+      status: 'PENDING',
+      metadata: {
+        conditionId,
+        redeemAmount: redeemAmount.toFixed(6),
+        type: 'redemption',
+        negativeRisk: isNegativeRisk,
+      },
+    }),
+    getWalletAndConfig(privyUserId, user.embeddedWalletAddress),
+  ]);
 
   try {
-    // Get wallet and builder config (no RelayerClient needed)
-    const { wallet, builderConfig } = await getWalletAndConfig(privyUserId, user.embeddedWalletAddress);
 
     let redeemData: `0x${string}`;
     let targetContract: string;
@@ -540,75 +736,50 @@ export async function redeemPosition(
       isNegativeRisk,
     });
 
-    // Execute with on-chain nonce (bypasses relayer's stale nonce)
-    const txResult = await executeWithOnChainNonce(
+    // Execute redemption: submit to relayer then return immediately
+    // (don't block the user waiting for mining + balance/position refresh)
+    const submitResult = await submitRedemptionTransaction(
       wallet,
       builderConfig,
       transaction,
       `Redeem ${position.outcome} position: ${position.title}`,
     );
 
-    const transactionHash = txResult.transactionHash;
-    const isFailed = txResult.state === 'STATE_FAILED' || txResult.state === 'TIMEOUT';
-
-    if (!transactionHash || isFailed) {
-      logger.error({
-        message: 'Redemption transaction failed',
-        privyUserId,
-        conditionId,
-        transactionHash,
-        state: txResult.state,
-        isNegativeRisk,
-      });
-      throw new Error(
-        txResult.state === 'TIMEOUT'
-          ? 'Transaction polling timed out'
-          : `Transaction failed on-chain. Hash: ${transactionHash}`
-      );
+    if (!submitResult.transactionHash) {
+      throw new Error('Relayer did not return a transaction hash');
     }
 
+    const { transactionHash, transactionID } = submitResult;
+
     logger.info({
-      message: 'Redemption transaction confirmed',
+      message: 'Redemption submitted to relayer, returning to user',
       privyUserId,
       conditionId,
       transactionHash,
+      transactionID,
     });
 
-    // Update redemption record
-    await updateTradeRecordById(redemptionRecord.id, {
+    // Update trade record with tx hash immediately
+    updateTradeRecordById(redemptionRecord.id, {
       transactionHash,
-      status: 'FILLED',
+      status: 'PENDING',
+    }).catch(() => {});
+
+    // Background: poll for confirmation, then refresh balance + positions
+    pollAndFinalizeRedemption(
+      transactionID,
+      redemptionRecord.id,
+      privyUserId,
+      conditionId,
+      user.proxyWalletAddress,
+    ).catch((err) => {
+      logger.error({
+        message: 'Background redemption finalization failed',
+        privyUserId,
+        conditionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
-
-    // Refresh balance from Alchemy (the webhook might also trigger, but we do it explicitly)
-    try {
-      await refreshAndUpdateBalance(user.proxyWalletAddress, privyUserId);
-      logger.info({
-        message: 'Balance refreshed after redemption',
-        privyUserId,
-      });
-    } catch (balanceError) {
-      logger.warn({
-        message: 'Failed to refresh balance after redemption',
-        privyUserId,
-        error: balanceError instanceof Error ? balanceError.message : String(balanceError),
-      });
-    }
-
-    // Refresh positions to update the database
-    try {
-      await refreshPositions(privyUserId);
-      logger.info({
-        message: 'Positions refreshed after redemption',
-        privyUserId,
-      });
-    } catch (positionsError) {
-      logger.warn({
-        message: 'Failed to refresh positions after redemption',
-        privyUserId,
-        error: positionsError instanceof Error ? positionsError.message : String(positionsError),
-      });
-    }
 
     return {
       success: true,

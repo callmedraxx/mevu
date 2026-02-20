@@ -62,10 +62,69 @@
 import { Router, Request, Response } from 'express';
 import { logger } from '../config/logger';
 import { executeTrade } from '../services/polymarket/trading/trading.service';
+import { getUnifiedPositions } from '../services/trading/unified-positions.service';
 import { getTradeHistory } from '../services/polymarket/trading/trades-history.service';
 import { CreateTradeRequest, TradeHistoryQuery, TradeSide, OrderType } from '../services/polymarket/trading/trading.types';
 
 const router = Router();
+
+/**
+ * @swagger
+ * /api/trading/positions:
+ *   get:
+ *     summary: Get unified positions (Polymarket + Kalshi)
+ *     description: Returns merged positions from both platforms for the positions tab
+ *     tags: [Trading]
+ *     parameters:
+ *       - in: query
+ *         name: privyUserId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Privy user ID
+ *       - in: query
+ *         name: platform
+ *         schema:
+ *           type: string
+ *           enum: [all, polymarket, kalshi]
+ *           default: all
+ *         description: Filter by platform
+ *     responses:
+ *       200:
+ *         description: Unified positions
+ *       400:
+ *         description: Missing privyUserId
+ */
+router.get('/positions', async (req: Request, res: Response) => {
+  try {
+    const { privyUserId, platform } = req.query;
+
+    if (!privyUserId || typeof privyUserId !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'privyUserId is required',
+      });
+    }
+
+    const positions = await getUnifiedPositions(privyUserId, {
+      platform: (platform as 'all' | 'polymarket' | 'kalshi') || 'all',
+    });
+
+    return res.json({
+      success: true,
+      positions,
+    });
+  } catch (error) {
+    logger.error({
+      message: 'Error fetching unified positions',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Internal server error',
+    });
+  }
+});
 
 /**
  * @swagger

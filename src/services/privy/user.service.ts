@@ -40,6 +40,7 @@ export async function initializeUsersTable(): Promise<void> {
       -- Add Solana wallet columns if missing (idempotent)
       ALTER TABLE users ADD COLUMN IF NOT EXISTS solana_wallet_address VARCHAR(64);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS solana_wallet_id VARCHAR(255);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS embedded_wallet_id VARCHAR(255);
 
       CREATE INDEX IF NOT EXISTS idx_users_privy_user_id ON users(privy_user_id);
       CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
@@ -160,7 +161,8 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
       `SELECT id, privy_user_id, username, embedded_wallet_address, 
               proxy_wallet_address, session_signer_enabled, usdc_approval_enabled,
               ctf_approval_enabled, onboarding_completed, created_at, updated_at,
-              trading_region, solana_wallet_address, solana_wallet_id, kalshi_onboarding_completed, kalshi_usdc_balance
+              trading_region, solana_wallet_address, solana_wallet_id, kalshi_onboarding_completed, kalshi_usdc_balance,
+              embedded_wallet_id
        FROM users WHERE privy_user_id = $1`,
       [privyUserId]
     );
@@ -186,6 +188,7 @@ export async function getUserByPrivyId(privyUserId: string): Promise<UserProfile
     if (row.solana_wallet_id != null) user.solanaWalletId = row.solana_wallet_id;
     if (row.kalshi_onboarding_completed != null) user.kalshiOnboardingCompleted = row.kalshi_onboarding_completed;
     if (row.kalshi_usdc_balance != null) user.kalshiUsdcBalance = String(row.kalshi_usdc_balance);
+    if (row.embedded_wallet_id != null) user.embeddedWalletId = row.embedded_wallet_id;
     return user;
   } finally {
     client.release();
@@ -607,6 +610,36 @@ export async function markOnboardingComplete(
       createdAt: new Date(row.created_at),
       updatedAt: new Date(row.updated_at),
     };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Update user's embedded wallet ID (Privy wallet ID cache)
+ * Saves the wallet ID to avoid repeated Privy API lookups
+ */
+export async function updateUserEmbeddedWalletId(
+  privyUserId: string,
+  embeddedWalletId: string
+): Promise<void> {
+  const dbConfig = getDatabaseConfig();
+
+  if (dbConfig.type !== 'postgres') {
+    const user = memoryStore.get(`user:privy:${privyUserId}`);
+    if (user) {
+      user.embeddedWalletId = embeddedWalletId;
+      memoryStore.set(`user:privy:${privyUserId}`, user);
+    }
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `UPDATE users SET embedded_wallet_id = $1, updated_at = CURRENT_TIMESTAMP WHERE privy_user_id = $2`,
+      [embeddedWalletId, privyUserId]
+    );
   } finally {
     client.release();
   }

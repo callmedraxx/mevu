@@ -45,31 +45,55 @@ async function getBuildId(): Promise<string | null> {
   return refreshBuildId();
 }
 
+/** Shape of the crypto-prices data from Polymarket SSR. */
+export interface SSRPriceData {
+  openPrice: number | null;
+  closePrice: number | null;
+}
+
 /**
  * Fetch the opening price for a market from Polymarket's SSR endpoint.
  * Returns the Chainlink-sourced openPrice or null if unavailable.
  */
 export async function fetchOpeningPrice(slug: string): Promise<number | null> {
-  const buildId = await getBuildId();
-  if (!buildId) return null;
-
-  let price = await fetchFromSSR(slug, buildId);
-
-  // If 404, build ID may be stale — refresh once and retry
-  if (price === undefined) {
-    const newId = await refreshBuildId();
-    if (newId && newId !== buildId) {
-      price = await fetchFromSSR(slug, newId);
-    }
-  }
-
-  return price ?? null;
+  const data = await fetchPriceData(slug);
+  return data?.openPrice ?? null;
 }
 
 /**
- * Internal: fetch openPrice from SSR. Returns number, null (no price in response), or undefined (request failed/404).
+ * Fetch the closing price for a market from Polymarket's SSR endpoint.
+ * Returns the Chainlink-sourced closePrice / endPrice or null if unavailable.
  */
-async function fetchFromSSR(slug: string, buildId: string): Promise<number | null | undefined> {
+export async function fetchClosingPrice(slug: string): Promise<number | null> {
+  const data = await fetchPriceData(slug);
+  return data?.closePrice ?? null;
+}
+
+/**
+ * Fetch all available price data (open + close) from Polymarket SSR.
+ */
+export async function fetchPriceData(slug: string): Promise<SSRPriceData | null> {
+  const buildId = await getBuildId();
+  if (!buildId) return null;
+
+  let result = await fetchFromSSR(slug, buildId);
+
+  // If 404, build ID may be stale — refresh once and retry
+  if (result === undefined) {
+    const newId = await refreshBuildId();
+    if (newId && newId !== buildId) {
+      result = await fetchFromSSR(slug, newId);
+    }
+  }
+
+  return result ?? null;
+}
+
+/**
+ * Internal: fetch price data from SSR.
+ * Returns SSRPriceData, null (no price in response), or undefined (request failed/404).
+ */
+async function fetchFromSSR(slug: string, buildId: string): Promise<SSRPriceData | null | undefined> {
   try {
     const url = `https://polymarket.com/_next/data/${buildId}/en/event/${slug}.json`;
     const response = await axios.get(url, {
@@ -86,8 +110,25 @@ async function fetchFromSSR(slug: string, buildId: string): Promise<number | nul
       const key = q?.queryKey;
       if (Array.isArray(key) && key[0] === 'crypto-prices' && key[1] === 'price') {
         const priceData = q?.state?.data;
-        if (priceData && typeof priceData.openPrice === 'number') {
-          return priceData.openPrice;
+        if (priceData) {
+          const openPrice = typeof priceData.openPrice === 'number' ? priceData.openPrice : null;
+          // Polymarket uses closePrice or endPrice for settled markets
+          const closePrice = typeof priceData.closePrice === 'number' ? priceData.closePrice
+            : typeof priceData.endPrice === 'number' ? priceData.endPrice
+            : typeof priceData.currentPrice === 'number' ? priceData.currentPrice
+            : null;
+
+          if (openPrice != null || closePrice != null) {
+            // Log discovered fields for diagnostics (helps identify correct field names)
+            logger.debug({
+              message: '[SSR Price] Extracted price data',
+              slug,
+              availableKeys: Object.keys(priceData),
+              openPrice,
+              closePrice,
+            });
+            return { openPrice, closePrice };
+          }
         }
       }
     }
@@ -99,7 +140,7 @@ async function fetchFromSSR(slug: string, buildId: string): Promise<number | nul
       return undefined; // signal to caller to refresh build ID
     }
     logger.warn({
-      message: '[Opening Price] SSR fetch failed',
+      message: '[SSR Price] Fetch failed',
       slug,
       error: error instanceof Error ? error.message : String(error),
     });

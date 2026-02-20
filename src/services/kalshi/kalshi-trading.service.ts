@@ -18,6 +18,31 @@ import { logger } from '../../config/logger';
 
 const KALSHI_TRADING_ENABLED = process.env.KALSHI_TRADING_ENABLED === 'true';
 
+/** Map raw on-chain/API errors to user-friendly messages. Full error is always logged. */
+function toUserFriendlyTradeError(rawError: unknown): string {
+  const raw = rawError instanceof Error ? rawError.message : String(rawError);
+  if (raw.includes('user_quote_vault check failed') || raw.includes('Invalid account owner')) {
+    return 'Your Solana wallet may not have USDC yet. Please fund your wallet with USDC before trading.';
+  }
+  if (raw.includes('Insufficient') || raw.includes('insufficient')) {
+    return raw.length < 120 ? raw : 'Insufficient balance. Please add more USDC to your wallet.';
+  }
+  if (raw.includes('PROOF_REQUIRED') || raw.includes('Proof')) {
+    return 'Identity verification required. Please complete KYC verification first.';
+  }
+  if (raw.includes('Slippage') || raw.includes('slippage')) {
+    return 'Price moved too much. Please try again.';
+  }
+  if (raw.includes('blockhash') || raw.includes('expired')) {
+    return 'Transaction expired. Please try again.';
+  }
+  // Long/technical errors (program logs, JSON blobs) → generic message
+  if (raw.length > 200 || raw.includes('Program log:') || raw.includes('"error":') || raw.includes('{"error"')) {
+    return 'Transaction failed. Please ensure your wallet has USDC and try again.';
+  }
+  return raw;
+}
+
 export interface KalshiBuyRequest {
   privyUserId: string;
   kalshiTicker: string;
@@ -124,16 +149,20 @@ export async function executeKalshiBuy(req: KalshiBuyRequest): Promise<KalshiTra
     // Sync on-chain balance after trade (delayed to allow Solana confirmation)
     syncBalanceAfterTrade(req.privyUserId, solanaWallet, 'kalshi_buy');
 
-    // Save trade with FILLED status and actual tx hash
+    // Save trade with FILLED status and actual tx hash.
+    // Use DFlow's inAmount (execution USDC) so avg entry = execution price, not total cost with fees.
+    const usdcExecuted = orderResponse.inAmount ?? req.usdcAmount;
+    const tokensReceived = orderResponse.outAmount ?? '0';
+    const platformFeeRaw = orderResponse.platformFee?.amount ?? null;
     if (getDatabaseConfig().type === 'postgres') {
       const client = await pool.connect();
       try {
         const r = await client.query(
           `INSERT INTO kalshi_trades_history
-           (privy_user_id, solana_wallet_address, kalshi_ticker, outcome_mint, outcome, side, input_amount, output_amount, dflow_order_id, status, solana_signature)
-           VALUES ($1, $2, $3, $4, $5, 'BUY', $6, $7, $8, 'FILLED', $9)
+           (privy_user_id, solana_wallet_address, kalshi_ticker, outcome_mint, outcome, side, input_amount, output_amount, platform_fee, dflow_order_id, status, solana_signature)
+           VALUES ($1, $2, $3, $4, $5, 'BUY', $6, $7, $8, $9, 'FILLED', $10)
            RETURNING id`,
-          [req.privyUserId, solanaWallet, req.kalshiTicker, outcomeMint, req.outcome, req.usdcAmount, orderResponse.outAmount ?? '0', null, hash]
+          [req.privyUserId, solanaWallet, req.kalshiTicker, outcomeMint, req.outcome, usdcExecuted, tokensReceived, platformFeeRaw, null, hash]
         );
         return { success: true, tradeId: r.rows[0]?.id, solanaSignature: hash };
       } finally {
@@ -143,13 +172,15 @@ export async function executeKalshiBuy(req: KalshiBuyRequest): Promise<KalshiTra
 
     return { success: true, solanaSignature: hash };
   } catch (e) {
+    const rawError = e instanceof Error ? e.message : String(e);
     logger.error({
       message: 'Kalshi BUY trade failed',
       privyUserId: req.privyUserId,
       kalshiTicker: req.kalshiTicker,
-      error: e instanceof Error ? e.message : String(e),
+      error: rawError,
+      stack: e instanceof Error ? e.stack : undefined,
     });
-    return { success: false, error: e instanceof Error ? e.message : String(e) };
+    return { success: false, error: toUserFriendlyTradeError(e) };
   }
 }
 
@@ -231,13 +262,15 @@ export async function executeKalshiSell(req: KalshiSellRequest): Promise<KalshiT
 
     return { success: true, solanaSignature: hash };
   } catch (e) {
+    const rawError = e instanceof Error ? e.message : String(e);
     logger.error({
       message: 'Kalshi SELL trade failed',
       privyUserId: req.privyUserId,
       kalshiTicker: req.kalshiTicker,
-      error: e instanceof Error ? e.message : String(e),
+      error: rawError,
+      stack: e instanceof Error ? e.stack : undefined,
     });
-    return { success: false, error: e instanceof Error ? e.message : String(e) };
+    return { success: false, error: toUserFriendlyTradeError(e) };
   }
 }
 
