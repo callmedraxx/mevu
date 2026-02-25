@@ -51,7 +51,7 @@ const USER_FRIENDLY_MESSAGES: Record<TradeErrorCode, string> = {
 function isRetryableError(error: any): boolean {
   if (error?.response?.status) {
     const status = error.response.status;
-    return status === 503 || status === 502 || status === 429 || status === 504;
+    return status === 503 || status === 502 || status === 429 || status === 504 || status === 425;
   }
   // Network errors
   if (error?.code === 'ECONNRESET' || error?.code === 'ETIMEDOUT' || error?.code === 'ENOTFOUND') {
@@ -318,8 +318,24 @@ async function fetchAndUpdateTransactionHash(
 export async function executeTrade(
   request: CreateTradeRequest
 ): Promise<CreateTradeResponse> {
-  const { privyUserId, marketInfo, side, orderType, size, price } = request;
-  
+  const { privyUserId, marketInfo, side, size, price } = request;
+
+  // Crypto markets: use GTC (limit) instead of FOK/FAK to avoid frequent "couldn't be fully filled" failures
+  const isCryptoMarket = marketInfo.metadata?.category === 'crypto';
+  const orderType = isCryptoMarket && (request.orderType === OrderType.FOK || request.orderType === OrderType.FAK)
+    ? OrderType.LIMIT
+    : request.orderType;
+
+  if (isCryptoMarket && request.orderType !== orderType) {
+    logger.info({
+      message: 'Crypto market: overriding order type to GTC limit',
+      privyUserId,
+      originalOrderType: request.orderType,
+      effectiveOrderType: orderType,
+      marketId: marketInfo.marketId,
+    });
+  }
+
   // Timing tracking for performance analysis
   const tradeStartTime = Date.now();
   const timings: Record<string, number> = {};
@@ -380,14 +396,14 @@ export async function executeTrade(
         ? (async () => {
             const estimatedCost = parseFloat(size) * parseFloat(price);
             try {
-              const { fetchBalanceFromAlchemy } = await import('../../alchemy/balance.service');
-              const balanceResult = await fetchBalanceFromAlchemy(proxyWalletAddress);
-              const balanceUsdc = parseFloat(balanceResult.balanceHuman);
+              const { getBalanceFromDb } = await import('../../alchemy/balance.service');
+              const balanceResult = await getBalanceFromDb(proxyWalletAddress);
+              const balanceUsdc = parseFloat(balanceResult?.balanceHuman ?? '0');
               const feeAmount = estimatedCost * FEE_CONFIG.RATE;
               const totalRequired = estimatedCost + feeAmount;
 
               logger.info({
-                message: 'Pre-trade balance check (Alchemy)',
+                message: 'Pre-trade balance check (DB)',
                 privyUserId,
                 proxyWalletAddress,
                 balanceUsdc,
@@ -542,6 +558,59 @@ export async function executeTrade(
               attempt,
               orderTimeMs: timings.createMarketOrder,
             });
+
+            // CLOB client returns error objects instead of throwing for HTTP 4xx/5xx.
+            // When FOK fails with "couldn't be fully filled", fallback to GTC before retrying/failing.
+            const returnedErrorStatus = typeof orderResponse?.status === 'number' && orderResponse.status >= 400;
+            const errorMsg = orderResponse?.error ?? orderResponse?.data?.error;
+            const fokNotFilledReturned =
+              returnedErrorStatus &&
+              typeof errorMsg === 'string' &&
+              errorMsg.includes('fully filled');
+
+            if (fokNotFilledReturned && side === TradeSide.SELL) {
+              logger.info({
+                message: 'FOK sell insufficient liquidity (returned) — falling back to GTC limit order',
+                privyUserId,
+                price,
+                size,
+                attempt,
+              });
+
+              try {
+                orderResponse = await clobClient.createAndPostOrder({
+                  tokenID: marketInfo.clobTokenId,
+                  price: parseFloat(price),
+                  size: parseFloat(size),
+                  side: Side.SELL,
+                });
+
+                logger.info({
+                  message: 'GTC limit sell order created (FOK fallback)',
+                  privyUserId,
+                  orderId: orderResponse?.orderID,
+                });
+
+                // GTC can also return error object — throw so we don't retry unnecessarily
+                const gtcReturnedError =
+                  typeof orderResponse?.status === 'number' && orderResponse.status >= 400;
+                if (gtcReturnedError) {
+                  const gtcErrMsg =
+                    orderResponse?.error ??
+                    orderResponse?.data?.error ??
+                    `HTTP ${orderResponse.status}`;
+                  throw new Error(gtcErrMsg);
+                }
+              } catch (gtcError: any) {
+                logger.error({
+                  message: 'GTC fallback also failed',
+                  privyUserId,
+                  error: gtcError?.message,
+                });
+                lastError = gtcError;
+                throw gtcError;
+              }
+            }
           } else {
             // Use limit order for LIMIT/MARKET orders
             // Limit orders require a price
@@ -565,20 +634,38 @@ export async function executeTrade(
             });
           }
 
-          // If we got here without error, break the retry loop
-          if (orderResponse?.orderID || orderResponse?.status) {
+          // If we got here without error, break the retry loop.
+          // CLOB client returns { status: 400, error } for HTTP errors instead of throwing —
+          // do NOT treat status >= 400 as success.
+          const isSuccess =
+            orderResponse?.orderID ||
+            (orderResponse?.status &&
+              (typeof orderResponse.status !== 'number' || orderResponse.status < 400));
+          if (isSuccess) {
             break;
           }
 
           // No order ID returned - might be a silent failure
           if (!orderResponse?.orderID && attempt < MAX_RETRIES) {
+            const respError = orderResponse?.error ?? orderResponse?.data?.error ?? '';
+            const isOrderTooOld = typeof respError === 'string' && respError.includes('order too old');
+
+            if (isOrderTooOld) {
+              // Order too old is non-retryable — fail immediately
+              throw new Error('order too old');
+            }
+
+            const isServiceNotReady = typeof respError === 'string' && respError.includes('service not ready');
+            const retryDelay = isServiceNotReady ? 100 : INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+
             logger.warn({
               message: 'Order response missing orderID, retrying',
               privyUserId,
               attempt,
               response: orderResponse,
+              retryDelay,
             });
-            await sleep(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1));
+            await sleep(retryDelay);
             continue;
           }
         } catch (error: any) {
@@ -612,9 +699,18 @@ export async function executeTrade(
                 orderId: orderResponse?.orderID,
               });
 
-              if (orderResponse?.orderID || orderResponse?.status) {
+              const gtcSuccess =
+                orderResponse?.orderID ||
+                (orderResponse?.status &&
+                  (typeof orderResponse.status !== 'number' || orderResponse.status < 400));
+              if (gtcSuccess) {
                 break;
               }
+              const gtcErrMsg =
+                orderResponse?.error ??
+                orderResponse?.data?.error ??
+                `HTTP ${orderResponse?.status ?? 'unknown'}`;
+              throw new Error(gtcErrMsg);
             } catch (gtcError: any) {
               logger.error({
                 message: 'GTC fallback also failed',
@@ -627,7 +723,9 @@ export async function executeTrade(
           }
 
           if (isRetryableError(error) && attempt < MAX_RETRIES) {
-            const delayMs = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+            const errMsg = error?.response?.data?.error ?? error?.message ?? '';
+            const isServiceNotReady = typeof errMsg === 'string' && errMsg.includes('service not ready');
+            const delayMs = isServiceNotReady ? 100 : INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
             logger.warn({
               message: 'Retryable error during order submission, retrying',
               privyUserId,
@@ -659,9 +757,13 @@ export async function executeTrade(
       });
 
       // Check if response is an HTTP error (status is a number like 400, 500)
-      // CLOB client sometimes returns error responses instead of throwing
+      // CLOB client returns { error, status } for HTTP errors instead of throwing
       if (typeof orderResponse.status === 'number' && orderResponse.status >= 400) {
-        const errorMsg = orderResponse.data?.error || orderResponse.statusText || `HTTP ${orderResponse.status}`;
+        const errorMsg =
+          orderResponse.error ??
+          orderResponse.data?.error ??
+          orderResponse.statusText ??
+          `HTTP ${orderResponse.status}`;
         throw new Error(errorMsg);
       }
 

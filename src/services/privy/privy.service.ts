@@ -135,10 +135,13 @@ class PrivyService {
           })) : [],
         });
         
-        const normalizedAddress = address.toLowerCase();
+        // EVM (0x) addresses: case-insensitive. Solana (base58): case-sensitive
+        const isEvm = address.startsWith('0x') || address.startsWith('0X');
+        const normalizeAddr = (a: string) => (isEvm ? a.toLowerCase() : a);
+        const targetAddr = normalizeAddr(address);
         const wallet = Array.isArray(wallets) ? wallets.find((w: any) => {
           const walletAddress = w?.address || w?.wallet_address;
-          return walletAddress && walletAddress.toLowerCase() === normalizedAddress;
+          return walletAddress && normalizeAddr(walletAddress) === targetAddr;
         }) : null;
         
         if (wallet) {
@@ -176,7 +179,10 @@ class PrivyService {
       const user = await (usersService as any).getUser?.(userId);
       if (user) {
         const linkedAccounts = user.linkedAccounts || user.linked_accounts || [];
-        const normalizedAddress = address.toLowerCase();
+        // EVM (0x): case-insensitive. Solana (base58): case-sensitive
+        const isEvm = address.startsWith('0x') || address.startsWith('0X');
+        const normalizeAddr = (a: string) => (isEvm ? a.toLowerCase() : a);
+        const targetAddr = normalizeAddr(address);
         
         logger.debug({
           message: 'Checking linked accounts from SDK user',
@@ -195,7 +201,7 @@ class PrivyService {
         
         const wallet = Array.isArray(linkedAccounts) ? linkedAccounts.find((account: any) => {
           const accountAddress = account?.address || account?.wallet_address;
-          return accountAddress && accountAddress.toLowerCase() === normalizedAddress;
+          return accountAddress && normalizeAddr(accountAddress) === targetAddr;
         }) : null;
         
         if (wallet) {
@@ -232,7 +238,10 @@ class PrivyService {
       const userResponse = await this.client.get(`/api/v1/users/${userId}`);
       const user = userResponse.data;
       const linkedAccounts = user?.linkedAccounts || user?.linked_accounts || [];
-      const normalizedAddress = address.toLowerCase();
+      // EVM (0x): case-insensitive. Solana (base58): case-sensitive
+      const isEvm = address.startsWith('0x') || address.startsWith('0X');
+      const normalizeAddr = (a: string) => (isEvm ? a.toLowerCase() : a);
+      const targetAddr = normalizeAddr(address);
       
       logger.debug({
         message: 'Fetched user via axios, checking linkedAccounts',
@@ -250,7 +259,7 @@ class PrivyService {
       
       const wallet = Array.isArray(linkedAccounts) ? linkedAccounts.find((account: any) => {
         const accountAddress = account?.address || account?.wallet_address;
-        return accountAddress && accountAddress.toLowerCase() === normalizedAddress;
+        return accountAddress && normalizeAddr(accountAddress) === targetAddr;
       }) : null;
       
       if (wallet) {
@@ -614,60 +623,22 @@ class PrivyService {
             // Use SDK to sign with authorization context
             // Try authorization private key first (most reliable)
             let authorizationContext = this.getAuthorizationContext();
-            
-            logger.info({
-              message: 'Checking authorization context for signing',
-              userId: request.userId,
-              walletId,
-              hasAuthContext: !!authorizationContext,
-              hasAuthKeys: !!(authorizationContext?.authorization_private_keys?.length),
-              authKeyLength: authorizationContext?.authorization_private_keys?.length || 0,
-              hasPrivyConfigAuthKey: !!privyConfig.authorizationPrivateKey,
-            });
-            
+
             // If no auth key, we can't sign (session signers require user JWT)
             if (!authorizationContext || !authorizationContext.authorization_private_keys?.length) {
               logger.warn({
                 message: 'No authorization private key available for signing',
                 userId: request.userId,
                 walletId,
-                privyConfigHasAuthKey: !!privyConfig.authorizationPrivateKey,
               });
               // Fall through to RPC endpoint which might work with session signers
             } else {
-              logger.info({
-                message: 'Signing typed data via Privy SDK with authorization private key',
-                userId: request.userId,
-                walletId,
-                hasAuthContext: !!authorizationContext,
-              });
-              
-              // Use Privy SDK's wallets().ethereum().signTypedData() method
-              // This follows Privy's documentation for signing typed data with authorization context
-              logger.info({
-                message: 'Using Privy SDK wallets().ethereum().signTypedData() for signing typed data',
-                userId: request.userId,
-                walletId,
-              });
-              
               try {
                 if (!this.privyClient) {
                   throw new Error('PrivyClient SDK not initialized');
                 }
-                
-                // Use SDK's wallets().ethereum().signTypedData() method
-                // This handles authorization signature generation automatically
+
                 const ethereumWallets = this.privyClient.wallets().ethereum();
-                
-                // Get embedded wallet address for logging
-                const embeddedWalletAddress = await this.getEmbeddedWalletAddress(request.userId);
-                
-                logger.info({
-                  message: 'Calling Privy SDK wallets().ethereum().signTypedData()',
-                  userId: request.userId,
-                  walletId,
-                  address: embeddedWalletAddress,
-                });
                 
                 // Use the SDK's signTypedData method with authorization context
                 // Following Privy's instructions: pass authorization_context inside the options object
@@ -689,17 +660,7 @@ class PrivyService {
                 
                 // Normalize signature format for downstream consumers (RelayerClient expects 0x-prefixed hex string)
                 const rawSignature = (response as any)?.signature;
-                
-                logger.info({
-                  message: 'Received signature from Privy signTypedData',
-                  userId: request.userId,
-                  walletId,
-                  signatureType: typeof rawSignature,
-                  isString: typeof rawSignature === 'string',
-                  isObject: typeof rawSignature === 'object',
-                  hasRaw: rawSignature && typeof rawSignature === 'object' && 'raw' in rawSignature,
-                });
-                
+
                 if (typeof rawSignature === 'string') {
                   // Already a hex string
                   return rawSignature;

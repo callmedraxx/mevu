@@ -55,6 +55,8 @@ const MAX_HISTORY_SIZE = 3600;
 // Reconnect with exponential backoff
 const INITIAL_RECONNECT_DELAY_MS = 2000;
 const MAX_RECONNECT_DELAY_MS = 30000;
+// If no price update for this long, assume zombie connection and force reconnect
+const SILENCE_RECONNECT_MS = 120000; // 2 minutes
 
 /** Upstream message format from Polymarket live-data WS */
 interface PolymarketChainlinkMessage {
@@ -76,6 +78,8 @@ class CryptoChainlinkPriceService {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private silenceCheckTimer: NodeJS.Timeout | null = null;
+  private lastPriceAt: number = 0;
   private diagnosticTimer: NodeJS.Timeout | null = null;
   private redisUnsubscribe: (() => void) | null = null;
   private updateCount: number = 0;
@@ -99,10 +103,10 @@ class CryptoChainlinkPriceService {
       this.redisUnsubscribe = subscribeToCryptoChainlinkSubscribe((msg) => {
         if (msg.symbol && !this.subscribedSymbols.has(msg.symbol)) {
           this.subscribedSymbols.add(msg.symbol);
-          logger.info({
-            message: 'Chainlink: dynamic symbol subscription requested',
-            symbol: msg.symbol,
-          });
+          // logger.info({
+          //   message: 'Chainlink: dynamic symbol subscription requested',
+          //   symbol: msg.symbol,
+          // });
           // If connected, send additional subscribe message
           if (this.ws?.readyState === WebSocket.OPEN) {
             this.subscribeSymbol(msg.symbol);
@@ -120,15 +124,15 @@ class CryptoChainlinkPriceService {
     this.diagnosticTimer = setInterval(() => {
       const latest = this.getAllLatestPrices();
       const latestSummary = Object.entries(latest).map(([s, p]) => `${s}=$${p.price.toFixed(2)}`).join(', ');
-      logger.info({
-        message: 'Chainlink price diagnostic',
-        connected: this.ws?.readyState === WebSocket.OPEN,
-        updateCount: this.updateCount,
-        historySize: Object.fromEntries(
-          Array.from(this.priceHistory.entries()).map(([k, v]) => [k, v.length])
-        ),
-        latestPrices: latestSummary || 'none',
-      });
+      // logger.info({
+      //   message: 'Chainlink price diagnostic',
+      //   connected: this.ws?.readyState === WebSocket.OPEN,
+      //   updateCount: this.updateCount,
+      //   historySize: Object.fromEntries(
+      //     Array.from(this.priceHistory.entries()).map(([k, v]) => [k, v.length])
+      //   ),
+      //   latestPrices: latestSummary || 'none',
+      // });
       this.updateCount = 0;
     }, 10000);
 
@@ -156,11 +160,16 @@ class CryptoChainlinkPriceService {
 
         // Start heartbeat (ping every 30s)
         this.startHeartbeat();
+
+        // Silence check: if no price for 2min, connection is likely dead — force reconnect
+        this.startSilenceCheck();
       });
 
       this.ws.on('message', (data) => {
         try {
           const raw = data.toString();
+          // Skip empty frames (Polymarket sends one on connect)
+          if (!raw || raw.length === 0) return;
           // Polymarket may send ping/pong frames or heartbeats
           if (raw === 'PING' || raw === 'ping') {
             this.ws?.send('PONG');
@@ -169,25 +178,25 @@ class CryptoChainlinkPriceService {
           const msg = JSON.parse(raw);
 
           // Log ALL messages for debugging (first 20 chars of raw for non-price messages)
-          if (msg.topic === 'crypto_prices_chainlink' && msg.type === 'update') {
-            // Price update — log concisely
-            logger.debug({
-              message: 'Chainlink WS price tick',
-              symbol: msg.payload?.symbol,
-              price: msg.payload?.value,
-              ts: msg.payload?.timestamp,
-            });
-          } else {
-            // Non-price message (connection ack, error, etc.) — log full
-            logger.info({
-              message: 'Chainlink WS message (non-price)',
-              topic: msg.topic,
-              type: msg.type,
-              connectionId: msg.connection_id,
-              keys: Object.keys(msg),
-              raw: raw.substring(0, 300),
-            });
-          }
+          // if (msg.topic === 'crypto_prices_chainlink' && msg.type === 'update') {
+          //   // Price update — log concisely
+          //   logger.debug({
+          //     message: 'Chainlink WS price tick',
+          //     symbol: msg.payload?.symbol,
+          //     price: msg.payload?.value,
+          //     ts: msg.payload?.timestamp,
+          //   });
+          // } else {
+          //   // Non-price message (connection ack, error, etc.) — log full
+          //   logger.info({
+          //     message: 'Chainlink WS message (non-price)',
+          //     topic: msg.topic,
+          //     type: msg.type,
+          //     connectionId: msg.connection_id,
+          //     keys: Object.keys(msg),
+          //     raw: raw.substring(0, 300),
+          //   });
+          // }
 
           this.handleMessage(msg);
         } catch (err) {
@@ -206,6 +215,7 @@ class CryptoChainlinkPriceService {
           reason: reason?.toString(),
         });
         this.stopHeartbeat();
+        this.stopSilenceCheck();
         this.scheduleReconnect();
       });
 
@@ -245,10 +255,10 @@ class CryptoChainlinkPriceService {
 
     this.ws.send(JSON.stringify(msg));
 
-    logger.info({
-      message: 'Subscribed to chainlink price feeds (all symbols)',
-      symbols: Array.from(this.subscribedSymbols),
-    });
+    // logger.info({
+    //   message: 'Subscribed to chainlink price feeds (all symbols)',
+    //   symbols: Array.from(this.subscribedSymbols),
+    // });
   }
 
   /**
@@ -293,11 +303,11 @@ class CryptoChainlinkPriceService {
       const symbol = normalizeChainlinkSymbol(rawSymbol);
 
       const dataPoints = msg.payload.data as Array<{ timestamp: number; value?: number; full_accuracy_value?: string }>;
-      logger.info({
-        message: 'Chainlink snapshot received',
-        symbol,
-        pointCount: dataPoints.length,
-      });
+      // logger.info({
+      //   message: 'Chainlink snapshot received',
+      //   symbol,
+      //   pointCount: dataPoints.length,
+      // });
 
       // Ensure history buffer exists
       if (!this.priceHistory.has(symbol)) {
@@ -324,6 +334,7 @@ class CryptoChainlinkPriceService {
       if (history.length > 0) {
         const last = history[history.length - 1];
         this.latestPrices.set(symbol, last);
+        this.lastPriceAt = Date.now();
         publishCryptoChainlinkPriceUpdate({
           type: 'chainlink_price_update',
           symbol,
@@ -345,12 +356,12 @@ class CryptoChainlinkPriceService {
       if (typeof acc === 'string') price = parseFloat(acc);
     }
     if (typeof price !== 'number' || Number.isNaN(price)) {
-      logger.debug({
-        message: 'Chainlink: dropped update (invalid price)',
-        symbol: msg.payload.symbol,
-        value: msg.payload.value,
-        full_accuracy_value: msg.payload.full_accuracy_value,
-      });
+      // logger.debug({
+      //   message: 'Chainlink: dropped update (invalid price)',
+      //   symbol: msg.payload.symbol,
+      //   value: msg.payload.value,
+      //   full_accuracy_value: msg.payload.full_accuracy_value,
+      // });
       return;
     }
 
@@ -374,6 +385,7 @@ class CryptoChainlinkPriceService {
     // Update latest price
     this.latestPrices.set(symbol, { price, timestamp });
     this.updateCount++;
+    this.lastPriceAt = Date.now();
 
     // Publish to Redis for all HTTP workers — no batching, zero latency
     const broadcastMsg: CryptoChainlinkPriceBroadcastMessage = {
@@ -388,10 +400,10 @@ class CryptoChainlinkPriceService {
   private scheduleReconnect(): void {
     if (this.isShuttingDown || this.reconnectTimer) return;
 
-    logger.info({
-      message: 'Scheduling reconnect to Polymarket live-data WS',
-      delayMs: this.reconnectDelay,
-    });
+    // logger.info({
+    //   message: 'Scheduling reconnect to Polymarket live-data WS',
+    //   delayMs: this.reconnectDelay,
+    // });
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -419,6 +431,35 @@ class CryptoChainlinkPriceService {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
+    }
+  }
+
+  private startSilenceCheck(): void {
+    this.stopSilenceCheck();
+    this.lastPriceAt = Date.now();
+    this.silenceCheckTimer = setInterval(() => {
+      if (this.isShuttingDown || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      const elapsed = Date.now() - this.lastPriceAt;
+      if (elapsed >= SILENCE_RECONNECT_MS) {
+        logger.warn({
+          message: 'Polymarket live-data WS: no price update for 2min, forcing reconnect',
+          elapsedMs: elapsed,
+        });
+        this.stopSilenceCheck();
+        this.stopHeartbeat();
+        try {
+          this.ws.close(4000, 'Silence timeout');
+        } catch {}
+        this.ws = null;
+        this.scheduleReconnect();
+      }
+    }, 15000); // Check every 15s
+  }
+
+  private stopSilenceCheck(): void {
+    if (this.silenceCheckTimer) {
+      clearInterval(this.silenceCheckTimer);
+      this.silenceCheckTimer = null;
     }
   }
 
@@ -458,6 +499,7 @@ class CryptoChainlinkPriceService {
   shutdown(): void {
     this.isShuttingDown = true;
     this.stopHeartbeat();
+    this.stopSilenceCheck();
     if (this.diagnosticTimer) {
       clearInterval(this.diagnosticTimer);
       this.diagnosticTimer = null;

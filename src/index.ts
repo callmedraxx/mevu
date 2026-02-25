@@ -41,6 +41,7 @@ import { cryptoMarketWebSocketService } from './services/crypto/crypto-market-we
 import { orderbookWebSocketService } from './services/crypto/orderbook-websocket.service';
 import { cryptoChainlinkPriceService } from './services/crypto/crypto-chainlink-price.service';
 import { cryptoLivePriceWebSocketService } from './services/crypto/crypto-live-price-websocket.service';
+import { startCryptoOpeningPriceCron, stopCryptoOpeningPriceCron } from './services/crypto/crypto-opening-price-cron.service';
 
 // Load environment variables
 dotenv.config();
@@ -85,8 +86,18 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }));
 
-// Middleware
-app.use(express.json());
+// Middleware - capture raw body for Alchemy Solana webhook (signature verification needs exact bytes)
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      const r = req as { originalUrl?: string; url?: string; rawBody?: string };
+      const path = r.originalUrl ?? r.url ?? '';
+      if (String(path).startsWith('/api/webhooks/alchemy-solana')) {
+        r.rawBody = buf.toString('utf8');
+      }
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true }));
 
 // Add worker ID to response headers for load balancing verification
@@ -163,7 +174,7 @@ app.use('/api', apiRouter);
 // Initialize SPORTS services only (for sports background worker)
 async function initializeSportsServices() {
   try {
-    // Run database migrations first
+    // Run database migrations first (must complete before anything else)
     const nodeEnv = process.env.NODE_ENV || 'development';
     if (nodeEnv === 'production') {
       logger.info({ message: 'Running database migrations...' });
@@ -171,38 +182,76 @@ async function initializeSportsServices() {
       logger.info({ message: 'Database migrations completed' });
     }
 
-    // Stagger database-dependent service initialization to prevent connection pool exhaustion
-    // Initialize users table
+    // Initialize users table (must complete before services that depend on users)
     logger.info({ message: 'Initializing users table...' });
     await initializeUsersTable();
 
-    // Small delay to allow previous connection to complete
-    await new Promise(resolve => setTimeout(resolve, 500));
+    // Initialize everything else in parallel — these are all independent
+    logger.info({ message: 'Initializing all sports services in parallel...' });
+    const startTime = Date.now();
 
-    // Initialize probability history table
-    await initializeProbabilityHistoryTable();
+    await Promise.all([
+      // DB table init
+      initializeProbabilityHistoryTable().catch(err => {
+        logger.warn({ message: 'Probability history table init failed', error: err instanceof Error ? err.message : String(err) });
+      }),
 
-    // Longer delay before starting services that make immediate DB connections
-    await new Promise(resolve => setTimeout(resolve, 1000));
+      // Series ID sync
+      seriesIdSyncService.start().catch(err => {
+        logger.warn({ message: 'Series ID sync failed', error: err instanceof Error ? err.message : String(err) });
+      }),
 
-    // Sync series IDs from Gamma so we don't have to hardcode seasonal series_id changes
-    await seriesIdSyncService.start();
+      // Alchemy webhook + embedded wallet balance (balance depends on Alchemy, so chain them)
+      (async () => {
+        try {
+          logger.info({ message: 'Initializing Alchemy webhook service...' });
+          await alchemyWebhookService.initialize();
+          logger.info({ message: 'Alchemy webhook service initialized', isReady: alchemyWebhookService.isReady() });
+        } catch (alchemyError) {
+          logger.error({
+            message: 'Failed to initialize Alchemy webhook service',
+            error: alchemyError instanceof Error ? alchemyError.message : String(alchemyError),
+          });
+        }
+        try {
+          logger.info({ message: 'Initializing embedded wallet balance service...' });
+          await embeddedWalletBalanceService.initialize();
+          logger.info({ message: 'Embedded wallet balance service initialized' });
+        } catch (balanceServiceError) {
+          logger.error({
+            message: 'Failed to initialize embedded wallet balance service',
+            error: balanceServiceError instanceof Error ? balanceServiceError.message : String(balanceServiceError),
+          });
+        }
+      })(),
 
-    // Start live games polling service
+      // Deposit progress
+      (async () => {
+        try {
+          logger.info({ message: 'Loading pending deposits for progress tracking...' });
+          await depositProgressService.loadFromDatabase();
+          logger.info({ message: 'Deposit progress service ready' });
+        } catch (depositProgressError) {
+          logger.warn({
+            message: 'Could not load pending deposits (table may not exist yet)',
+            error: depositProgressError instanceof Error ? depositProgressError.message : String(depositProgressError),
+          });
+        }
+      })(),
+    ]);
+
+    logger.info({
+      message: 'Parallel service init completed',
+      durationMs: Date.now() - startTime,
+    });
+
+    // Start polling/background services (these are fire-and-forget, no need to await)
     liveGamesService.start();
-
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    // Start sports games polling service
     logger.info({ message: 'Starting sports games service...' });
     sportsGamesService.start();
-
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    // Start teams refresh service
     teamsRefreshService.start();
 
-    // Initialize Kalshi service - runs in parallel with live games refresh
+    // Initialize Kalshi service
     logger.info({ message: 'Initializing Kalshi service...' });
     registerOnGamesRefreshed(async () => {
       try {
@@ -220,31 +269,7 @@ async function initializeSportsServices() {
     });
     logger.info({ message: 'Kalshi service initialized' });
 
-    // Initialize Alchemy webhook service for USDC balance notifications
-    try {
-      logger.info({ message: 'Initializing Alchemy webhook service...' });
-      await alchemyWebhookService.initialize();
-      logger.info({ message: 'Alchemy webhook service initialized', isReady: alchemyWebhookService.isReady() });
-    } catch (alchemyError) {
-      logger.error({
-        message: 'Failed to initialize Alchemy webhook service',
-        error: alchemyError instanceof Error ? alchemyError.message : String(alchemyError),
-      });
-    }
-
-    // Initialize embedded wallet balance service
-    try {
-      logger.info({ message: 'Initializing embedded wallet balance service...' });
-      await embeddedWalletBalanceService.initialize();
-      logger.info({ message: 'Embedded wallet balance service initialized' });
-    } catch (balanceServiceError) {
-      logger.error({
-        message: 'Failed to initialize embedded wallet balance service',
-        error: balanceServiceError instanceof Error ? balanceServiceError.message : String(balanceServiceError),
-      });
-    }
-
-    // Initialize auto-transfer service
+    // Initialize auto-transfer service (synchronous)
     try {
       logger.info({ message: 'Initializing auto-transfer service...' });
       autoTransferService.initialize();
@@ -253,18 +278,6 @@ async function initializeSportsServices() {
       logger.error({
         message: 'Failed to initialize auto-transfer service',
         error: autoTransferError instanceof Error ? autoTransferError.message : String(autoTransferError),
-      });
-    }
-
-    // Load any pending deposits from database for progress tracking
-    try {
-      logger.info({ message: 'Loading pending deposits for progress tracking...' });
-      await depositProgressService.loadFromDatabase();
-      logger.info({ message: 'Deposit progress service ready' });
-    } catch (depositProgressError) {
-      logger.warn({
-        message: 'Could not load pending deposits (table may not exist yet)',
-        error: depositProgressError instanceof Error ? depositProgressError.message : String(depositProgressError),
       });
     }
 
@@ -337,6 +350,9 @@ async function initializeSportsServices() {
       logger.info({ message: 'Fee retry background job started (runs every 5 minutes)' });
     }
 
+    // Crypto short-term markets: proactively fetch opening/closing prices (every 1 min)
+    startCryptoOpeningPriceCron();
+
     logger.info({ message: 'Sports services initialized successfully' });
   } catch (error) {
     logger.error({
@@ -359,9 +375,34 @@ async function initializeClobServices() {
     logger.info({ message: 'Initializing Chainlink price service...' });
     cryptoChainlinkPriceService.initialize();
 
-    // Wait a bit for sports worker to populate games cache first
+    // Poll Redis until games cache has data (instead of fixed 10s sleep)
     logger.info({ message: 'CLOB worker waiting for games cache to populate...' });
-    await new Promise(resolve => setTimeout(resolve, 10000)); // 10 second delay
+    const { getCacheStats } = await import('./services/polymarket/redis-games-cache.service');
+    const pollStart = Date.now();
+    const POLL_INTERVAL_MS = 500;
+    const POLL_TIMEOUT_MS = 30000;
+    while (Date.now() - pollStart < POLL_TIMEOUT_MS) {
+      try {
+        const stats = await getCacheStats();
+        if (stats.gamesCount > 0) {
+          logger.info({
+            message: 'Games cache populated, proceeding with CLOB init',
+            gamesCount: stats.gamesCount,
+            waitedMs: Date.now() - pollStart,
+          });
+          break;
+        }
+      } catch {
+        // Redis not ready yet, keep polling
+      }
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+    if (Date.now() - pollStart >= POLL_TIMEOUT_MS) {
+      logger.warn({
+        message: 'Games cache poll timed out, proceeding anyway',
+        waitedMs: Date.now() - pollStart,
+      });
+    }
 
     // Initialize CLOB price update service for real-time odds/probability updates
     logger.info({ message: 'Initializing CLOB price update service...' });
@@ -393,11 +434,11 @@ async function initializeClobServices() {
 
     // Crypto services already initialized above (before games delay)
     const cryptoStatus = cryptoClobPriceService.getStatus();
-    logger.info({
-      message: 'CLOB crypto pipeline ready',
-      trackedCryptoTokens: cryptoStatus.trackedTokens,
-      trackedSlugs: cryptoStatus.trackedSlugs,
-    });
+    // logger.info({
+    //   message: 'CLOB crypto pipeline ready',
+    //   trackedCryptoTokens: cryptoStatus.trackedTokens,
+    //   trackedSlugs: cryptoStatus.trackedSlugs,
+    // });
 
     logger.info({ message: 'CLOB services initialized successfully' });
   } catch (error) {
@@ -457,6 +498,7 @@ function startSportsBackgroundWorker() {
   // Graceful shutdown for sports worker
   const shutdownSports = () => {
     logger.info({ message: 'Sports worker shutting down gracefully' });
+    stopCryptoOpeningPriceCron();
     sportsWebSocketService.disconnect();
     shutdownRedisGamesBroadcast().catch(() => {});
     shutdownRedisGamesCache().catch(() => {});
@@ -582,8 +624,8 @@ function startHttpWorker() {
   orderbookWebSocketService.initialize(server, '/ws/orderbook');
   cryptoLivePriceWebSocketService.initialize(server, '/ws/crypto-prices');
 
-  // Start server
-  server.listen(PORT, () => {
+  // Start server - backlog 2048 to reduce connection queuing under high concurrency (default 511)
+  server.listen(PORT, 2048, () => {
     console.log(`HTTP worker running on port ${PORT} (pid=${process.pid})`);
     console.log(`Swagger: http://localhost:${PORT}/api-docs`);
   });

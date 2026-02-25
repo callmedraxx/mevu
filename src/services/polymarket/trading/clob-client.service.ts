@@ -20,6 +20,10 @@ const clobClientCache = new Map<string, {
   proxyWalletAddress: string;
 }>();
 
+// Separate cache for API credentials — survives CLOB client cache clears
+// so we don't re-derive API keys (500-2000ms) unnecessarily
+const apiCredsCache = new Map<string, any>();
+
 const CLOB_HOST = process.env.POLYMARKET_CLOB_HOST || 'https://clob.polymarket.com';
 const CHAIN_ID = 137; // Polygon mainnet
 const SIGNATURE_TYPE = 2; // Deployed Safe proxy wallet signature type (for gasless trading)
@@ -114,49 +118,50 @@ export async function getClobClientForUser(
     builderConfig // Builder config for gasless trading
   );
   
-  // Create or derive API key
-  // Note: createOrDeriveApiKey() first tries to create, then derives if create fails
-  // The first attempt may fail with "Could not create api key" which is expected
-  // if an API key already exists - it will then derive successfully
-  let apiCreds;
-  try {
-    apiCreds = await tempClient.createOrDeriveApiKey();
+  // Get or create API credentials — check separate cache first
+  let apiCreds = apiCredsCache.get(privyUserId);
+  if (apiCreds) {
     logger.info({
-      message: 'Created or derived API key for CLOB client',
+      message: 'Reusing cached API credentials (skipping createOrDeriveApiKey)',
       privyUserId,
-      hasApiKey: !!apiCreds,
     });
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    // Check if this is a "could not create" error - try derive only
-    if (errorMessage.toLowerCase().includes('could not create')) {
+  } else {
+    // Try derive first (fast path for returning users — avoids wasted create attempt + extra sign).
+    // Only fall back to createOrDeriveApiKey for genuinely new users.
+    const apiCredsStartTime = Date.now();
+    try {
+      apiCreds = await tempClient.deriveApiKey();
       logger.info({
-        message: 'API key creation failed (expected if key exists), trying derive only',
+        message: 'Derived API key for CLOB client',
         privyUserId,
+        durationMs: Date.now() - apiCredsStartTime,
+      });
+    } catch (deriveError) {
+      // Derive failed — likely a new user with no API key yet. Fall back to create+derive.
+      logger.info({
+        message: 'deriveApiKey failed, trying createOrDeriveApiKey (new user)',
+        privyUserId,
+        deriveError: deriveError instanceof Error ? deriveError.message : String(deriveError),
       });
       try {
-        apiCreds = await tempClient.deriveApiKey();
+        apiCreds = await tempClient.createOrDeriveApiKey();
         logger.info({
-          message: 'Successfully derived API key',
+          message: 'Created API key for CLOB client (new user)',
           privyUserId,
-          hasApiKey: !!apiCreds,
+          durationMs: Date.now() - apiCredsStartTime,
         });
-      } catch (deriveError) {
+      } catch (createError) {
+        const errorMessage = createError instanceof Error ? createError.message : String(createError);
         logger.error({
-          message: 'Failed to derive API key for CLOB client',
+          message: 'Failed to create/derive API key for CLOB client',
           privyUserId,
-          error: deriveError instanceof Error ? deriveError.message : String(deriveError),
+          error: errorMessage,
         });
-        throw new Error(`Failed to derive API credentials: ${deriveError instanceof Error ? deriveError.message : String(deriveError)}`);
+        throw new Error(`Failed to create API credentials: ${errorMessage}`);
       }
-    } else {
-      logger.error({
-        message: 'Failed to create/derive API key for CLOB client',
-        privyUserId,
-        error: errorMessage,
-      });
-      throw new Error(`Failed to create API credentials: ${errorMessage}`);
     }
+    // Cache API credentials separately so they survive CLOB client cache clears
+    apiCredsCache.set(privyUserId, apiCreds);
   }
 
   // Create CLOB client with API credentials and builder config

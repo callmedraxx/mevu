@@ -108,12 +108,7 @@ export class PrivySignerAdapter extends ethers.Signer {
     types: Record<string, ethers.TypedDataField[]>,
     value: Record<string, any>
   ): Promise<string> {
-    logger.info({
-      message: 'Signing typed data via Privy session signer',
-      userId: this.userId,
-      walletAddress: this.walletAddress,
-      domain: domain.name,
-    });
+    const signStartTime = Date.now();
 
     // Helper function to serialize BigInt values to strings (Privy API doesn't accept BigInt)
     const serializeBigInt = (obj: any): any => {
@@ -165,13 +160,10 @@ export class PrivySignerAdapter extends ethers.Signer {
       });
 
       logger.info({
-        message: 'Received signature from privyService.signTypedData',
+        message: 'Signed typed data',
         userId: this.userId,
-        signatureType: typeof signature,
-        isString: typeof signature === 'string',
-        isObject: typeof signature === 'object',
-        hasRaw: signature && typeof signature === 'object' && 'raw' in signature,
-        signaturePreview: typeof signature === 'string' ? signature.substring(0, 20) + '...' : 'object',
+        domain: domain.name,
+        durationMs: Date.now() - signStartTime,
       });
 
       // Defensive normalization - ensure we always return a hex string
