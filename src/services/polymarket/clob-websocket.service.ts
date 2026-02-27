@@ -9,7 +9,7 @@ import { ClobOrderBookUpdate, ClobWebSocketMessage } from './polymarket.types';
 
 const CLOB_WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
-/** Interval (ms) for client-side ping to prevent idle timeout (1006) */
+/** Polymarket requires text "PING" every 10s — see docs.polymarket.com CLOB WebSocket */
 const PING_INTERVAL_MS = 10_000;
 
 /**
@@ -28,7 +28,13 @@ interface WsShard {
   isConnected: boolean;
   destroyed: boolean;
   shardIndex: number;
+  connectedAt: number; // timestamp for uptime diagnostics
+  /** Consecutive rapid-failure count; reset when connection was stable (>10s) before close */
+  rapidFailureCount: number;
 }
+
+/** If connection was stable this long before close, treat next disconnect as fresh (use short delay) */
+const SHARD_STABLE_UPTIME_MS = 10_000;
 
 export class ClobWebSocketService {
   private ws: WebSocket | null = null;
@@ -48,6 +54,9 @@ export class ClobWebSocketService {
   private addAssetsTimer: NodeJS.Timeout | null = null;
   /** Additional WebSocket connections for assets beyond the first 500 */
   private shards: WsShard[] = [];
+  /** Recently registered tokens (for diagnostics: correlate shard closes with new market visits) */
+  private recentlyRegisteredTokens: Map<string, number> = new Map();
+  private static readonly RECENT_TOKEN_TTL_MS = 60_000;
 
   /**
    * Connect to the CLOB WebSocket endpoint
@@ -507,13 +516,14 @@ export class ClobWebSocketService {
     });
   }
 
+  /** Max rapid reconnects before backing off; only applies when connection died within 10s of connect */
   private static readonly SHARD_MAX_RECONNECT = 5;
-  private static readonly SHARD_RECONNECT_BASE_MS = 5000;
+  private static readonly SHARD_RECONNECT_BASE_MS = 3000;
 
   /**
    * Create a shard WebSocket connection for a chunk of assets.
    * Reuses the same message handling pipeline as the primary connection.
-   * Automatically reconnects on abnormal closure (up to SHARD_MAX_RECONNECT times).
+   * Reconnects on abnormal closure. Stable disconnects (uptime >10s) always retry; rapid failures use exponential backoff and a 60s cooldown after 5 attempts.
    */
   private createShard(assets: string[], shardIndex: number): Promise<WsShard> {
     const shard: WsShard = {
@@ -524,6 +534,8 @@ export class ClobWebSocketService {
       isConnected: false,
       destroyed: false,
       shardIndex,
+      connectedAt: 0,
+      rapidFailureCount: 0,
     };
 
     const connectShard = (attempt: number = 0): Promise<void> => {
@@ -548,11 +560,12 @@ export class ClobWebSocketService {
         ws.once('open', () => {
           clearTimeout(timeout);
           shard.isConnected = true;
+          shard.connectedAt = Date.now();
 
-          // Start ping keepalive
+          // Start ping keepalive — Polymarket expects text "PING", not ws.ping()
           if (shard.pingInterval) clearInterval(shard.pingInterval);
           shard.pingInterval = setInterval(() => {
-            if (ws.readyState === WebSocket.OPEN) ws.ping();
+            if (ws.readyState === WebSocket.OPEN) ws.send('PING');
           }, PING_INTERVAL_MS);
 
           // Subscribe to this shard's assets
@@ -591,16 +604,58 @@ export class ClobWebSocketService {
 
           if (code === 1000 || shard.destroyed) return;
 
-          logger.warn({ message: `CLOB shard ${shardIndex} closed, will reconnect`, code, assets: assets.length });
+          const uptimeMs = shard.connectedAt > 0 ? Date.now() - shard.connectedAt : 0;
+          const uptimeSec = Math.round(uptimeMs / 1000);
+          const now = Date.now();
+          const recentOverlap = assets.filter((a) => {
+            const t = this.recentlyRegisteredTokens.get(a);
+            return t != null && now - t < ClobWebSocketService.RECENT_TOKEN_TTL_MS;
+          });
+          logger.warn({
+            message: `CLOB shard ${shardIndex} closed, will reconnect`,
+            code,
+            codeMeaning: code === 1006 ? 'Abnormal closure (remote closed without close frame)' : undefined,
+            assets: assets.length,
+            uptimeSec,
+            uptimeMin: uptimeSec >= 60 ? (uptimeSec / 60).toFixed(1) : undefined,
+            ...(recentOverlap.length > 0 && {
+              recentlyRegisteredTokenOnShard: true,
+              overlapCount: recentOverlap.length,
+              sample: recentOverlap[0]?.substring(0, 20) + '...',
+            }),
+          });
 
-          // Schedule reconnect with exponential backoff
-          const nextAttempt = attempt + 1;
-          if (nextAttempt <= ClobWebSocketService.SHARD_MAX_RECONNECT) {
+          // Reset rapid-failure count if connection was stable; otherwise use exponential backoff
+          const wasStable = uptimeMs >= SHARD_STABLE_UPTIME_MS;
+          if (wasStable) {
+            shard.rapidFailureCount = 0;
+          }
+          const nextAttempt = shard.rapidFailureCount + 1;
+          shard.rapidFailureCount = nextAttempt;
+
+          // Max reconnect limit only applies to rapid failures; stable disconnects always retry
+          const exceededRapidLimit = !wasStable && nextAttempt > ClobWebSocketService.SHARD_MAX_RECONNECT;
+          if (exceededRapidLimit) {
+            logger.error({
+              message: `CLOB shard ${shardIndex} max rapid-reconnect attempts reached, will retry after 60s`,
+              attempts: nextAttempt,
+            });
+            shard.rapidFailureCount = 0; // Reset so next attempt gets short delay
+            shard.reconnectTimer = setTimeout(() => {
+              shard.reconnectTimer = null;
+              if (!shard.destroyed) {
+                connectShard(1).catch((err) => {
+                  logger.error({ message: `CLOB shard ${shardIndex} reconnect failed`, error: err instanceof Error ? err.message : String(err) });
+                });
+              }
+            }, 60_000); // Wait 60s before retrying after rapid failure exhaustion
+          } else {
             const delay = ClobWebSocketService.SHARD_RECONNECT_BASE_MS * Math.pow(2, Math.min(nextAttempt - 1, 4));
             logger.info({
               message: `Scheduling CLOB shard ${shardIndex} reconnect`,
               attempt: nextAttempt,
               delayMs: delay,
+              rapidFailure: !wasStable,
             });
             shard.reconnectTimer = setTimeout(() => {
               shard.reconnectTimer = null;
@@ -610,8 +665,6 @@ export class ClobWebSocketService {
                 });
               }
             }, delay);
-          } else {
-            logger.error({ message: `CLOB shard ${shardIndex} max reconnect attempts reached`, attempts: nextAttempt });
           }
         });
 
@@ -662,12 +715,18 @@ export class ClobWebSocketService {
     const added = assetIds.filter(id => !oldSet.has(id));
     const removed = [...oldSet].filter(id => !newSet.has(id));
 
-    if (added.length === 0 && removed.length === 0) return; // No change
+    if (added.length === 0 && removed.length === 0) {
+      logger.debug({
+        message: 'CLOB replaceSubscriptions: no change, skipping forceReconnect',
+        assetCount: assetIds.length,
+      });
+      return; // No change
+    }
 
     this.pendingSubscriptions = assetIds;
 
     logger.info({
-      message: 'CLOB subscriptions replaced (pruned stale tokens)',
+      message: 'CLOB subscriptions replaced (pruned stale tokens), triggering forceReconnect',
       oldCount: oldSize,
       newCount: assetIds.length,
       added: added.length,
@@ -688,20 +747,38 @@ export class ClobWebSocketService {
   }
 
   /**
-   * Send PING to server (for keepalive)
+   * Send PING to server (for keepalive).
+   * Polymarket expects text "PING" every 10s, not ws.ping() — see docs.polymarket.com CLOB WebSocket.
    */
   ping(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return;
     }
-
-    // logger.debug({
-//       message: 'Sending ping to server',
-//     });
-
-    this.ws.ping();
+    this.ws.send('PING');
   }
 
+  /**
+   * Note token registration for diagnostics. Called when a user subscribes to a new crypto/finance market.
+   * When a shard closes, we check if it handled recently-registered tokens (correlates with "new market visit → shard disconnect").
+   */
+  noteTokenRegistrationForDiagnostics(tokenIds: string[]): void {
+    if (!tokenIds?.length) return;
+    const now = Date.now();
+    const cutoff = now - ClobWebSocketService.RECENT_TOKEN_TTL_MS;
+    for (const id of tokenIds) {
+      if (id) this.recentlyRegisteredTokens.set(id, now);
+    }
+    // Prune old entries
+    for (const [id, t] of this.recentlyRegisteredTokens) {
+      if (t < cutoff) this.recentlyRegisteredTokens.delete(id);
+    }
+    if (this.recentlyRegisteredTokens.size > 100) {
+      const entries = Array.from(this.recentlyRegisteredTokens.entries()).sort((a, b) => a[1] - b[1]);
+      for (let i = 0; i < entries.length - 50; i++) {
+        this.recentlyRegisteredTokens.delete(entries[i][0]);
+      }
+    }
+  }
 
   private clearPingInterval(): void {
     if (this.pingInterval) {

@@ -85,6 +85,7 @@ export class CryptoOrderbookService {
     this.registeredTokens.add(clobTokenId);
 
     if (isNew) {
+      clobWebSocketService.noteTokenRegistrationForDiagnostics([clobTokenId]);
       logger.info({
         message: 'Crypto orderbook: registered token for routing',
         clobTokenId: clobTokenId.substring(0, 20) + '...',

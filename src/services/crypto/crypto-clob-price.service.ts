@@ -214,12 +214,18 @@ export class CryptoClobPriceService {
     const { slug, upClobTokenId, downClobTokenId } = msg;
     if (!slug || !upClobTokenId) return;
 
+    const newTokens: string[] = [];
     if (!this.tokenToSlug.has(upClobTokenId)) {
+      newTokens.push(upClobTokenId);
       this.tokenToSlug.set(upClobTokenId, { slug, outcomeLabel: 'up', outcomeIndex: 0 });
     }
 
     if (downClobTokenId && !this.tokenToSlug.has(downClobTokenId)) {
+      newTokens.push(downClobTokenId);
       this.tokenToSlug.set(downClobTokenId, { slug, outcomeLabel: 'down', outcomeIndex: 1 });
+    }
+    if (newTokens.length > 0) {
+      clobWebSocketService.noteTokenRegistrationForDiagnostics(newTokens);
     }
 
     // Always refresh slug -> tokens mapping (idempotent)
