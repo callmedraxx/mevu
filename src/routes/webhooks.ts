@@ -123,8 +123,10 @@ router.post('/alchemy', async (req: Request, res: Response) => {
  */
 router.post('/alchemy-solana', async (req: Request, res: Response) => {
   try {
-    const rawBody = JSON.stringify(req.body);
+    const rawBody = (req as { rawBody?: string }).rawBody ?? JSON.stringify(req.body);
     const signature = req.headers['x-alchemy-signature'] as string;
+
+    const transactionCount = req.body?.event?.transaction?.length ?? 0;
 
     if (signature && !verifySolanaWebhookSignature(rawBody, signature)) {
       logger.warn({ message: 'Invalid Alchemy Solana webhook signature' });
@@ -133,13 +135,15 @@ router.post('/alchemy-solana', async (req: Request, res: Response) => {
 
     res.status(200).json({ success: true, message: 'Webhook received' });
 
-    try {
-      await processSolanaWebhook(req.body);
-    } catch (processError) {
-      logger.error({
-        message: 'Error processing Alchemy Solana webhook',
-        error: processError instanceof Error ? processError.message : String(processError),
-      });
+    if (transactionCount > 0) {
+      try {
+        await processSolanaWebhook(req.body);
+      } catch (processError) {
+        logger.error({
+          message: 'Error processing Alchemy Solana webhook',
+          error: processError instanceof Error ? processError.message : String(processError),
+        });
+      }
     }
   } catch (error) {
     logger.error({
@@ -263,7 +267,7 @@ router.get('/alchemy/status', async (req: Request, res: Response) => {
  *       200:
  *         description: Solana webhook service status
  */
-router.get('/alchemy-solana/status', async (req: Request, res: Response) => {
+router.get('/alchemy-solana/status', async (_req: Request, res: Response) => {
   const webhookUrl = process.env.ALCHEMY_SOLANA_WEBHOOK_URL || null;
   res.json({
     success: true,

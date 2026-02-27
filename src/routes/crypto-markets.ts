@@ -31,7 +31,7 @@ const router = Router();
  *         name: timeframe
  *         schema:
  *           type: string
- *           enum: [15min, hourly, 4hour, daily, weekly, monthly, pre-market, etf]
+ *           enum: [5min, 15min, hourly, 4hour, daily, weekly, monthly, pre-market, etf]
  *         description: Filter by timeframe. Omit for all.
  *       - in: query
  *         name: asset
@@ -78,6 +78,7 @@ const router = Router();
  *             schema: { $ref: '#/components/schemas/Error' }
  */
 router.get('/', async (req: Request, res: Response) => {
+  const t0 = Date.now();
   try {
     const { timeframe, asset, page, limit } = req.query;
     const pageNum = page ? Math.max(1, parseInt(String(page), 10)) : 1;
@@ -92,6 +93,8 @@ router.get('/', async (req: Request, res: Response) => {
       limit: limitNum,
     });
 
+    const fetchMs = Date.now() - t0;
+    res.setHeader('X-Fetch-Ms', String(fetchMs));
     return res.json({
       success: true,
       count: result.markets.length,

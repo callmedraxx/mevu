@@ -1,19 +1,18 @@
 /**
- * Frontend Crypto Markets Service
- * Fetches crypto_markets from DB, transforms to PredictionMarket format.
- * Uses in-memory cache, promise coalescing for burst traffic, connect-only-when-read.
+ * Frontend Finance Markets Service
+ * Fetches finance_markets from DB, transforms to FinanceMarketFrontend format.
+ * Uses in-memory cache, promise coalescing for burst traffic.
  */
 
 import { connectWithRetry } from '../../config/database';
 import {
-  transformCryptoMarketToFrontend,
-  PredictionMarketFrontend,
-  CryptoMarketRow,
-} from './crypto-market.transformer';
-import { fetchOpeningPrice, fetchClosingPrice } from './crypto-opening-price.service';
+  transformFinanceMarketToFrontend,
+  FinanceMarketFrontend,
+  FinanceMarketRow,
+} from './finance-market.transformer';
 
 interface CacheEntry {
-  data: PredictionMarketFrontend[];
+  data: FinanceMarketFrontend[];
   timestamp: number;
   total: number;
   hasMore: boolean;
@@ -24,11 +23,10 @@ const CACHE_TTL_MS = 5_000;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 
-/** In-flight promises keyed by cache key to coalesce concurrent identical requests */
 const inFlight = new Map<string, Promise<PaginatedResult>>();
 
 export interface PaginatedResult {
-  markets: PredictionMarketFrontend[];
+  markets: FinanceMarketFrontend[];
   total: number;
   page: number;
   limit: number;
@@ -43,20 +41,10 @@ export interface ListOptions {
 }
 
 const TIMEFRAME_ALIASES: Record<string, string> = {
-  '5min': '5m',
-  '5m': '5m',
-  '15min': '15m',
-  '15m': '15m',
-  '1h': '1h',
-  'hourly': '1h',
-  '4h': '4h',
-  '4hour': '4h',
   'daily': 'daily',
   'weekly': 'weekly',
   'monthly': 'monthly',
   'yearly': 'yearly',
-  'pre-market': 'pre-market',
-  'etf': 'etf',
 };
 
 function normalizeTimeframe(v: string | null | undefined): string | null {
@@ -71,27 +59,7 @@ function normalizeAsset(v: string | null | undefined): string | null {
   return s || null;
 }
 
-/** Infer start_time from end_date and timeframe when Gamma API doesn't provide startTime. */
-const TIMEFRAME_DURATIONS_MS: Record<string, number> = {
-  '5m': 5 * 60 * 1000,
-  '15m': 15 * 60 * 1000,
-  '1h': 60 * 60 * 1000,
-  '4h': 4 * 60 * 60 * 1000,
-  'daily': 24 * 60 * 60 * 1000,
-};
-
-function inferStartTime(endDate: string, timeframe: string): string | null {
-  const durationMs = TIMEFRAME_DURATIONS_MS[timeframe.toLowerCase()];
-  if (!durationMs) return null;
-  const endMs = new Date(endDate).getTime();
-  if (isNaN(endMs)) return null;
-  return new Date(endMs - durationMs).toISOString();
-}
-
-/** Timeframes where we deduplicate by series_slug, showing only the current/active window.
- *  Short intervals (5m–daily) have many recurring events per asset; longer ones (weekly+)
- *  are naturally unique but included for safety — DISTINCT ON is a no-op when only one exists. */
-const DEDUP_TIMEFRAMES = new Set(['5m', '15m', '1h', '4h', 'daily', 'weekly', 'monthly', 'yearly', 'pre-market', 'etf']);
+const DEDUP_TIMEFRAMES = new Set(['daily', 'weekly', 'monthly', 'yearly']);
 
 async function fetchFromDb(options: ListOptions): Promise<PaginatedResult> {
   const page = Math.max(1, options.page ?? 1);
@@ -119,18 +87,13 @@ async function fetchFromDb(options: ListOptions): Promise<PaginatedResult> {
 
     let q: string;
     if (isShortTimeframe) {
-      // Short timeframes (15m, 5m): deduplicate by series_slug, pick the current window.
-      // DISTINCT ON picks one row per series_slug. The CASE expression prioritises
-      // the window we are inside (start_time <= NOW) over future windows, and
-      // end_date ASC picks the soonest-ending within each priority tier.
-      // COUNT(*) OVER() avoids a separate COUNT round-trip.
       params.push(limit, offset);
       q = `
         SELECT *, COUNT(*) OVER () AS total_count FROM (
           SELECT DISTINCT ON (series_slug)
             id, slug, title, end_date, icon, active, closed, liquidity, volume,
             comment_count, is_live, timeframe, asset, tags, markets
-          FROM crypto_markets
+          FROM finance_markets
           WHERE ${whereClause}
             AND series_slug IS NOT NULL
             AND end_date > NOW()
@@ -142,13 +105,12 @@ async function fetchFromDb(options: ListOptions): Promise<PaginatedResult> {
         LIMIT $${params.length - 1} OFFSET $${params.length}
       `;
     } else {
-      // Normal path: single query with window-function count.
       params.push(limit, offset);
       q = `
         SELECT id, slug, title, end_date, icon, active, closed, liquidity, volume,
                comment_count, is_live, timeframe, asset, tags, markets,
                COUNT(*) OVER () AS total_count
-        FROM crypto_markets
+        FROM finance_markets
         WHERE ${whereClause}
         ORDER BY volume DESC NULLS LAST, end_date ASC NULLS LAST
         LIMIT $${params.length - 1} OFFSET $${params.length}
@@ -156,9 +118,9 @@ async function fetchFromDb(options: ListOptions): Promise<PaginatedResult> {
     }
 
     const res = await client.query(q, params);
-    const rows = res.rows as (CryptoMarketRow & { total_count?: string })[];
+    const rows = res.rows as (FinanceMarketRow & { total_count?: string })[];
     const total = rows.length > 0 ? parseInt(rows[0].total_count ?? '0', 10) : 0;
-    const markets = rows.map(transformCryptoMarketToFrontend);
+    const markets = rows.map(transformFinanceMarketToFrontend);
 
     return {
       markets,
@@ -172,10 +134,9 @@ async function fetchFromDb(options: ListOptions): Promise<PaginatedResult> {
   }
 }
 
-export async function getFrontendCryptoMarketsFromDatabase(
+export async function getFrontendFinanceMarketsFromDatabase(
   options: ListOptions
 ): Promise<PaginatedResult> {
-  // Skip DB when no database configured (local dev without DATABASE_URL)
   if (!process.env.DATABASE_URL) {
     return { markets: [], total: 0, page: 1, limit: DEFAULT_LIMIT, hasMore: false };
   }
@@ -185,12 +146,11 @@ export async function getFrontendCryptoMarketsFromDatabase(
   const tf = normalizeTimeframe(options.timeframe);
   const asset = normalizeAsset(options.asset);
 
-  // Cache key uses normalized values so equivalent params coalesce (e.g. timeframe=5min vs 5m)
   const cacheKey = JSON.stringify({ tf, a: asset, p: page, l: limit });
 
   const now = Date.now();
   const isFirstPageUnfiltered = !tf && !asset && page === 1 && limit === DEFAULT_LIMIT;
-  const simpleCacheKey = 'list:p1:default';
+  const simpleCacheKey = 'finance:list:p1:default';
 
   if (isFirstPageUnfiltered) {
     const hit = cache.get(simpleCacheKey);
@@ -205,7 +165,6 @@ export async function getFrontendCryptoMarketsFromDatabase(
     }
   }
 
-  // Request coalescing: identical concurrent requests share one DB fetch (same as games/frontend)
   const existingInFlight = inFlight.get(cacheKey);
   if (existingInFlight) {
     return existingInFlight;
@@ -236,12 +195,7 @@ export async function getFrontendCryptoMarketsFromDatabase(
   }
 }
 
-/**
- * Fetch full/raw detail of a crypto market by slug — SSR-like structure.
- * Composes the response in PostgreSQL to minimise Node.js work.
- * Returns null when not found.
- */
-export async function getCryptoMarketDetailBySlug(
+export async function getFinanceMarketDetailBySlug(
   slug: string
 ): Promise<Record<string, unknown> | null> {
   if (!process.env.DATABASE_URL) return null;
@@ -259,74 +213,21 @@ export async function getCryptoMarketDetailBySlug(
          timeframe, asset, series_slug,
          opening_price, closing_price,
          markets, series, tags_data AS tags
-       FROM crypto_markets
+       FROM finance_markets
        WHERE LOWER(slug) = LOWER($1)
        LIMIT 1`,
       [slug]
     );
     if (res.rows.length === 0) return null;
-    const row = res.rows[0] as Record<string, unknown>;
-
-    // Infer start_time from end_date + timeframe when Gamma API doesn't provide it
-    if (row.start_time == null && row.end_date && row.timeframe) {
-      const inferred = inferStartTime(row.end_date as string, row.timeframe as string);
-      if (inferred) {
-        row.start_time = inferred;
-        client.query(
-          'UPDATE crypto_markets SET start_time = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-          [inferred, row.id]
-        ).catch(() => {});
-      }
-    }
-
-    // On-demand: if opening_price is missing and market has started, fetch from Polymarket SSR
-    const marketStarted = row.start_time
-      ? new Date(row.start_time as string) <= new Date()
-      : row.end_date
-        ? new Date(row.end_date as string) <= new Date() // If no start_time, check if ended
-        : false;
-
-    if (row.opening_price == null && marketStarted) {
-      try {
-        const price = await fetchOpeningPrice(row.slug as string);
-        if (price != null) {
-          row.opening_price = price;
-          client.query(
-            'UPDATE crypto_markets SET opening_price = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-            [price, row.id]
-          ).catch(() => {});
-        }
-      } catch {
-        // Non-critical — return row without opening_price
-      }
-    }
-
-    // On-demand: if closing_price is missing and market has ended, fetch from Polymarket SSR
-    const endDate = row.end_date as string | undefined;
-    if (endDate && new Date(endDate) <= new Date() && row.closing_price == null) {
-      try {
-        const closePrice = await fetchClosingPrice(row.slug as string);
-        if (closePrice != null) {
-          row.closing_price = closePrice;
-          client.query(
-            'UPDATE crypto_markets SET closing_price = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-            [closePrice, row.id]
-          ).catch(() => {});
-        }
-      } catch {
-        // Non-critical
-      }
-    }
-
-    return row;
+    return res.rows[0] as Record<string, unknown>;
   } finally {
     client.release();
   }
 }
 
-export async function getFrontendCryptoMarketBySlugFromDatabase(
+export async function getFrontendFinanceMarketBySlugFromDatabase(
   slug: string
-): Promise<PredictionMarketFrontend | null> {
+): Promise<FinanceMarketFrontend | null> {
   if (!process.env.DATABASE_URL) return null;
 
   const client = await connectWithRetry();
@@ -334,20 +235,20 @@ export async function getFrontendCryptoMarketBySlugFromDatabase(
     const res = await client.query(
       `SELECT id, slug, title, end_date, icon, active, closed, liquidity, volume,
               comment_count, is_live, timeframe, asset, tags, markets
-       FROM crypto_markets
+       FROM finance_markets
        WHERE LOWER(slug) = LOWER($1) AND active = true AND closed = false`,
       [slug]
     );
     if (res.rows.length === 0) return null;
-    return transformCryptoMarketToFrontend(res.rows[0] as CryptoMarketRow);
+    return transformFinanceMarketToFrontend(res.rows[0] as FinanceMarketRow);
   } finally {
     client.release();
   }
 }
 
-export async function getFrontendCryptoMarketByIdFromDatabase(
+export async function getFrontendFinanceMarketByIdFromDatabase(
   id: string
-): Promise<PredictionMarketFrontend | null> {
+): Promise<FinanceMarketFrontend | null> {
   if (!process.env.DATABASE_URL) return null;
 
   const client = await connectWithRetry();
@@ -355,22 +256,18 @@ export async function getFrontendCryptoMarketByIdFromDatabase(
     const res = await client.query(
       `SELECT id, slug, title, end_date, icon, active, closed, liquidity, volume,
               comment_count, is_live, timeframe, asset, tags, markets
-       FROM crypto_markets
+       FROM finance_markets
        WHERE id = $1 AND active = true AND closed = false`,
       [id]
     );
     if (res.rows.length === 0) return null;
-    return transformCryptoMarketToFrontend(res.rows[0] as CryptoMarketRow);
+    return transformFinanceMarketToFrontend(res.rows[0] as FinanceMarketRow);
   } finally {
     client.release();
   }
 }
 
-/**
- * Get the currently active market in a series (start_time <= now AND end_date > now).
- * Returns the slug of the active market or null if none is active.
- */
-export async function getCurrentMarketBySeriesSlug(
+export async function getCurrentFinanceMarketBySeriesSlug(
   seriesSlug: string
 ): Promise<string | null> {
   if (!process.env.DATABASE_URL) return null;
@@ -378,7 +275,7 @@ export async function getCurrentMarketBySeriesSlug(
   const client = await connectWithRetry();
   try {
     const res = await client.query(
-      `SELECT slug FROM crypto_markets
+      `SELECT slug FROM finance_markets
        WHERE series_slug = $1
          AND start_time <= NOW()
          AND end_date > NOW()
@@ -393,12 +290,6 @@ export async function getCurrentMarketBySeriesSlug(
   }
 }
 
-/**
- * Get a timeline of markets in a series around the current time.
- * Returns `past` (most recent N ended) + `current` (if any) + `future` (next N upcoming).
- * Each entry includes slug, start_time, end_date, and opening_price.
- * Past markets also include outcome data via the SSR past-results.
- */
 export interface TimelineMarket {
   slug: string;
   startTime: string;
@@ -410,10 +301,10 @@ export interface TimelineMarket {
   oddsHigh: number | null;
   oddsLow: number | null;
   status: 'past' | 'current' | 'future';
-  outcome: 'up' | 'down' | null; // null for current/future
+  outcome: 'up' | 'down' | null;
 }
 
-export async function getSeriesTimeline(
+export async function getFinanceSeriesTimeline(
   seriesSlug: string,
   pastCount = 4,
   futureCount = 3,
@@ -422,13 +313,12 @@ export async function getSeriesTimeline(
 
   const client = await connectWithRetry();
   try {
-    // Single query: grab a window around NOW (include closing_price for outcome derivation)
     const res = await client.query(
       `(
         SELECT slug, start_time, end_date, opening_price, closing_price,
                price_high, price_low, odds_high, odds_low,
                markets, 'past' AS status
-        FROM crypto_markets
+        FROM finance_markets
         WHERE series_slug = $1 AND end_date <= NOW() AND start_time IS NOT NULL
         ORDER BY start_time DESC
         LIMIT $2
@@ -438,7 +328,7 @@ export async function getSeriesTimeline(
         SELECT slug, start_time, end_date, opening_price, closing_price,
                price_high, price_low, odds_high, odds_low,
                markets, 'current' AS status
-        FROM crypto_markets
+        FROM finance_markets
         WHERE series_slug = $1 AND start_time <= NOW() AND end_date > NOW() AND start_time IS NOT NULL
         ORDER BY start_time DESC
         LIMIT 1
@@ -448,7 +338,7 @@ export async function getSeriesTimeline(
         SELECT slug, start_time, end_date, opening_price, closing_price,
                price_high, price_low, odds_high, odds_low,
                markets, 'future' AS status
-        FROM crypto_markets
+        FROM finance_markets
         WHERE series_slug = $1 AND start_time > NOW() AND start_time IS NOT NULL
         ORDER BY start_time ASC
         LIMIT $3
@@ -460,7 +350,6 @@ export async function getSeriesTimeline(
     return res.rows.map((r: Record<string, unknown>) => {
       let outcome: 'up' | 'down' | null = null;
       if (r.status === 'past') {
-        // Prefer Chainlink-sourced closing vs opening (authoritative); fallback to outcomePrices
         const open = r.opening_price != null ? Number(r.opening_price) : null;
         const close = r.closing_price != null ? Number(r.closing_price) : null;
         if (open != null && close != null) {

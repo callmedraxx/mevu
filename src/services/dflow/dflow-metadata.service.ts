@@ -18,7 +18,19 @@ import { SOLANA_USDC_MINT } from './dflow-order-validation';
 export interface DFlowMarketBatchItem {
   ticker?: string;
   title?: string;
-  accounts?: Record<string, { yesMint?: string; noMint?: string; marketLedger?: string; isInitialized?: boolean }>;
+  status?: string;
+  result?: string;
+  accounts?: Record<string, DFlowAccountInfo>;
+}
+
+/** Account info for a settlement mint (e.g. USDC) */
+export interface DFlowAccountInfo {
+  yesMint?: string;
+  noMint?: string;
+  marketLedger?: string;
+  isInitialized?: boolean;
+  redemptionStatus?: 'open' | 'closed' | string;
+  scalarOutcomePct?: number;
 }
 
 const DFLOW_METADATA_API_URL =
@@ -38,7 +50,7 @@ export interface DFlowMarketMapping {
   marketLedger?: string;
 }
 
-type AccountInfo = { marketLedger?: string; yesMint?: string; noMint?: string; isInitialized?: boolean };
+type AccountInfo = { marketLedger?: string; yesMint?: string; noMint?: string; isInitialized?: boolean; redemptionStatus?: string };
 
 class DFlowMetadataService {
   private client: AxiosInstance;
@@ -245,6 +257,74 @@ class DFlowMetadataService {
       });
       return [];
     }
+  }
+
+  /**
+   * Fetch full market details by outcome mint.
+   * GET /api/v1/market/by-mint/{mint} — returns status, result, redemptionStatus for redemption checks.
+   */
+  async getMarketByMint(outcomeMint: string): Promise<{
+    status?: string;
+    result?: string;
+    redemptionStatus?: string;
+    ticker?: string;
+    title?: string;
+    accounts?: Record<string, DFlowAccountInfo>;
+  } | null> {
+    if (!this.enabled) return null;
+    try {
+      const response = await this.client.get<{
+        status?: string;
+        result?: string;
+        ticker?: string;
+        title?: string;
+        settlementMint?: string;
+        accounts?: Record<string, DFlowAccountInfo>;
+      }>(`/api/v1/market/by-mint/${outcomeMint}`);
+
+      const data = response.data;
+      if (!data) return null;
+
+      const settlementMint = data.settlementMint ?? SOLANA_USDC_MINT;
+      const usdcAccount = data.accounts?.[settlementMint] ?? data.accounts?.[SOLANA_USDC_MINT];
+
+      return {
+        status: data.status,
+        result: data.result,
+        redemptionStatus: usdcAccount?.redemptionStatus,
+        ticker: data.ticker,
+        title: data.title,
+        accounts: data.accounts,
+      };
+    } catch (error) {
+      if ((error as any)?.response?.status === 404) return null;
+      logger.warn({
+        message: 'DFlow getMarketByMint failed',
+        outcomeMint,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Check if an outcome mint is redeemable (market determined/finalized, redemption open, user holds winning outcome).
+   */
+  async isOutcomeRedeemable(outcomeMint: string): Promise<boolean> {
+    const market = await this.getMarketByMint(outcomeMint);
+    if (!market) return false;
+    if (market.status !== 'determined' && market.status !== 'finalized') return false;
+    if (market.redemptionStatus !== 'open') return false;
+
+    const usdcAccount = market.accounts?.[SOLANA_USDC_MINT];
+    if (!usdcAccount) return false;
+
+    const result = (market.result ?? '').toLowerCase();
+    if (result === 'yes' && usdcAccount.yesMint === outcomeMint) return true;
+    if (result === 'no' && usdcAccount.noMint === outcomeMint) return true;
+    if (result === '' && usdcAccount.scalarOutcomePct != null) return true; // Scalar: both redeemable
+
+    return false;
   }
 
   /**

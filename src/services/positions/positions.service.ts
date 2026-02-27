@@ -9,6 +9,11 @@ import { logger } from '../../config/logger';
 import { getUserByPrivyId } from '../privy/user.service';
 import { getAllLiveGamesFromCache } from '../polymarket/live-games.service';
 import {
+  getTokenPricesForPositions,
+  hasTokenPricesInCache,
+  setTokenPricesForPositions,
+} from '../polymarket/redis-games-cache.service';
+import {
   PolymarketPosition,
   UserPosition,
   PositionsQueryParams,
@@ -20,19 +25,47 @@ const POLYMARKET_DATA_API_URL = 'https://data-api.polymarket.com';
 /**
  * Build a price lookup map from our live games data
  * Maps clobTokenId -> { buyPrice, sellPrice }
- * 
+ *
  * buyPrice = best_ask (what you pay to BUY)
  * sellPrice = best_bid (what you GET when you SELL) - used for position valuation
- * 
+ *
+ * When assetIds is provided and token-prices cache is populated, uses fast HMGET path
+ * instead of slow getAllGamesFromCache (avoids ~5–10s delay).
  * Also returns a set of assets from ended games (these should not be enriched)
  */
-async function buildPriceLookupFromLiveGames(): Promise<{
+async function buildPriceLookupFromLiveGames(assetIds?: string[]): Promise<{
   priceMap: Map<string, { buyPrice: number; sellPrice: number }>;
   endedAssets: Set<string>;
 }> {
   const priceMap = new Map<string, { buyPrice: number; sellPrice: number }>();
   const endedAssets = new Set<string>();
-  
+
+  // Fast path: use token-prices cache when we have assetIds and cache is warm
+  // Only use cache when we get at least one hit — otherwise fall back to full scan
+  if (assetIds && assetIds.length > 0) {
+    try {
+      const cachePopulated = await hasTokenPricesInCache();
+      if (cachePopulated) {
+        const cached = await getTokenPricesForPositions(assetIds);
+        const hits = cached.priceMap.size + cached.endedAssets.size;
+        if (hits > 0) {
+          logger.debug({
+            message: 'Using token-prices cache for position enrichment',
+            assetCount: assetIds.length,
+            cacheHits: hits,
+          });
+          return cached;
+        }
+      }
+    } catch (err) {
+      logger.warn({
+        message: 'Token-prices cache read failed, falling back to full scan',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Full scan: fetch all games and build price map (also populates cache for next time)
   try {
     const games = await getAllLiveGamesFromCache();
     
@@ -97,7 +130,7 @@ async function buildPriceLookupFromLiveGames(): Promise<{
       error: error instanceof Error ? error.message : String(error),
     });
   }
-  
+
   return { priceMap, endedAssets };
 }
 
@@ -523,23 +556,51 @@ export async function fetchAndStorePositions(
     params
   );
 
-  // Enrich positions with real-time prices from our live games (CLOB WebSocket data)
-  // This replaces stale curPrice from Polymarket Data API with accurate prices
-  // Note: Ended games are excluded from enrichment to preserve Polymarket's settlement prices
-  const { priceMap, endedAssets } = await buildPriceLookupFromLiveGames();
-  const enrichedPositions = enrichPositionsWithLivePrices(polymarketPositions, priceMap, endedAssets);
+  let enrichedPositions: PolymarketPosition[];
 
-  // Log enrichment stats
-  const enrichedCount = enrichedPositions.filter((p, i) => 
-    p.curPrice !== polymarketPositions[i].curPrice
-  ).length;
-  if (enrichedCount > 0) {
-    logger.info({
-      message: 'Enriched positions with live prices',
-      privyUserId,
-      totalPositions: enrichedPositions.length,
-      enrichedWithLivePrices: enrichedCount,
-    });
+  if (polymarketPositions.length === 0) {
+    // No positions — skip expensive price lookup (Redis hgetall + DB query).
+    // Avoids ~5–10s delay when user has no positions.
+    enrichedPositions = [];
+  } else {
+    // Enrich positions with real-time prices from sports only.
+    // Crypto positions: frontend uses WebSocket for live prices — skip backend enrichment to speed up response.
+    const assetIds = polymarketPositions.map((p) => p.asset);
+    const sportsLookup = await buildPriceLookupFromLiveGames(assetIds);
+
+    const priceMap = sportsLookup.priceMap;
+    const endedAssets = sportsLookup.endedAssets;
+
+    enrichedPositions = enrichPositionsWithLivePrices(polymarketPositions, priceMap, endedAssets);
+
+    // Populate token-prices cache with merged sports+crypto so subsequent requests use fast path
+    const cacheUpdates = new Array<{ clobTokenId: string; buyPrice: number; sellPrice: number; isEnded: boolean }>();
+    for (const [clobTokenId, { buyPrice, sellPrice }] of priceMap) {
+      cacheUpdates.push({ clobTokenId, buyPrice: buyPrice * 100, sellPrice: sellPrice * 100, isEnded: false });
+    }
+    for (const clobTokenId of endedAssets) {
+      if (!priceMap.has(clobTokenId)) {
+        cacheUpdates.push({ clobTokenId, buyPrice: 0, sellPrice: 0, isEnded: true });
+      }
+    }
+    if (cacheUpdates.length > 0) {
+      setTokenPricesForPositions(cacheUpdates).catch((err) =>
+        logger.warn({ message: 'Failed to populate token-prices cache', error: err instanceof Error ? err.message : String(err) })
+      );
+    }
+
+    // Log enrichment stats
+    const enrichedCount = enrichedPositions.filter((p, i) =>
+      p.curPrice !== polymarketPositions[i].curPrice
+    ).length;
+    if (enrichedCount > 0) {
+      logger.info({
+        message: 'Enriched positions with live prices (sports only, crypto uses WebSocket)',
+        privyUserId,
+        totalPositions: enrichedPositions.length,
+        enrichedWithLivePrices: enrichedCount,
+      });
+    }
   }
 
   // Store enriched positions in database

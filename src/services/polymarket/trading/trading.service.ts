@@ -149,6 +149,7 @@ async function findMatchingClobTrade(
 
 /**
  * Update the trade record with actual fill data from CLOB (tx hash, price, size).
+ * Sets PARTIALLY_FILLED when actual fill < requested, with requestedSize in metadata for trade history.
  */
 async function applyFillData(
   matchingTrade: any,
@@ -172,6 +173,23 @@ async function applyFillData(
     updateData.size = actualFillSize.toFixed(18);
     updateData.costUsdc = actualCostUsdc.toFixed(18);
     updateData.feeAmount = actualFeeAmount.toFixed(18);
+
+    // Partial fill: actual < requested (tolerance 0.01 for float rounding)
+    const requestedSize = originalSize ? parseFloat(originalSize) : null;
+    const isPartialFill = requestedSize != null && actualFillSize < requestedSize - 0.01;
+
+    if (isPartialFill) {
+      updateData.status = 'PARTIALLY_FILLED';
+      updateData.metadata = { requestedSize: String(requestedSize) };
+      logger.info({
+        message: `📊 ${side || 'UNKNOWN'} trade PARTIALLY_FILLED — ${actualFillSize} of ${requestedSize}`,
+        privyUserId,
+        tradeId: tradeRecordId,
+        orderId,
+        actualFillSize,
+        requestedSize,
+      });
+    }
 
     logger.info({
       message: `📊 ${side || 'UNKNOWN'} trade updated with actual fill data`,
@@ -320,21 +338,11 @@ export async function executeTrade(
 ): Promise<CreateTradeResponse> {
   const { privyUserId, marketInfo, side, size, price } = request;
 
-  // Crypto markets: use GTC (limit) instead of FOK/FAK to avoid frequent "couldn't be fully filled" failures
+  // Crypto markets: use FOK first, FAK fallback (no GTC - avoids resting orders, partial fills visible in history)
   const isCryptoMarket = marketInfo.metadata?.category === 'crypto';
   const orderType = isCryptoMarket && (request.orderType === OrderType.FOK || request.orderType === OrderType.FAK)
-    ? OrderType.LIMIT
+    ? OrderType.FOK  // Always try FOK first for crypto; fall back to FAK on "couldn't be fully filled"
     : request.orderType;
-
-  if (isCryptoMarket && request.orderType !== orderType) {
-    logger.info({
-      message: 'Crypto market: overriding order type to GTC limit',
-      privyUserId,
-      originalOrderType: request.orderType,
-      effectiveOrderType: orderType,
-      marketId: marketInfo.marketId,
-    });
-  }
 
   // Timing tracking for performance analysis
   const tradeStartTime = Date.now();
@@ -560,7 +568,7 @@ export async function executeTrade(
             });
 
             // CLOB client returns error objects instead of throwing for HTTP 4xx/5xx.
-            // When FOK fails with "couldn't be fully filled", fallback to GTC before retrying/failing.
+            // When FOK fails with "couldn't be fully filled": crypto → FAK fallback, non-crypto → GTC fallback.
             const returnedErrorStatus = typeof orderResponse?.status === 'number' && orderResponse.status >= 400;
             const errorMsg = orderResponse?.error ?? orderResponse?.data?.error;
             const fokNotFilledReturned =
@@ -569,46 +577,75 @@ export async function executeTrade(
               errorMsg.includes('fully filled');
 
             if (fokNotFilledReturned && side === TradeSide.SELL) {
-              logger.info({
-                message: 'FOK sell insufficient liquidity (returned) — falling back to GTC limit order',
-                privyUserId,
-                price,
-                size,
-                attempt,
-              });
-
-              try {
-                orderResponse = await clobClient.createAndPostOrder({
-                  tokenID: marketInfo.clobTokenId,
-                  price: parseFloat(price),
-                  size: parseFloat(size),
-                  side: Side.SELL,
+              if (isCryptoMarket && orderType === OrderType.FOK) {
+                // Crypto: try FAK (fill what you can, cancel rest) — no resting orders
+                logger.info({
+                  message: 'Crypto: FOK sell insufficient liquidity — falling back to FAK',
+                  privyUserId,
+                  price,
+                  size,
+                  attempt,
                 });
 
+                orderResponse = await clobClient.createAndPostMarketOrder(
+                  marketOrderParams,
+                  {},
+                  ClobOrderType.FAK
+                );
+
                 logger.info({
-                  message: 'GTC limit sell order created (FOK fallback)',
+                  message: 'Crypto: FAK sell order created (FOK fallback)',
                   privyUserId,
                   orderId: orderResponse?.orderID,
                 });
 
-                // GTC can also return error object — throw so we don't retry unnecessarily
-                const gtcReturnedError =
-                  typeof orderResponse?.status === 'number' && orderResponse.status >= 400;
-                if (gtcReturnedError) {
-                  const gtcErrMsg =
-                    orderResponse?.error ??
-                    orderResponse?.data?.error ??
-                    `HTTP ${orderResponse.status}`;
-                  throw new Error(gtcErrMsg);
+                const fakReturnedError = typeof orderResponse?.status === 'number' && orderResponse.status >= 400;
+                if (fakReturnedError) {
+                  const fakErrMsg = orderResponse?.error ?? orderResponse?.data?.error ?? `HTTP ${orderResponse.status}`;
+                  throw new Error(fakErrMsg);
                 }
-              } catch (gtcError: any) {
-                logger.error({
-                  message: 'GTC fallback also failed',
+              } else if (!isCryptoMarket) {
+                // Non-crypto: GTC limit fallback (existing behavior)
+                logger.info({
+                  message: 'FOK sell insufficient liquidity (returned) — falling back to GTC limit order',
                   privyUserId,
-                  error: gtcError?.message,
+                  price,
+                  size,
+                  attempt,
                 });
-                lastError = gtcError;
-                throw gtcError;
+
+                try {
+                  orderResponse = await clobClient.createAndPostOrder({
+                    tokenID: marketInfo.clobTokenId,
+                    price: parseFloat(price),
+                    size: parseFloat(size),
+                    side: Side.SELL,
+                  });
+
+                  logger.info({
+                    message: 'GTC limit sell order created (FOK fallback)',
+                    privyUserId,
+                    orderId: orderResponse?.orderID,
+                  });
+
+                  const gtcReturnedError =
+                    typeof orderResponse?.status === 'number' && orderResponse.status >= 400;
+                  if (gtcReturnedError) {
+                    const gtcErrMsg =
+                      orderResponse?.error ??
+                      orderResponse?.data?.error ??
+                      `HTTP ${orderResponse.status}`;
+                    throw new Error(gtcErrMsg);
+                  }
+                } catch (gtcError: any) {
+                  logger.error({
+                    message: 'GTC fallback also failed',
+                    privyUserId,
+                    error: gtcError?.message,
+                  });
+                  lastError = gtcError;
+                  throw gtcError;
+                }
               }
             }
           } else {
@@ -671,54 +708,107 @@ export async function executeTrade(
         } catch (error: any) {
           lastError = error;
 
-          // FOK sell failed due to insufficient liquidity — fallback to GTC limit order
+          // FOK sell failed due to insufficient liquidity — crypto: FAK fallback, non-crypto: GTC fallback
           const fokNotFilled = error?.response?.status === 400 &&
             typeof error?.response?.data?.error === 'string' &&
             error.response.data.error.includes('fully filled');
 
           if (fokNotFilled && side === TradeSide.SELL && (orderType === OrderType.FOK || orderType === OrderType.FAK)) {
-            logger.info({
-              message: 'FOK sell insufficient liquidity — falling back to GTC limit order',
-              privyUserId,
-              price,
-              size,
-              attempt,
-            });
-
-            try {
-              orderResponse = await clobClient.createAndPostOrder({
-                tokenID: marketInfo.clobTokenId,
-                price: parseFloat(price),
-                size: parseFloat(size),
-                side: Side.SELL,
-              });
-
+            if (isCryptoMarket && orderType === OrderType.FOK) {
               logger.info({
-                message: 'GTC limit sell order created (FOK fallback)',
+                message: 'Crypto: FOK sell insufficient liquidity (thrown) — falling back to FAK',
                 privyUserId,
-                orderId: orderResponse?.orderID,
+                price,
+                size,
+                attempt,
               });
 
-              const gtcSuccess =
-                orderResponse?.orderID ||
-                (orderResponse?.status &&
-                  (typeof orderResponse.status !== 'number' || orderResponse.status < 400));
-              if (gtcSuccess) {
-                break;
+              try {
+                const marketOrderParams: any = {
+                  tokenID: marketInfo.clobTokenId,
+                  amount: parseFloat(size),
+                  side: Side.SELL,
+                };
+                if (price) {
+                  marketOrderParams.price = Math.max(0.01, Math.min(0.99, parseFloat(price)));
+                }
+                orderResponse = await clobClient.createAndPostMarketOrder(
+                  marketOrderParams,
+                  {},
+                  ClobOrderType.FAK
+                );
+
+                logger.info({
+                  message: 'Crypto: FAK sell order created (FOK fallback)',
+                  privyUserId,
+                  orderId: orderResponse?.orderID,
+                });
+
+                const fakSuccess =
+                  orderResponse?.orderID ||
+                  (orderResponse?.status &&
+                    (typeof orderResponse.status !== 'number' || orderResponse.status < 400));
+                if (fakSuccess) {
+                  break;
+                }
+                const fakErrMsg =
+                  orderResponse?.error ??
+                  orderResponse?.data?.error ??
+                  `HTTP ${orderResponse?.status ?? 'unknown'}`;
+                throw new Error(fakErrMsg);
+              } catch (fakError: any) {
+                logger.error({
+                  message: 'Crypto: FAK fallback also failed',
+                  privyUserId,
+                  error: fakError?.message,
+                });
+                lastError = fakError;
+                throw fakError;
               }
-              const gtcErrMsg =
-                orderResponse?.error ??
-                orderResponse?.data?.error ??
-                `HTTP ${orderResponse?.status ?? 'unknown'}`;
-              throw new Error(gtcErrMsg);
-            } catch (gtcError: any) {
-              logger.error({
-                message: 'GTC fallback also failed',
+            } else if (!isCryptoMarket) {
+              logger.info({
+                message: 'FOK sell insufficient liquidity — falling back to GTC limit order',
                 privyUserId,
-                error: gtcError?.message,
+                price,
+                size,
+                attempt,
               });
-              lastError = gtcError;
-              throw gtcError;
+
+              try {
+                orderResponse = await clobClient.createAndPostOrder({
+                  tokenID: marketInfo.clobTokenId,
+                  price: parseFloat(price),
+                  size: parseFloat(size),
+                  side: Side.SELL,
+                });
+
+                logger.info({
+                  message: 'GTC limit sell order created (FOK fallback)',
+                  privyUserId,
+                  orderId: orderResponse?.orderID,
+                });
+
+                const gtcSuccess =
+                  orderResponse?.orderID ||
+                  (orderResponse?.status &&
+                    (typeof orderResponse.status !== 'number' || orderResponse.status < 400));
+                if (gtcSuccess) {
+                  break;
+                }
+                const gtcErrMsg =
+                  orderResponse?.error ??
+                  orderResponse?.data?.error ??
+                  `HTTP ${orderResponse?.status ?? 'unknown'}`;
+                throw new Error(gtcErrMsg);
+              } catch (gtcError: any) {
+                logger.error({
+                  message: 'GTC fallback also failed',
+                  privyUserId,
+                  error: gtcError?.message,
+                });
+                lastError = gtcError;
+                throw gtcError;
+              }
             }
           }
 
@@ -850,7 +940,7 @@ export async function executeTrade(
         status: finalStatus,
         feeRate: FEE_CONFIG.RATE,
         feeAmount: feeAmount.toFixed(18),
-        feeStatus: finalStatus === 'FILLED' ? 'PENDING' : undefined, // Only charge fee if trade filled
+        feeStatus: (finalStatus === 'FILLED' || finalStatus === 'PARTIALLY_FILLED') ? 'PENDING' : undefined,
       });
 
       logger.info({

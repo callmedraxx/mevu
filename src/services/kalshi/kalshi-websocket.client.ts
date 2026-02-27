@@ -281,11 +281,11 @@ export class KalshiWebSocketClient extends EventEmitter {
       // Log first few messages of each type for debugging
       if (!this.messageTypesLogged.has(message.type)) {
         this.messageTypesLogged.add(message.type);
-        logger.info({
-          message: 'Kalshi WebSocket message type first seen',
-          type: message.type,
-          fullMessage: JSON.stringify(message).substring(0, 500),
-        });
+        // logger.info({
+        //   message: 'Kalshi WebSocket message type first seen',
+        //   type: message.type,
+        //   fullMessage: JSON.stringify(message).substring(0, 500),
+        // });
       }
       
       // Handle different message types
@@ -301,11 +301,11 @@ export class KalshiWebSocketClient extends EventEmitter {
         }
         this.emit('ticker', message as KalshiTickerMessage);
       } else if (message.type === 'subscribed') {
-        logger.info({
-          message: 'Kalshi subscription confirmed',
-          channels: message.msg?.channels,
-          tickerCount: message.msg?.market_tickers?.length,
-        });
+        // logger.info({
+        //   message: 'Kalshi subscription confirmed',
+        //   channels: message.msg?.channels,
+        //   tickerCount: message.msg?.market_tickers?.length,
+        // });
       } else if (message.type === 'error') {
         logger.error({
           message: 'Kalshi WebSocket error message',
@@ -481,11 +481,11 @@ export class KalshiWebSocketClient extends EventEmitter {
 
     this.emit('subscribed', newTickers);
     
-    logger.info({
-      message: 'Kalshi subscribed to markets',
-      newCount: newTickers.length,
-      totalSubscribed: this.subscribedTickers.size,
-    });
+    // logger.info({
+    //   message: 'Kalshi subscribed to markets',
+    //   newCount: newTickers.length,
+    //   totalSubscribed: this.subscribedTickers.size,
+    // });
   }
 
   /**

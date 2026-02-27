@@ -35,6 +35,7 @@ import { depositProgressService } from './services/privy/deposit-progress.servic
 import { kalshiService, kalshiPriceUpdateService } from './services/kalshi';
 import { registerOnGamesRefreshed } from './services/polymarket/live-games.service';
 import { cryptoMarketsService } from './services/crypto/crypto-markets.service';
+import { financeMarketsService } from './services/finance/finance-markets.service';
 import { cryptoClobPriceService } from './services/crypto/crypto-clob-price.service';
 import { cryptoOrderbookService } from './services/crypto/crypto-orderbook.service';
 import { cryptoMarketWebSocketService } from './services/crypto/crypto-market-websocket.service';
@@ -284,6 +285,10 @@ async function initializeSportsServices() {
     // Start crypto markets polling service (1h refresh)
     logger.info({ message: 'Starting crypto markets service...' });
     cryptoMarketsService.start();
+
+    // Start finance markets polling service (1h refresh)
+    logger.info({ message: 'Starting finance markets service...' });
+    financeMarketsService.start();
 
     // Start sports WebSocket for live game score updates
     logger.info({ message: 'Starting sports WebSocket service...' });

@@ -176,7 +176,33 @@ export async function registerUserAndDeployWallet(
       userId: existingUser.id,
       username: existingUser.username,
       hasProxyWallet: !!existingUser.proxyWalletAddress,
+      hasSolanaWallet: !!existingUser.solanaWalletAddress,
     });
+
+    // Ensure Solana wallet exists for Kalshi trading (backfill during onboarding for users created before Solana support)
+    if (!existingUser.solanaWalletAddress) {
+      try {
+        const { privyService } = await import('./privy.service');
+        const solanaResult = await privyService.createSolanaEmbeddedWallet(privyUserId);
+        const { updateUserSolanaWallet } = await import('./kalshi-user.service');
+        await updateUserSolanaWallet(privyUserId, solanaResult.address, solanaResult.walletId);
+        existingUser.solanaWalletAddress = solanaResult.address;
+        existingUser.solanaWalletId = solanaResult.walletId;
+        const { addSolanaAddressToWebhook } = await import('../alchemy/alchemy-solana-webhook-addresses');
+        addSolanaAddressToWebhook(solanaResult.address).catch(() => {});
+        logger.info({
+          message: 'Solana wallet created and saved for existing user during onboarding',
+          privyUserId,
+          solanaWalletAddress: solanaResult.address,
+        });
+      } catch (solanaErr) {
+        logger.warn({
+          message: 'Failed to create Solana wallet for existing user — can be retried via /api/users/create-solana-wallet',
+          privyUserId,
+          error: solanaErr instanceof Error ? solanaErr.message : String(solanaErr),
+        });
+      }
+    }
 
     // If user has proxy wallet, return it
     if (existingUser.proxyWalletAddress) {

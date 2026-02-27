@@ -1,6 +1,7 @@
 /**
  * Solana Wallet Service
- * Manages Privy Solana embedded wallets for US/Kalshi users
+ * Manages Privy Solana embedded wallets for US/Kalshi users.
+ * Creates solana_wallet_address (base58) — distinct from proxy_wallet and embedded_wallet (EVM/0x).
  */
 
 import { logger } from '../../config/logger';
@@ -35,7 +36,7 @@ export async function createSolanaWallet(
       throw new Error('Privy returned wallet without address');
     }
 
-    await updateUserSolanaWallet(privyUserId, wallet.address);
+    await updateUserSolanaWallet(privyUserId, wallet.address, wallet.id);
 
     const { addSolanaAddressToWebhook } = await import('../alchemy/alchemy-solana-webhook-addresses');
     addSolanaAddressToWebhook(wallet.address).catch(() => {});

@@ -254,6 +254,112 @@ export async function getCryptoTrades(slug: string, limit: number = 100): Promis
   }
 }
 
+// ─── Finance: Get Market Meta from finance_markets table ───
+
+async function getFinanceMarketMeta(slug: string): Promise<CryptoMarketMeta | null> {
+  const dbConfig = getDatabaseConfig();
+  if (dbConfig.type !== 'postgres') return null;
+
+  const client = await pool.connect();
+  try {
+    const r = await client.query(
+      `SELECT id, markets->0->>'conditionId' AS condition_id,
+              markets->0->'outcomes' AS outcomes,
+              markets->0->'outcomePrices' AS outcome_prices,
+              markets->0->'clobTokenIds' AS clob_token_ids,
+              markets->0->>'question' AS question
+       FROM finance_markets WHERE LOWER(slug) = $1 LIMIT 1`,
+      [slug.toLowerCase()]
+    );
+    if (r.rows.length === 0) return null;
+    const row = r.rows[0];
+    return {
+      id: row.id,
+      conditionId: row.condition_id || '',
+      outcomes: Array.isArray(row.outcomes) ? row.outcomes : ['Yes', 'No'],
+      outcomePrices: Array.isArray(row.outcome_prices) ? row.outcome_prices : [],
+      clobTokenIds: Array.isArray(row.clob_token_ids) ? row.clob_token_ids : [],
+      question: row.question || '',
+    };
+  } finally {
+    client.release();
+  }
+}
+
+// ─── Public: Get Finance Trades ───
+
+export async function getFinanceTrades(slug: string, limit: number = 100): Promise<{ trades: CryptoTrade[]; count: number } | null> {
+  const meta = await getFinanceMarketMeta(slug);
+  if (!meta || !meta.conditionId) return null;
+
+  const dbConfig = getDatabaseConfig();
+  if (dbConfig.type !== 'postgres') return { trades: [], count: 0 };
+
+  const client = await pool.connect();
+  try {
+    const needsFetch = await shouldFetchFromPolymarket(client, meta.id, 'trades');
+
+    if (needsFetch) {
+      const rawTrades = await fetchTradesFromPolymarket(meta.conditionId);
+
+      if (rawTrades.length > 0) {
+        const values: any[] = [];
+        const placeholders: string[] = [];
+        let idx = 1;
+        for (const t of rawTrades) {
+          placeholders.push(`($${idx}, $${idx+1}, $${idx+2}, $${idx+3}, $${idx+4}, $${idx+5}, $${idx+6}, $${idx+7}, $${idx+8}, $${idx+9}, $${idx+10})`);
+          values.push(
+            meta.id, meta.conditionId, t.proxyWallet || '', t.side,
+            t.size, t.price, t.outcome || '', t.outcomeIndex ?? null,
+            t.timestamp, t.transactionHash || '', t.name || null
+          );
+          idx += 11;
+        }
+
+        await client.query(
+          `INSERT INTO crypto_trades (crypto_market_id, condition_id, proxy_wallet, side, size, price, outcome, outcome_index, timestamp, transaction_hash, name)
+           VALUES ${placeholders.join(', ')}
+           ON CONFLICT (transaction_hash) WHERE transaction_hash IS NOT NULL AND transaction_hash != '' DO NOTHING`,
+          values
+        );
+
+        await markFetched(client, meta.id, 'trades');
+      }
+    }
+
+    const r = await client.query(
+      `SELECT id, side, size, price, outcome, proxy_wallet, timestamp
+       FROM crypto_trades
+       WHERE crypto_market_id = $1
+       ORDER BY timestamp DESC
+       LIMIT $2`,
+      [meta.id, limit]
+    );
+
+    const trades: CryptoTrade[] = r.rows.map((row: any) => ({
+      id: row.id,
+      side: row.side === 'BUY' ? 'Buy' as const : 'Sell' as const,
+      amount: Number((row.size * row.price).toFixed(2)),
+      shares: Number(row.size),
+      price: Math.round(row.price * 100),
+      outcome: row.outcome || '',
+      trader: row.proxy_wallet || '',
+      time: new Date(row.timestamp * 1000).toISOString(),
+    }));
+
+    return { trades, count: trades.length };
+  } catch (err) {
+    logger.error({
+      message: 'Error in getFinanceTrades',
+      slug,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { trades: [], count: 0 };
+  } finally {
+    client.release();
+  }
+}
+
 // ─── Public: Get Holders ───
 
 export async function getCryptoHolders(slug: string): Promise<{ holders: CryptoHolder[]; count: number } | null> {
@@ -445,6 +551,190 @@ export async function getCryptoWhales(slug: string, limit: number = 100): Promis
     return { trades: [], count: 0 };
   } finally {
     // client may already be released if needsFetch was true
+    try { client.release(); } catch {}
+  }
+}
+
+// ─── Public: Get Finance Holders ───
+
+export async function getFinanceHolders(slug: string): Promise<{ holders: CryptoHolder[]; count: number } | null> {
+  const meta = await getFinanceMarketMeta(slug);
+  if (!meta || !meta.conditionId) return null;
+
+  const dbConfig = getDatabaseConfig();
+  if (dbConfig.type !== 'postgres') return { holders: [], count: 0 };
+
+  const tokenToLabel = new Map<string, string>();
+  meta.clobTokenIds.forEach((tid, idx) => {
+    tokenToLabel.set(tid, meta.outcomes[idx] || `Outcome ${idx}`);
+  });
+
+  const client = await pool.connect();
+  try {
+    const needsFetch = await shouldFetchFromPolymarket(client, meta.id, 'holders');
+
+    if (needsFetch) {
+      const rawHolders = await fetchHoldersFromPolymarket(meta.conditionId);
+
+      if (rawHolders.length > 0) {
+        const allHolders: { token: string; h: any }[] = [];
+        for (const resp of rawHolders) {
+          for (const h of resp.holders || []) {
+            allHolders.push({ token: resp.token, h });
+          }
+        }
+
+        if (allHolders.length > 0) {
+          await client.query('DELETE FROM crypto_holders WHERE crypto_market_id = $1', [meta.id]);
+
+          const values: any[] = [];
+          const placeholders: string[] = [];
+          let idx = 1;
+          for (const { token, h } of allHolders) {
+            placeholders.push(`($${idx}, $${idx+1}, $${idx+2}, $${idx+3}, $${idx+4}, $${idx+5}, $${idx+6}, $${idx+7}, $${idx+8}, $${idx+9})`);
+            values.push(
+              meta.id, meta.conditionId, token, h.proxyWallet || '',
+              h.asset || '', h.amount || 0, h.outcomeIndex ?? null,
+              h.name || null, h.pseudonym || null, h.verified || false
+            );
+            idx += 10;
+          }
+
+          await client.query(
+            `INSERT INTO crypto_holders (crypto_market_id, condition_id, token, proxy_wallet, asset, amount, outcome_index, name, pseudonym, verified)
+             VALUES ${placeholders.join(', ')}`,
+            values
+          );
+
+          await markFetched(client, meta.id, 'holders');
+        }
+      }
+    }
+
+    const r = await client.query(
+      `SELECT proxy_wallet, asset, amount, outcome_index
+       FROM crypto_holders
+       WHERE crypto_market_id = $1
+       ORDER BY amount DESC`,
+      [meta.id]
+    );
+
+    const walletMap = new Map<string, { totalAmount: number; assets: { assetId: string; shortLabel: string; question: string; amount: number }[] }>();
+    for (const row of r.rows) {
+      const wallet = row.proxy_wallet;
+      if (!walletMap.has(wallet)) {
+        walletMap.set(wallet, { totalAmount: 0, assets: [] });
+      }
+      const entry = walletMap.get(wallet)!;
+      const amount = Number(row.amount);
+      const dollarAmount = amount * (meta.outcomePrices[row.outcome_index] ? parseFloat(meta.outcomePrices[row.outcome_index]) : 0.5);
+      entry.totalAmount += dollarAmount;
+      const label = tokenToLabel.get(row.asset) || meta.outcomes[row.outcome_index] || 'Unknown';
+      entry.assets.push({
+        assetId: row.asset || '',
+        shortLabel: label,
+        question: meta.question,
+        amount: dollarAmount,
+      });
+    }
+
+    const sorted = [...walletMap.entries()]
+      .sort(([, a], [, b]) => b.totalAmount - a.totalAmount)
+      .slice(0, 50);
+
+    const holders: CryptoHolder[] = sorted.map(([wallet, data], idx) => ({
+      id: `${meta.id}-${wallet.slice(0, 8)}`,
+      rank: idx + 1,
+      wallet,
+      totalAmount: Number(data.totalAmount.toFixed(2)),
+      assets: data.assets,
+    }));
+
+    return { holders, count: holders.length };
+  } catch (err) {
+    logger.error({
+      message: 'Error in getFinanceHolders',
+      slug,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { holders: [], count: 0 };
+  } finally {
+    client.release();
+  }
+}
+
+// ─── Public: Get Finance Whale Trades (trades >= $1000) ───
+
+export async function getFinanceWhales(slug: string, limit: number = 100): Promise<{ trades: CryptoTrade[]; count: number } | null> {
+  const meta = await getFinanceMarketMeta(slug);
+  if (!meta || !meta.conditionId) return null;
+
+  const dbConfig = getDatabaseConfig();
+  if (dbConfig.type !== 'postgres') return { trades: [], count: 0 };
+
+  const client = await pool.connect();
+  try {
+    const needsFetch = await shouldFetchFromPolymarket(client, meta.id, 'trades');
+    if (needsFetch) {
+      client.release();
+      await getFinanceTrades(slug, 500);
+      const client2 = await pool.connect();
+      try {
+        const r = await client2.query(
+          `SELECT id, side, size, price, outcome, proxy_wallet, timestamp
+           FROM crypto_trades
+           WHERE crypto_market_id = $1 AND (size * price) >= 1000
+           ORDER BY timestamp DESC
+           LIMIT $2`,
+          [meta.id, limit]
+        );
+
+        const trades: CryptoTrade[] = r.rows.map((row: any) => ({
+          id: row.id,
+          side: row.side === 'BUY' ? 'Buy' as const : 'Sell' as const,
+          amount: Number((row.size * row.price).toFixed(2)),
+          shares: Number(row.size),
+          price: Math.round(row.price * 100),
+          outcome: row.outcome || '',
+          trader: row.proxy_wallet || '',
+          time: new Date(row.timestamp * 1000).toISOString(),
+        }));
+
+        return { trades, count: trades.length };
+      } finally {
+        client2.release();
+      }
+    }
+
+    const r = await client.query(
+      `SELECT id, side, size, price, outcome, proxy_wallet, timestamp
+       FROM crypto_trades
+       WHERE crypto_market_id = $1 AND (size * price) >= 1000
+       ORDER BY timestamp DESC
+       LIMIT $2`,
+      [meta.id, limit]
+    );
+
+    const trades: CryptoTrade[] = r.rows.map((row: any) => ({
+      id: row.id,
+      side: row.side === 'BUY' ? 'Buy' as const : 'Sell' as const,
+      amount: Number((row.size * row.price).toFixed(2)),
+      shares: Number(row.size),
+      price: Math.round(row.price * 100),
+      outcome: row.outcome || '',
+      trader: row.proxy_wallet || '',
+      time: new Date(row.timestamp * 1000).toISOString(),
+    }));
+
+    return { trades, count: trades.length };
+  } catch (err) {
+    logger.error({
+      message: 'Error in getFinanceWhales',
+      slug,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { trades: [], count: 0 };
+  } finally {
     try { client.release(); } catch {}
   }
 }

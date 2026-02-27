@@ -5,10 +5,9 @@
  * Handles Polymarket CLOB `book` events (full bids/asks arrays) for the orderbook widget.
  * Tokens are registered on-demand via Redis (crypto:orderbook:subscribe).
  *
- * Deduplication: addAssets() checks pendingSubscriptions, so a token already subscribed
- * (e.g. for crypto price updates) will NOT trigger a second CLOB subscription message.
- * Both this service and cryptoClobPriceService register independent callbacks on the
- * shared clobWebSocketService, so each gets all messages and filters for its type.
+ * CLOB WS subscription is managed centrally by subscribeToAllGames() which includes
+ * all active crypto tokens. This service only registers tokens in a local routing set
+ * so incoming book events are forwarded to the correct Redis channel.
  */
 
 import { logger } from '../../config/logger';
@@ -76,10 +75,8 @@ export class CryptoOrderbookService {
   }
 
   /**
-   * Register a clobTokenId for orderbook event routing.
-   * Calls addAssets() which deduplicates at the CLOB WS level — if the token is
-   * already subscribed (for price updates or a prior orderbook request), no
-   * duplicate CLOB subscription message is sent.
+   * Register a clobTokenId for orderbook event routing (local map only).
+   * The token is already subscribed on the CLOB WS via subscribeToAllGames().
    */
   private registerToken(clobTokenId: string): void {
     if (!clobTokenId) return;
@@ -87,17 +84,13 @@ export class CryptoOrderbookService {
     const isNew = !this.registeredTokens.has(clobTokenId);
     this.registeredTokens.add(clobTokenId);
 
-    // addAssets() internally checks pendingSubscriptions — safe to call even if
-    // the token was already subscribed by cryptoClobPriceService.
     if (isNew) {
-      clobWebSocketService.addAssets([clobTokenId]);
       logger.info({
-        message: 'Crypto orderbook: registered token',
+        message: 'Crypto orderbook: registered token for routing',
         clobTokenId: clobTokenId.substring(0, 20) + '...',
         totalOrderbookTokens: this.registeredTokens.size,
       });
     }
-    // If not new, the token is already subscribed and events already flow — no-op.
   }
 
   getStatus() {

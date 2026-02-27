@@ -1,50 +1,35 @@
 /**
- * Crypto Markets Service
- * Fetches all crypto events from Polymarket Gamma API, transforms to SSR-compatible format,
- * and bulk upserts into the crypto_markets table. Auto-refreshes every 1 hour.
+ * Finance Markets Service
+ * Fetches all finance events from Polymarket Gamma API (tag_id=120), transforms to SSR-compatible format,
+ * and bulk upserts into the finance_markets table. Auto-refreshes every 1 hour.
+ * Reuses the same transformation logic as crypto markets.
  */
 
 import { pool } from '../../config/database';
 import { logger } from '../../config/logger';
 import { polymarketClient } from '../polymarket/polymarket.client';
-import { setCryptoRefreshInProgress, clearCryptoRefreshInProgress } from '../polymarket/redis-games-cache.service';
+import { transformMarketToSSR } from '../crypto/crypto-markets.service';
 
-// Gamma API tag ID for "Crypto"
-const CRYPTO_TAG_ID = 21;
+// Gamma API tag ID for "Finance"
+const FINANCE_TAG_ID = 120;
 const PAGE_LIMIT = 100;
-const REFRESH_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const BATCH_SIZE = 500;
 
-// Known timeframe tag slugs for categorization
+// Known timeframe tag slugs for finance categorization
 const TIMEFRAME_TAGS = new Set([
-  '5M', '15M', '1H', '4h', 'daily', 'weekly', 'monthly', 'yearly', 'pre-market', 'etf',
+  'daily', 'weekly', 'monthly', 'yearly',
 ]);
 
-// Known asset tag slugs for categorization
+// Known asset/category tag slugs for finance categorization
 const ASSET_TAGS = new Set([
-  'bitcoin', 'ethereum', 'solana', 'xrp', 'dogecoin', 'microstrategy',
-  'cardano', 'chainlink', 'polkadot', 'avalanche', 'polygon', 'litecoin',
-  'uniswap', 'aave', 'sui', 'pepe', 'shiba-inu', 'tron', 'stellar',
-  'hedera', 'near', 'aptos', 'arbitrum', 'optimism', 'cosmos',
-  'filecoin', 'render', 'injective', 'bonk', 'floki', 'wif',
-  'trump', 'melania', 'fartcoin', 'ai16z', 'virtual', 'griffain',
+  'stocks', 'earnings', 'indicies', 'indices', 'commodities', 'forex',
+  'collectibles', 'acquisitions', 'earnings-calls', 'ipos', 'ipo',
+  'fed-rates', 'prediction-markets', 'treasuries', 'treasures',
+  'tech', 'big-tech', 'economy',
 ]);
 
-// Null fields present in SSR but not in Gamma API
-const SSR_NULL_FIELDS = {
-  amm_type: null,
-  denomination_token: null,
-  lower_bound: null,
-  lower_bound_date: null,
-  market_type: null,
-  upper_bound: null,
-  upper_bound_date: null,
-  wide_format: null,
-  x_axis_value: null,
-  y_axis_value: null,
-};
-
-// Types
+// Types (same as crypto)
 interface GammaTag {
   id: string;
   label: string;
@@ -57,9 +42,9 @@ interface GammaMarket {
   question: string;
   conditionId: string;
   slug: string;
-  outcomes: string; // JSON string
-  outcomePrices: string; // JSON string
-  clobTokenIds: string; // JSON string
+  outcomes: string;
+  outcomePrices: string;
+  clobTokenIds: string;
   [key: string]: any;
 }
 
@@ -104,13 +89,7 @@ interface GammaEvent {
   [key: string]: any;
 }
 
-interface GammaPaginationResponse {
-  data: GammaEvent[];
-  count?: number;
-  next_cursor?: string;
-}
-
-interface CryptoMarketRow {
+interface FinanceMarketRow {
   id: string;
   ticker: string;
   slug: string;
@@ -156,11 +135,10 @@ interface CryptoMarketRow {
   opening_price: number | null;
 }
 
-// Column count for parameterized insert
 const COLUMN_COUNT = 43;
 
 const INSERT_QUERY = `
-  INSERT INTO crypto_markets (
+  INSERT INTO finance_markets (
     id, ticker, slug, title, description, resolution_source,
     start_date, end_date, image, image_raw, icon,
     active, closed, archived, new, featured, restricted,
@@ -195,63 +173,22 @@ const INSERT_QUERY = `
     timeframe = EXCLUDED.timeframe, asset = EXCLUDED.asset, tags = EXCLUDED.tags,
     markets = EXCLUDED.markets, series = EXCLUDED.series,
     tags_data = EXCLUDED.tags_data, raw_data = EXCLUDED.raw_data,
-    opening_price = COALESCE(crypto_markets.opening_price, EXCLUDED.opening_price),
-    price_high = COALESCE(crypto_markets.price_high, EXCLUDED.price_high),
-    price_low = COALESCE(crypto_markets.price_low, EXCLUDED.price_low),
-    odds_high = COALESCE(crypto_markets.odds_high, EXCLUDED.odds_high),
-    odds_low = COALESCE(crypto_markets.odds_low, EXCLUDED.odds_low),
+    opening_price = COALESCE(finance_markets.opening_price, EXCLUDED.opening_price),
+    price_high = COALESCE(finance_markets.price_high, EXCLUDED.price_high),
+    price_low = COALESCE(finance_markets.price_low, EXCLUDED.price_low),
+    odds_high = COALESCE(finance_markets.odds_high, EXCLUDED.odds_high),
+    odds_low = COALESCE(finance_markets.odds_low, EXCLUDED.odds_low),
     updated_at = CURRENT_TIMESTAMP
 `;
 
-/**
- * Transform a Gamma market object to SSR-compatible format.
- * Parses JSON string fields (outcomes, outcomePrices, clobTokenIds) into arrays
- * and adds snake_case aliases + null SSR fields.
- */
-export function transformMarketToSSR(market: GammaMarket): any {
-  const transformed: any = { ...market };
-
-  // Parse JSON string fields into arrays
-  for (const field of ['outcomes', 'outcomePrices', 'clobTokenIds']) {
-    if (typeof transformed[field] === 'string') {
-      try {
-        transformed[field] = JSON.parse(transformed[field]);
-      } catch {
-        // Keep as-is if parse fails
-      }
-    }
-  }
-
-  // Add snake_case aliases
-  transformed.created_at = market.createdAt ?? null;
-  transformed.end_date = market.endDate ?? null;
-  transformed.resolution_source = market.resolutionSource ?? null;
-  transformed.updated_at = market.updatedAt ?? null;
-  transformed.liquidity_num = market.liquidityNum ?? null;
-  transformed.volume_num = market.volumeNum ?? null;
-  transformed.closed_time = market.closedTime ?? null;
-  transformed.resolved_by = market.resolvedBy ?? null;
-
-  // Add null fields present in SSR but not Gamma
-  Object.assign(transformed, SSR_NULL_FIELDS);
-
-  return transformed;
-}
-
-/**
- * Extract timeframe from event tags
- */
 function extractTimeframe(tags: GammaTag[]): string | null {
   for (const tag of tags) {
     if (TIMEFRAME_TAGS.has(tag.slug)) return tag.slug;
-    if (TIMEFRAME_TAGS.has(tag.label)) return tag.label;
+    if (TIMEFRAME_TAGS.has(tag.label?.toLowerCase())) return tag.label.toLowerCase();
   }
   return null;
 }
 
-/**
- * Extract asset from event tags
- */
 function extractAsset(tags: GammaTag[]): string | null {
   for (const tag of tags) {
     if (ASSET_TAGS.has(tag.slug)) return tag.slug;
@@ -259,16 +196,12 @@ function extractAsset(tags: GammaTag[]): string | null {
   return null;
 }
 
-/**
- * Transform a Gamma event to a CryptoMarketRow for database storage
- */
-export function transformToSSRFormat(event: GammaEvent): CryptoMarketRow {
+export function transformToFinanceRow(event: GammaEvent): FinanceMarketRow {
   const tags = event.tags || [];
   const tagSlugs = tags.map(t => t.slug);
   const timeframe = extractTimeframe(tags);
   const asset = extractAsset(tags);
 
-  // Transform markets to SSR format
   const markets = (event.markets || []).map(transformMarketToSSR);
 
   return {
@@ -318,10 +251,7 @@ export function transformToSSRFormat(event: GammaEvent): CryptoMarketRow {
   };
 }
 
-/**
- * Fetch all crypto events from Gamma API with pagination
- */
-export async function fetchAllCryptoEvents(): Promise<GammaEvent[]> {
+async function fetchAllFinanceEvents(): Promise<GammaEvent[]> {
   const allEvents: GammaEvent[] = [];
   let offset = 0;
   let hasMore = true;
@@ -330,7 +260,7 @@ export async function fetchAllCryptoEvents(): Promise<GammaEvent[]> {
     const response = await polymarketClient.get<{ data?: GammaEvent[] } | GammaEvent[]>(
       '/events/pagination',
       {
-        tag_id: CRYPTO_TAG_ID,
+        tag_id: FINANCE_TAG_ID,
         active: true,
         closed: false,
         limit: PAGE_LIMIT,
@@ -340,7 +270,6 @@ export async function fetchAllCryptoEvents(): Promise<GammaEvent[]> {
       },
     );
 
-    // Gamma API returns { data: [...] } for /events/pagination
     const raw = response as { data?: GammaEvent[] } | GammaEvent[];
     const events: GammaEvent[] = Array.isArray(raw) ? raw : (Array.isArray(raw?.data) ? raw.data : []);
 
@@ -349,8 +278,6 @@ export async function fetchAllCryptoEvents(): Promise<GammaEvent[]> {
     } else {
       allEvents.push(...events);
       offset += PAGE_LIMIT;
-
-      // Safety: if we got less than PAGE_LIMIT, we've reached the end
       if (events.length < PAGE_LIMIT) {
         hasMore = false;
       }
@@ -360,19 +287,13 @@ export async function fetchAllCryptoEvents(): Promise<GammaEvent[]> {
   return allEvents;
 }
 
-/**
- * Bulk upsert crypto market rows into the database.
- * Deduplicates by id to avoid "ON CONFLICT DO UPDATE cannot affect row a second time" when Gamma returns same event multiple times.
- */
-export async function storeCryptoMarketsInDatabase(rows: CryptoMarketRow[]): Promise<void> {
+async function storeFinanceMarketsInDatabase(rows: FinanceMarketRow[]): Promise<void> {
   if (rows.length === 0) return;
 
-  // Dedupe by id (last occurrence wins) - Gamma can return same event in multiple pages
-  const byId = new Map<string, CryptoMarketRow>();
+  const byId = new Map<string, FinanceMarketRow>();
   for (const row of rows) {
     byId.set(row.id, row);
   }
-  // Sort by id so all writers acquire row locks in same order (reduces deadlock risk)
   const deduped = Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
 
   const batches: { values: any[]; placeholders: string }[] = [];
@@ -385,11 +306,9 @@ export async function storeCryptoMarketsInDatabase(rows: CryptoMarketRow[]): Pro
 
     for (const row of batch) {
       const rowPlaceholders: string[] = [];
-
       for (let j = 0; j < COLUMN_COUNT; j++) {
         rowPlaceholders.push(`$${paramIndex++}`);
       }
-      // created_at and updated_at use CURRENT_TIMESTAMP
       rowPlaceholders.push('CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP');
       placeholderRows.push(`(${rowPlaceholders.join(', ')})`);
 
@@ -422,12 +341,10 @@ export async function storeCryptoMarketsInDatabase(rows: CryptoMarketRow[]): Pro
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-
       for (const { values, placeholders } of batches) {
         const query = INSERT_QUERY.replace('%PLACEHOLDERS%', placeholders);
         await client.query(query, values);
       }
-
       await client.query('COMMIT');
       return;
     } catch (error) {
@@ -437,7 +354,7 @@ export async function storeCryptoMarketsInDatabase(rows: CryptoMarketRow[]): Pro
       if (isDeadlock && attempt < maxRetries - 1) {
         const delayMs = 100 * Math.pow(2, attempt);
         logger.warn({
-          message: 'Crypto markets store deadlock, retrying',
+          message: 'Finance markets store deadlock, retrying',
           attempt: attempt + 1,
           maxRetries,
           delayMs,
@@ -451,44 +368,23 @@ export async function storeCryptoMarketsInDatabase(rows: CryptoMarketRow[]): Pro
     }
   }
 
-  throw lastError || new Error('Failed to store crypto markets');
+  throw lastError || new Error('Failed to store finance markets');
 }
 
-/**
- * Fetch, transform, and store all crypto markets
- */
-export async function refreshCryptoMarkets(): Promise<void> {
+async function refreshFinanceMarkets(): Promise<void> {
   try {
-    //logger.info({ message: 'Refreshing crypto markets from Gamma API...' });
-
-    const events = await fetchAllCryptoEvents();
-    //logger.info({ message: 'Fetched crypto events from Gamma API', count: events.length });
+    const events = await fetchAllFinanceEvents();
 
     if (events.length === 0) {
-      //logger.warn({ message: 'No crypto events fetched from Gamma API' });
       return;
     }
 
-    const rows = events.map(transformToSSRFormat);
-    await setCryptoRefreshInProgress();
-    try {
-      await storeCryptoMarketsInDatabase(rows);
-      lastRefreshAt = new Date();
-    } finally {
-      await clearCryptoRefreshInProgress();
-    }
-
-    // Notify CLOB price service to re-subscribe with updated crypto tokens
-    try {
-      const { notifyGamesRefreshed } = await import('../polymarket/live-games.service');
-      notifyGamesRefreshed();
-    } catch {
-      // Non-critical — tokens will be picked up on next sports refresh
-    }
-    //logger.info({ message: 'Crypto markets refresh complete', count: rows.length });
+    const rows = events.map(transformToFinanceRow);
+    await storeFinanceMarketsInDatabase(rows);
+    lastRefreshAt = new Date();
   } catch (error) {
     logger.error({
-      message: 'Failed to refresh crypto markets',
+      message: 'Failed to refresh finance markets',
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined,
     });
@@ -499,10 +395,7 @@ export async function refreshCryptoMarkets(): Promise<void> {
 let refreshInterval: NodeJS.Timeout | null = null;
 let lastRefreshAt: Date | null = null;
 
-/**
- * Get crypto markets count from DB and service status
- */
-export async function getCryptoMarketsStatus(): Promise<{
+async function getFinanceMarketsStatus(): Promise<{
   count: number;
   lastRefreshAt: string | null;
   refreshIntervalMs: number;
@@ -515,7 +408,7 @@ export async function getCryptoMarketsStatus(): Promise<{
   const client = await pool.connect();
   try {
     const r = await client.query(
-      `SELECT COUNT(*) as c FROM crypto_markets WHERE active = true AND closed = false`
+      `SELECT COUNT(*) as c FROM finance_markets WHERE active = true AND closed = false`
     );
     const count = parseInt(r.rows[0]?.c ?? '0', 10);
     return {
@@ -528,45 +421,36 @@ export async function getCryptoMarketsStatus(): Promise<{
   }
 }
 
-/**
- * Start the crypto markets polling service
- */
 function start(): void {
-  logger.info({ message: 'Starting crypto markets service (1h refresh interval)' });
+  logger.info({ message: 'Starting finance markets service (4h refresh interval)' });
 
-  // Initial fetch (non-blocking)
-  refreshCryptoMarkets().catch(err => {
+  refreshFinanceMarkets().catch(err => {
     logger.warn({
-      message: 'Initial crypto markets fetch failed',
+      message: 'Initial finance markets fetch failed',
       error: err instanceof Error ? err.message : String(err),
     });
   });
 
-  // Schedule periodic refresh
   refreshInterval = setInterval(() => {
-    refreshCryptoMarkets().catch(err => {
+    refreshFinanceMarkets().catch(err => {
       logger.error({
-        message: 'Scheduled crypto markets refresh failed',
+        message: 'Scheduled finance markets refresh failed',
         error: err instanceof Error ? err.message : String(err),
       });
     });
   }, REFRESH_INTERVAL_MS);
 }
 
-/**
- * Stop the crypto markets polling service
- */
 function stop(): void {
   if (refreshInterval) {
     clearInterval(refreshInterval);
     refreshInterval = null;
-    //logger.info({ message: 'Crypto markets service stopped' });
   }
 }
 
-export const cryptoMarketsService = {
+export const financeMarketsService = {
   start,
   stop,
-  refreshCryptoMarkets,
-  getCryptoMarketsStatus,
+  refreshFinanceMarkets,
+  getFinanceMarketsStatus,
 };

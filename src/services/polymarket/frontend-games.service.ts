@@ -20,6 +20,12 @@ const CACHE_TTL_MS = 5000; // 5 seconds
 const MAX_GAMES_LIMIT = 1000; // Maximum games to return per query
 
 /**
+ * Request coalescing: when many concurrent requests hit games/frontend with the same
+ * query params (not user-specific), only one fetches from DB; others wait for that result.
+ */
+const inFlightFrontendGamesRequests = new Map<string, Promise<PaginatedGamesResult>>();
+
+/**
  * Compute sort_timestamp for chronological ordering: date from slug + time from endDate.
  * Games are ordered by when they're played (soonest first).
  */
@@ -632,6 +638,35 @@ export async function getFrontendGamesFromDatabase(options: {
     };
   }
 
+  // Request coalescing: identical concurrent requests share one DB fetch
+  const existingInFlight = inFlightFrontendGamesRequests.get(cacheKey);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const fetchPromise = doGetFrontendGamesFromDatabase(options, cacheKey);
+  inFlightFrontendGamesRequests.set(cacheKey, fetchPromise);
+  try {
+    return await fetchPromise;
+  } finally {
+    inFlightFrontendGamesRequests.delete(cacheKey);
+  }
+}
+
+async function doGetFrontendGamesFromDatabase(
+  options: {
+    sport?: string | null;
+    live?: 'true' | 'false' | null;
+    includeEnded?: 'true' | 'false' | null;
+    page?: number;
+    limit?: number;
+  },
+  cacheKey: string,
+): Promise<PaginatedGamesResult> {
+  const { sport, live, includeEnded, page = 1, limit = 50 } = options;
+  const offset = (page - 1) * limit;
+  const isUnfilteredUnpaginated = !sport && !live && includeEnded !== 'true' && page === 1 && limit === 50;
+
   const client = await connectWithRetry();
 
   try {
@@ -703,6 +738,7 @@ export async function getFrontendGamesFromDatabase(options: {
     
     // Cache the result (only cache unfiltered, unpaginated queries)
     if (isUnfilteredUnpaginated) {
+      const now = Date.now();
       frontendGamesCache.set(cacheKey, {
         data: games,
         timestamp: now,

@@ -197,7 +197,7 @@ export async function retryPendingFees(): Promise<void> {
        FROM trades_history
        WHERE fee_status IN ('PENDING', 'FAILED', 'RETRYING')
          AND fee_retry_count < $1
-         AND status = 'FILLED'
+         AND status IN ('FILLED', 'PARTIALLY_FILLED')
          AND (fee_last_retry IS NULL OR fee_last_retry < NOW() - INTERVAL '5 minutes')
        ORDER BY created_at ASC
        LIMIT 10`,

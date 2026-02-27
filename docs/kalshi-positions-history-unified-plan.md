@@ -220,9 +220,9 @@ POST /api/kalshi-trading/sell
 - **Kalshi**: on sell click:
   - Call `POST /api/kalshi-trading/sell` with `kalshiTicker`, `outcome`, `tokenAmount` (from `token_balance` or human→raw).
 
-### 3.2 Trade Widget — History Tab
+### 3.2 Trade Widget — History Tab (Implemented)
 
-- Use unified `GET /api/trading/history?platform=all`.
+- **Endpoint**: `GET /api/trading/history?privyUserId=...&platform=all|polymarket|kalshi`
 - Show trades with platform badge: “Polymarket” or “Kalshi”.
 - Normalize display: side, outcome, amount, price, date, status.
 
@@ -243,7 +243,7 @@ POST /api/kalshi-trading/sell
 1. **Backend**
    - [ ] Add Kalshi positions via on-chain + DFlow (Solana RPC + filter_outcome_mints + markets/batch).
    - [ ] Add `GET /api/trading/positions` with `platform` support and normalized response.
-   - [ ] Add `GET /api/trading/history` with `platform` support and normalized response.
+   - [x] Add `GET /api/trading/history` with `platform` support and normalized response (done).
    - [ ] Document Kalshi sell payload for positions.
 
 2. **Frontend**

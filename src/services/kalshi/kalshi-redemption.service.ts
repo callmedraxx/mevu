@@ -1,16 +1,102 @@
 import { pool, getDatabaseConfig } from '../../config/database';
 import { dflowClient } from '../dflow/dflow.client';
 import { privyService } from '../privy/privy.service';
+import { dflowMetadataService } from '../dflow/dflow-metadata.service';
+import { getAllOutcomeTokenBalances } from '../solana/solana-token-accounts';
 import { SOLANA_USDC_MINT } from '../dflow/dflow-order-validation';
 import { setKalshiUsdcBalance } from '../privy/kalshi-user.service';
 import { getSolanaUsdcBalance } from '../solana/solana-usdc-balance';
 import { publishKalshiPositionUpdate } from '../redis-cluster-broadcast.service';
+import { getUserByPrivyId } from '../privy/user.service';
 import { logger } from '../../config/logger';
 
 export interface RedeemResult {
   success: boolean;
   solanaSignature?: string;
   error?: string;
+}
+
+/**
+ * Redeem a Kalshi position by outcome mint.
+ * Uses DFlow metadata to verify redeemability (market determined/finalized, redemption open).
+ * Does NOT require kalshi_positions DB — works directly with on-chain balances.
+ */
+export async function redeemKalshiPositionByMint(
+  privyUserId: string,
+  outcomeMint: string
+): Promise<RedeemResult> {
+  const user = await getUserByPrivyId(privyUserId);
+  if (!user) return { success: false, error: 'User not found' };
+
+  const solanaWallet = (user as any).solanaWalletAddress;
+  const solanaWalletId = (user as any).solanaWalletId;
+  if (!solanaWallet) return { success: false, error: 'User has no Solana wallet' };
+  if (!solanaWalletId) return { success: false, error: 'User has no Solana wallet ID — please recreate wallet' };
+
+  const canRedeem = await dflowMetadataService.isOutcomeRedeemable(outcomeMint);
+  if (!canRedeem) {
+    return { success: false, error: 'Position is not redeemable yet. The market may still be settling or redemption is not funded.' };
+  }
+
+  const tokens = await getAllOutcomeTokenBalances(solanaWallet);
+  const token = tokens.find((t) => t.mint === outcomeMint);
+  if (!token || parseFloat(token.rawBalance) <= 0) {
+    return { success: false, error: 'No balance found for this outcome token' };
+  }
+
+    const dflowParams = {
+    inputMint: outcomeMint,
+    outputMint: SOLANA_USDC_MINT,
+    amount: token.rawBalance,
+    userPublicKey: solanaWallet,
+    slippageBps: 500,
+    predictionMarketSlippageBps: 1000,
+  };
+
+  const isBlockhashError = (err: unknown) => {
+    const s = err instanceof Error ? err.message : String(err);
+    return s.includes('Blockhash not found') || s.includes('blockhash') || s.includes('expired');
+  };
+
+  try {
+    let hash: string | null = null;
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      const orderResponse = await dflowClient.getSellOrder(dflowParams);
+      if (!orderResponse.transaction) return { success: false, error: 'DFlow did not return a transaction' };
+      try {
+        const result = await privyService.signAndSendSolanaTransaction(solanaWalletId, orderResponse.transaction);
+        hash = result.hash;
+        break;
+      } catch (signErr) {
+        if (attempt < 2 && isBlockhashError(signErr)) {
+          logger.info({ message: 'Kalshi redeem: blockhash expired, retrying', attempt: attempt + 1, outcomeMint });
+          continue;
+        }
+        throw signErr;
+      }
+    }
+    if (!hash) return { success: false, error: 'Transaction failed. Please try again.' };
+
+    logger.info({ message: 'Kalshi position redeemed (by mint)', privyUserId, outcomeMint, txHash: hash });
+
+    syncBalanceAfterRedeem(privyUserId, solanaWallet);
+    return { success: true, solanaSignature: hash };
+  } catch (e) {
+    const rawError = e instanceof Error ? e.message : String(e);
+    logger.error({
+      message: 'Kalshi redemption by mint failed',
+      privyUserId,
+      outcomeMint,
+      error: rawError,
+    });
+    const userError =
+      rawError.includes('route_not_found')
+        ? 'Redemption is not available yet for this market. DFlow may still be settling. Please try again in a few hours or contact support.'
+        : rawError.includes('Blockhash not found') || rawError.includes('blockhash')
+        ? 'Transaction expired. Please try again.'
+        : rawError;
+    return { success: false, error: userError };
+  }
 }
 
 export async function redeemKalshiPosition(
@@ -116,16 +202,20 @@ function syncBalanceAfterRedeem(privyUserId: string, solanaWallet: string): void
 }
 
 export async function getRedeemablePositions(privyUserId: string): Promise<any[]> {
-  const dbConfig = getDatabaseConfig();
-  if (dbConfig.type !== 'postgres') return [];
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      'SELECT * FROM kalshi_positions WHERE privy_user_id = $1 AND is_redeemable = true AND redeemed_at IS NULL',
-      [privyUserId]
-    );
-    return result.rows;
-  } finally {
-    client.release();
-  }
+  const user = await getUserByPrivyId(privyUserId);
+  const solanaWallet = (user as any)?.solanaWalletAddress;
+  if (!solanaWallet) return [];
+
+  const { getKalshiPositions } = await import('./kalshi-positions.service');
+  const positions = await getKalshiPositions(solanaWallet);
+  return positions
+    .filter((p) => p.isRedeemable)
+    .map((p) => ({
+      outcome_mint: p.outcomeMint,
+      kalshi_ticker: p.kalshiTicker,
+      outcome: p.outcome,
+      token_balance: p.tokenBalance,
+      market_title: p.marketTitle,
+      solana_wallet_address: solanaWallet,
+    }));
 }

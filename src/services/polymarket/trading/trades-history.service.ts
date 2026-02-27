@@ -276,6 +276,7 @@ export async function updateTradeRecordById(
     feeRetryCount?: number;
     feeLastRetry?: Date;
     errorMessage?: string;
+    metadata?: Record<string, any>; // Merged into existing metadata (e.g. requestedSize for partial fills)
   }
 ): Promise<TradeRecord | null> {
   const dbConfig = getDatabaseConfig();
@@ -359,9 +360,12 @@ export async function updateTradeRecordById(
       updateValues.push(updates.feeLastRetry);
     }
     if (updates.errorMessage !== undefined) {
-      // Store error message in metadata
       updateFields.push(`metadata = COALESCE(metadata, '{}'::jsonb) || $${paramIndex++}::jsonb`);
       updateValues.push(JSON.stringify({ errorMessage: updates.errorMessage }));
+    }
+    if (updates.metadata !== undefined && Object.keys(updates.metadata).length > 0) {
+      updateFields.push(`metadata = COALESCE(metadata, '{}'::jsonb) || $${paramIndex++}::jsonb`);
+      updateValues.push(JSON.stringify(updates.metadata));
     }
 
     if (updateFields.length === 0) {

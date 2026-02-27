@@ -297,7 +297,7 @@ const swaggerDefinition: SwaggerDefinition = {
           question: { type: 'string', example: 'Will Bitcoin exceed $120,000 by March 2026?' },
           category: { type: 'string', enum: ['crypto', 'politics'] },
           subcategory: { type: 'string', example: 'Bitcoin' },
-          timeframe: { type: 'string', example: 'monthly', description: '15min, hourly, 4hour, daily, weekly, monthly, pre-market, etf' },
+          timeframe: { type: 'string', example: 'monthly', description: '5min, 15min, hourly, 4hour, daily, weekly, monthly, pre-market, etf' },
           yesPrice: { type: 'number', example: 67 },
           noPrice: { type: 'number', example: 33 },
           yesProbability: { type: 'number', example: 67 },

@@ -125,10 +125,10 @@ export class ActivityWatcherWebSocketService {
                        request.headers['x-real-ip'] || 
                        request.socket.remoteAddress;
 
-      logger.info({
-        message: 'Activity Watcher WebSocket client connected',
-        clientIp,
-      });
+      // logger.info({
+      //   message: 'Activity Watcher WebSocket client connected',
+      //   clientIp,
+      // });
 
       // Handle incoming messages (subscription commands)
       ws.on('message', (data) => {
@@ -229,11 +229,11 @@ export class ActivityWatcherWebSocketService {
     // Send initial data for the game
     await this.sendInitialData(ws, normalizedSlug);
 
-    logger.info({
-      message: 'Client subscribed to game',
-      slug: normalizedSlug,
-      clientCount: this.slugClients.get(normalizedSlug)?.size || 0,
-    });
+    // logger.info({
+    //   message: 'Client subscribed to game',
+    //   slug: normalizedSlug,
+    //   clientCount: this.slugClients.get(normalizedSlug)?.size || 0,
+    // });
   }
 
   /**

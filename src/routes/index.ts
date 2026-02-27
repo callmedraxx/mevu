@@ -22,6 +22,7 @@ import kalshiTradingRouter from './kalshi-trading';
 import announcementsRouter from './announcements';
 import proofRouter from './proof';
 import cryptoMarketsRouter from './crypto-markets';
+import financeMarketsRouter from './finance-markets';
 import commentsRouter from './comments';
 
 const router = Router();
@@ -110,6 +111,7 @@ router.use('/kalshi-trading', kalshiTradingRouter);
 router.use('/announcements', announcementsRouter);
 router.use('/proof', proofRouter);
 router.use('/crypto-markets', cryptoMarketsRouter);
+router.use('/finance-markets', financeMarketsRouter);
 router.use('/comments', commentsRouter);
 
 export default router;

@@ -16,6 +16,10 @@ export interface DFlowOrderParams {
   userPublicKey: string;
   slippageBps?: number;
   platformFeeBps?: number;
+  /** USDC token account (SPL) that receives platform fees. Required when platformFeeBps > 0. */
+  feeAccount?: string;
+  /** For prediction market orders (sell/redemption): max slippage. Redemption may require this. */
+  predictionMarketSlippageBps?: number;
 }
 
 export interface DFlowPlatformFee {
@@ -73,17 +77,32 @@ class DFlowClient {
       userPublicKey: params.userPublicKey,
       ...(params.slippageBps != null && { slippageBps: String(params.slippageBps) }),
       ...(params.platformFeeBps != null && { platformFeeBps: String(params.platformFeeBps) }),
+      ...(params.feeAccount && { feeAccount: params.feeAccount }),
+      ...(params.predictionMarketSlippageBps != null && {
+        predictionMarketSlippageBps: String(params.predictionMarketSlippageBps),
+      }),
     });
-    const response = await this.client.get<DFlowOrderResponse>('/order?' + query.toString());
-    return response.data;
+    try {
+      const response = await this.client.get<DFlowOrderResponse>('/order?' + query.toString());
+      return response.data;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      const body = err?.response?.data;
+      const msg = err?.response?.data?.message ?? err?.response?.data?.error ?? (typeof body === 'string' ? body : body ? JSON.stringify(body) : null);
+      const apiMsg = `DFlow API ${status ?? 'error'}: ${msg || err?.message || 'Unknown error'}`.trim();
+      const e = new Error(apiMsg);
+      (e as any).cause = err;
+      throw e;
+    }
   }
 
+  /**
+   * Get a sell order (outcome tokens → settlement mint).
+   * DFlow expects inputMint=outcomeMint, outputMint=settlementMint for decrease/sell.
+   * Do NOT swap — pass params through. See: https://pond.dflow.net/build/recipes/prediction-markets/decrease-position
+   */
   async getSellOrder(params: DFlowOrderParams): Promise<DFlowOrderResponse> {
-    return this.getBuyOrder({
-      ...params,
-      inputMint: params.outputMint,
-      outputMint: params.inputMint,
-    });
+    return this.getBuyOrder(params);
   }
 
   async getOrderStatus(signature: string, lastValidBlockHeight?: number): Promise<DFlowOrderStatusResponse> {

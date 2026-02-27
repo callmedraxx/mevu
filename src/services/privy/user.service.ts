@@ -37,7 +37,7 @@ export async function initializeUsersTable(): Promise<void> {
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
       
-      -- Add Solana wallet columns if missing (idempotent)
+      -- Add Solana wallet columns (Solana chain/base58, for Kalshi — NOT proxy_wallet or embedded_wallet)
       ALTER TABLE users ADD COLUMN IF NOT EXISTS solana_wallet_address VARCHAR(64);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS solana_wallet_id VARCHAR(255);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS embedded_wallet_id VARCHAR(255);

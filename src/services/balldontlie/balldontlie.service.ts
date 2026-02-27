@@ -1959,13 +1959,13 @@ export async function fetchPeriodScores(game: any): Promise<PeriodScores | null>
       endpoint = `https://api.balldontlie.io/nfl/v1/games/${balldontlieGameId}`;
     }
 
-    logger.info({
-      message: 'Fetching period scores from Ball Don\'t Lie',
-      gameId: game.id,
-      balldontlieGameId,
-      sport: bdSport,
-      endpoint,
-    });
+    // logger.info({
+    //   message: 'Fetching period scores from Ball Don\'t Lie',
+    //   gameId: game.id,
+    //   balldontlieGameId,
+    //   sport: bdSport,
+    //   endpoint,
+    // });
 
     const response = await axios.get(endpoint, {
       headers: { 'Authorization': apiKey },
@@ -2116,12 +2116,12 @@ export async function fetchPeriodScores(game: any): Promise<PeriodScores | null>
       }
     });
 
-    logger.info({
-      message: 'Period scores fetched successfully',
-      gameId: game.id,
-      sport: bdSport,
-      periodScores,
-    });
+    // logger.info({
+    //   message: 'Period scores fetched successfully',
+    //   gameId: game.id,
+    //   sport: bdSport,
+    //   periodScores,
+    // });
 
     return periodScores;
     

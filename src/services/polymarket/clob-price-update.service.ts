@@ -8,6 +8,7 @@ import { logger } from '../../config/logger';
 import { clobWebSocketService } from './clob-websocket.service';
 import { ClobPriceChangeUpdate, ClobPriceChange } from './polymarket.types';
 import { getAllLiveGames, updateGameInCache, LiveGame, registerOnGamesRefreshed, registerOnRefreshStarting, registerOnRefreshEnded, acquireLiveGamesWriteLock, releaseLiveGamesWriteLock } from './live-games.service';
+import { isGamesRefreshInProgress } from './redis-games-cache.service';
 import { positionsWebSocketService } from '../positions/positions-websocket.service';
 import { connectWithRetry } from '../../config/database';
 import { transformToFrontendGame, FrontendGame, KalshiPriceData } from './frontend-game.transformer';
@@ -19,6 +20,7 @@ import {
   publishActivityBroadcast,
   isRedisGamesBroadcastReady,
 } from '../redis-cluster-broadcast.service';
+import { setTokenPricesForPositions } from './redis-games-cache.service';
 
 // Cache for probability changes per game (avoids DB lookup during hot path)
 interface CachedProbabilityChange {
@@ -539,6 +541,15 @@ export class ClobPriceUpdateService {
         updateGameInCache(gameId, updatedGame).catch(() => {});
         this.gamesByIdCache.set(gameId, updatedGame);
 
+        // Populate token-prices cache for fast position enrichment (HMGET instead of full games scan)
+        const tokenPriceUpdates = Array.from(updates.entries()).map(([assetId, u]) => ({
+          clobTokenId: assetId,
+          buyPrice: u.buyPrice,
+          sellPrice: u.sellPrice,
+          isEnded: game.ended === true || game.closed === true,
+        }));
+        setTokenPricesForPositions(tokenPriceUpdates).catch(() => {});
+
         // Get cached probability change or use defaults (skip DB lookup)
         const cachedProbChange = this.getCachedProbabilityChange(gameId);
         
@@ -668,6 +679,14 @@ export class ClobPriceUpdateService {
     this.writeFlushTimer = null;
 
     if (this.pendingWrites.size === 0 || this.isFlushingWrites || this.flushPaused) {
+      return;
+    }
+
+    // Cross-worker: skip flush during games refresh (sports worker) to prevent deadlock
+    if (await isGamesRefreshInProgress()) {
+      if (this.pendingWrites.size > 0 && !this.writeFlushTimer && !this.flushPaused) {
+        this.writeFlushTimer = setTimeout(() => this.flushPendingWrites(), this.writeFlushInterval);
+      }
       return;
     }
 
@@ -906,19 +925,77 @@ export class ClobPriceUpdateService {
       // Update asset map
       this.assetToGameMap = newAssetMap;
 
+      // Also collect crypto + finance market tokens so the CLOB WS has one authoritative list
+      let cryptoTokenCount = 0;
+      let financeTokenCount = 0;
+      try {
+        const predictionClient = await connectWithRetry(2, 200);
+        try {
+          // Crypto markets
+          const cryptoRes = await predictionClient.query(
+            `SELECT markets FROM crypto_markets WHERE end_date > NOW() AND active = true`
+          );
+          for (const row of cryptoRes.rows) {
+            const mkts = Array.isArray(row.markets) ? row.markets : [];
+            const m = mkts[0];
+            if (!m) continue;
+            const tokenIds = Array.isArray(m.clobTokenIds) ? m.clobTokenIds : [];
+            for (const tid of tokenIds) {
+              if (tid) {
+                const tokenStr = String(tid);
+                if (!newAssetMap.has(tokenStr)) {
+                  assetIds.push(tokenStr);
+                  cryptoTokenCount++;
+                }
+              }
+            }
+          }
+
+          // Finance markets
+          const financeRes = await predictionClient.query(
+            `SELECT markets FROM finance_markets WHERE end_date > NOW() AND active = true`
+          );
+          for (const row of financeRes.rows) {
+            const mkts = Array.isArray(row.markets) ? row.markets : [];
+            const m = mkts[0];
+            if (!m) continue;
+            const tokenIds = Array.isArray(m.clobTokenIds) ? m.clobTokenIds : [];
+            for (const tid of tokenIds) {
+              if (tid) {
+                const tokenStr = String(tid);
+                if (!newAssetMap.has(tokenStr) && !assetIds.includes(tokenStr)) {
+                  assetIds.push(tokenStr);
+                  financeTokenCount++;
+                }
+              }
+            }
+          }
+        } finally {
+          predictionClient.release();
+        }
+      } catch (err) {
+        logger.warn({
+          message: 'Failed to fetch crypto/finance tokens for CLOB subscription, sports-only',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
       if (assetIds.length === 0) {
         logger.warn({ message: 'No asset IDs found to subscribe to' });
         return;
       }
 
-      // Subscribe to filtered assets
-      clobWebSocketService.subscribeToAssets(assetIds);
+      // Replace subscriptions (single authoritative list: sports + crypto, prunes stale)
+      clobWebSocketService.replaceSubscriptions(assetIds);
 
       this.isSubscribed = true;
       logger.info({
-        message: 'Subscribed to CLOB price updates (filtered by eligibility)',
+        message: 'Subscribed to CLOB price updates (sports + crypto + finance)',
         totalGames: allGames.length,
         eligibleGames: eligibleGames.length,
+        sportsAssets: assetIds.length - cryptoTokenCount - financeTokenCount,
+        cryptoAssets: cryptoTokenCount,
+        financeAssets: financeTokenCount,
         totalAssets: assetIds.length,
       });
     } catch (error) {

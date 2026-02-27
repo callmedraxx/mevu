@@ -27,6 +27,46 @@ export async function updateUserTradingRegion(
   }
 }
 
+/**
+ * Get Solana wallet address for a Kalshi user, with fallback from kalshi_trades_history.
+ * Returns solana_wallet_address only — NOT proxy_wallet or embedded_wallet (those are EVM/0x).
+ * Call this when you need the Solana address for Kalshi positions/portfolio/balance.
+ */
+export async function getSolanaAddressForKalshiUser(privyUserId: string): Promise<string | null> {
+  const dbConfig = getDatabaseConfig();
+  if (dbConfig.type !== 'postgres') return null;
+
+  const client = await pool.connect();
+  try {
+    const r = await client.query<{ solana_wallet_address: string | null }>(
+      `SELECT solana_wallet_address FROM users WHERE privy_user_id = $1`,
+      [privyUserId]
+    );
+    let addr = r.rows[0]?.solana_wallet_address ?? null;
+    if (addr) return addr;
+
+    // Fallback: from kalshi_trades_history
+    const t = await client.query<{ solana_wallet_address: string }>(
+      `SELECT solana_wallet_address FROM kalshi_trades_history
+       WHERE privy_user_id = $1 AND solana_wallet_address IS NOT NULL AND solana_wallet_address != ''
+       ORDER BY created_at DESC LIMIT 1`,
+      [privyUserId]
+    );
+    addr = t.rows[0]?.solana_wallet_address ?? null;
+    if (addr) {
+      await updateUserSolanaWallet(privyUserId, addr);
+      return addr;
+    }
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Update users.solana_wallet_address — Solana chain only (base58).
+ * Rejects EVM addresses (0x...) to avoid accidental use of proxy_wallet or embedded_wallet.
+ */
 export async function updateUserSolanaWallet(
   privyUserId: string,
   solanaWalletAddress: string,
@@ -34,6 +74,16 @@ export async function updateUserSolanaWallet(
 ): Promise<boolean> {
   const dbConfig = getDatabaseConfig();
   if (dbConfig.type !== 'postgres') return false;
+
+  // Guard: Solana addresses are base58 (~44 chars), not 0x (EVM proxy/embedded)
+  if (solanaWalletAddress.startsWith('0x') || solanaWalletAddress.startsWith('0X')) {
+    logger.warn({
+      message: 'Rejected EVM address for solana_wallet_address — use proxy_wallet or embedded_wallet for EVM',
+      privyUserId,
+      addressPrefix: solanaWalletAddress.slice(0, 10) + '...',
+    });
+    return false;
+  }
 
   const client = await pool.connect();
   try {

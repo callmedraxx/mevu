@@ -10,6 +10,13 @@ import { logger } from '../../config/logger';
 const REDIS_KEY_GAMES = 'games:cache';
 const REDIS_KEY_GID_TO_EID = 'games:gid2eid';
 const REDIS_KEY_SLUG_TO_ID = 'games:slug2id';
+const REDIS_KEY_TOKEN_PRICES = 'positions:token_prices';
+
+/** Cross-worker coordination: pause CLOB flush during games refresh (prevents deadlock) */
+const REDIS_KEY_GAMES_REFRESH = 'sync:games_refresh_in_progress';
+/** Cross-worker coordination: pause crypto CLOB flush during crypto markets refresh */
+const REDIS_KEY_CRYPTO_REFRESH = 'sync:crypto_refresh_in_progress';
+const REFRESH_KEY_TTL_SEC = 300; // 5 min max — safety if process crashes
 
 export interface LiveGameStored {
   id: string;
@@ -23,6 +30,7 @@ let redisDisabled = false; // Circuit breaker: true when Redis is unstable
 const inMemoryGames = new Map<string, string>(); // id -> JSON
 const inMemoryGidToEid = new Map<number, string>();
 const inMemorySlugToId = new Map<string, string>();
+const inMemoryTokenPrices = new Map<string, string>(); // clobTokenId -> JSON
 
 // Track rapid reconnections to detect unstable connections
 const RECONNECT_WINDOW_MS = 30_000; // 30 second window
@@ -139,6 +147,7 @@ export async function shutdownRedisGamesCache(): Promise<void> {
   inMemoryGames.clear();
   inMemoryGidToEid.clear();
   inMemorySlugToId.clear();
+  inMemoryTokenPrices.clear();
 }
 
 /**
@@ -147,13 +156,60 @@ export async function shutdownRedisGamesCache(): Promise<void> {
  */
 export async function clearAllGamesCaches(): Promise<void> {
   if (useRedis() && redisClient) {
-    await redisClient.del(REDIS_KEY_GAMES, REDIS_KEY_GID_TO_EID, REDIS_KEY_SLUG_TO_ID);
+    await redisClient.del(REDIS_KEY_GAMES, REDIS_KEY_GID_TO_EID, REDIS_KEY_SLUG_TO_ID, REDIS_KEY_TOKEN_PRICES);
   }
   inMemoryGames.clear();
   inMemoryGidToEid.clear();
   inMemorySlugToId.clear();
-  
-  logger.info({ message: 'All games caches cleared (games, gid2eid, slug2id)' });
+  inMemoryTokenPrices.clear();
+
+  logger.info({ message: 'All games caches cleared (games, gid2eid, slug2id, token_prices)' });
+}
+
+/**
+ * Cross-worker coordination for games refresh (sports + live games).
+ * Sports worker sets when refresh starts; CLOB worker checks before flush.
+ * Prevents deadlock between storeGames (live_games) and CLOB flush (live_games).
+ */
+export async function setGamesRefreshInProgress(): Promise<void> {
+  if (useRedis() && redisClient) {
+    await redisClient.set(REDIS_KEY_GAMES_REFRESH, '1', 'EX', REFRESH_KEY_TTL_SEC);
+  }
+}
+
+export async function clearGamesRefreshInProgress(): Promise<void> {
+  if (useRedis() && redisClient) {
+    await redisClient.del(REDIS_KEY_GAMES_REFRESH);
+  }
+}
+
+export async function isGamesRefreshInProgress(): Promise<boolean> {
+  if (!useRedis() || !redisClient) return false;
+  const v = await redisClient.get(REDIS_KEY_GAMES_REFRESH);
+  return v === '1';
+}
+
+/**
+ * Cross-worker coordination for crypto markets refresh.
+ * Sports worker sets when crypto refresh starts; CLOB worker (cryptoClobPriceService) checks before flush.
+ * Prevents deadlock between storeCryptoMarketsInDatabase and crypto CLOB flush.
+ */
+export async function setCryptoRefreshInProgress(): Promise<void> {
+  if (useRedis() && redisClient) {
+    await redisClient.set(REDIS_KEY_CRYPTO_REFRESH, '1', 'EX', REFRESH_KEY_TTL_SEC);
+  }
+}
+
+export async function clearCryptoRefreshInProgress(): Promise<void> {
+  if (useRedis() && redisClient) {
+    await redisClient.del(REDIS_KEY_CRYPTO_REFRESH);
+  }
+}
+
+export async function isCryptoRefreshInProgress(): Promise<boolean> {
+  if (!useRedis() || !redisClient) return false;
+  const v = await redisClient.get(REDIS_KEY_CRYPTO_REFRESH);
+  return v === '1';
 }
 
 /** Set a single game in cache */
@@ -388,6 +444,87 @@ export async function cleanupStaleMappings(): Promise<{ removedGidMappings: numb
   }
 
   return { removedGidMappings, removedSlugMappings };
+}
+
+/**
+ * Token prices cache for fast position enrichment.
+ * Populated by ClobPriceUpdateService on price changes; read by positions service via HMGET.
+ * Avoids slow getAllGamesFromCache when we only need prices for a user's N positions.
+ */
+export interface TokenPriceEntry {
+  buyPrice: number;
+  sellPrice: number;
+  isEnded?: boolean;
+}
+
+/** Set token prices (called when CLOB price changes) */
+export async function setTokenPricesForPositions(
+  updates: Array<{ clobTokenId: string; buyPrice: number; sellPrice: number; isEnded?: boolean }>
+): Promise<void> {
+  if (updates.length === 0) return;
+
+  const entries = updates.map((u) => [
+    u.clobTokenId,
+    JSON.stringify({ buyPrice: u.buyPrice, sellPrice: u.sellPrice, isEnded: u.isEnded ?? false }),
+  ] as [string, string]);
+
+  if (useRedis() && redisClient) {
+    const pipeline = redisClient.pipeline();
+    for (const [k, v] of entries) {
+      pipeline.hset(REDIS_KEY_TOKEN_PRICES, k, v);
+    }
+    await pipeline.exec();
+  } else {
+    for (const [k, v] of entries) {
+      inMemoryTokenPrices.set(k as string, v as string);
+    }
+  }
+}
+
+/** Get token prices for specific assets (fast path - HMGET instead of full games scan) */
+export async function getTokenPricesForPositions(
+  assetIds: string[]
+): Promise<{ priceMap: Map<string, { buyPrice: number; sellPrice: number }>; endedAssets: Set<string> }> {
+  const priceMap = new Map<string, { buyPrice: number; sellPrice: number }>();
+  const endedAssets = new Set<string>();
+
+  if (assetIds.length === 0) return { priceMap, endedAssets };
+
+  let values: (string | null)[];
+  if (useRedis() && redisClient) {
+    values = await redisClient.hmget(REDIS_KEY_TOKEN_PRICES, ...assetIds);
+  } else {
+    values = assetIds.map((id) => inMemoryTokenPrices.get(id) ?? null);
+  }
+
+  for (let i = 0; i < assetIds.length; i++) {
+    const json = values[i];
+    if (!json) continue;
+    try {
+      const parsed = JSON.parse(json) as TokenPriceEntry;
+      if (parsed.isEnded) {
+        endedAssets.add(assetIds[i]);
+      } else if (parsed.buyPrice > 0 || parsed.sellPrice > 0) {
+        priceMap.set(assetIds[i], {
+          buyPrice: parsed.buyPrice / 100,
+          sellPrice: parsed.sellPrice / 100,
+        });
+      }
+    } catch {
+      // skip invalid entries
+    }
+  }
+
+  return { priceMap, endedAssets };
+}
+
+/** Check if token prices cache has enough data to use (avoids full scan when cache is cold) */
+export async function hasTokenPricesInCache(): Promise<boolean> {
+  if (useRedis() && redisClient) {
+    const len = await redisClient.hlen(REDIS_KEY_TOKEN_PRICES);
+    return len >= 50;
+  }
+  return inMemoryTokenPrices.size >= 50;
 }
 
 /**

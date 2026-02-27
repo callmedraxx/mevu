@@ -78,12 +78,12 @@ router.get('/:gameIdentifier', async (req: Request, res: Response) => {
             }
           }
           stats.periodScores = convertedScores;
-          logger.info({
-            message: 'Updated period scores from Ball Don\'t Lie',
-            gameId: game.id,
-            sport,
-            periodScoresKeys: Object.keys(convertedScores),
-          });
+          // logger.info({
+          //   message: 'Updated period scores from Ball Don\'t Lie',
+          //   gameId: game.id,
+          //   sport,
+          //   periodScoresKeys: Object.keys(convertedScores),
+          // });
         }
       } catch (error) {
         logger.warn({

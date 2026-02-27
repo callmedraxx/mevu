@@ -64,6 +64,7 @@ import { logger } from '../config/logger';
 import { executeTrade } from '../services/polymarket/trading/trading.service';
 import { getUnifiedPositions } from '../services/trading/unified-positions.service';
 import { getTradeHistory } from '../services/polymarket/trading/trades-history.service';
+import { getUnifiedTradeHistory } from '../services/trading/unified-trade-history.service';
 import { CreateTradeRequest, TradeHistoryQuery, TradeSide, OrderType } from '../services/polymarket/trading/trading.types';
 
 const router = Router();
@@ -467,6 +468,13 @@ router.post('/sell', async (req: Request, res: Response) => {
  *           type: string
  *           enum: [PENDING, FILLED, PARTIALLY_FILLED, CANCELLED, FAILED]
  *         description: Filter by trade status
+ *       - in: query
+ *         name: platform
+ *         schema:
+ *           type: string
+ *           enum: [all, polymarket, kalshi]
+ *           default: all
+ *         description: Filter by platform (all returns merged Polymarket + Kalshi with platform label per trade)
  *     responses:
  *       200:
  *         description: Trade history retrieved successfully
@@ -490,7 +498,7 @@ router.post('/sell', async (req: Request, res: Response) => {
  */
 router.get('/history', async (req: Request, res: Response) => {
   try {
-    const { privyUserId, limit, offset, side, marketId, status } = req.query;
+    const { privyUserId, limit, offset, side, marketId, status, platform } = req.query;
 
     if (!privyUserId) {
       return res.status(400).json({
@@ -499,16 +507,22 @@ router.get('/history', async (req: Request, res: Response) => {
       });
     }
 
-    const query: TradeHistoryQuery = {
+    const platformVal = (platform as string) || 'all';
+    if (!['all', 'polymarket', 'kalshi'].includes(platformVal)) {
+      return res.status(400).json({
+        success: false,
+        message: 'platform must be all, polymarket, or kalshi',
+      });
+    }
+
+    const trades = await getUnifiedTradeHistory({
       privyUserId: String(privyUserId),
       limit: limit ? parseInt(String(limit), 10) : undefined,
       offset: offset ? parseInt(String(offset), 10) : undefined,
-      side: side ? (side as TradeSide) : undefined,
-      marketId: marketId ? String(marketId) : undefined,
+      side: side ? String(side) : undefined,
+      platform: platformVal as 'all' | 'polymarket' | 'kalshi',
       status: status ? String(status) : undefined,
-    };
-
-    const trades = await getTradeHistory(query);
+    });
 
     return res.status(200).json({
       success: true,

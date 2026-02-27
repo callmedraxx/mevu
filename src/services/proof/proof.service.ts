@@ -50,11 +50,11 @@ export async function checkVerification(solanaAddress: string): Promise<boolean>
       verifiedCache.add(solanaAddress);
     }
 
-    logger.info({
-      message: 'Proof verification check',
-      solanaAddress,
-      verified,
-    });
+    // logger.info({
+    //   message: 'Proof verification check',
+    //   solanaAddress,
+    //   verified,
+    // });
 
     return verified;
   } catch (error) {
@@ -97,12 +97,12 @@ export async function generateProofDeepLink(
 
   const url = `${PROOF_DEEP_LINK_BASE}?${params.toString()}`;
 
-  logger.info({
-    message: 'Generated Proof deep link',
-    solanaAddress,
-    timestamp,
-    redirectUri,
-  });
+  // logger.info({
+  //   message: 'Generated Proof deep link',
+  //   solanaAddress,
+  //   timestamp,
+  //   redirectUri,
+  // });
 
   return { url };
 }

@@ -16,6 +16,7 @@
 
 import WebSocket from 'ws';
 import { logger } from '../../config/logger';
+import { connectWithRetry } from '../../config/database';
 import {
   initRedisClusterBroadcast,
   publishCryptoChainlinkPriceUpdate,
@@ -58,6 +59,25 @@ const MAX_RECONNECT_DELAY_MS = 30000;
 // If no price update for this long, assume zombie connection and force reconnect
 const SILENCE_RECONNECT_MS = 120000; // 2 minutes
 
+// Map crypto_markets.asset to Chainlink symbol
+const ASSET_TO_CHAINLINK_SYMBOL: Record<string, string> = {
+  bitcoin: 'btc/usd',
+  ethereum: 'eth/usd',
+  solana: 'sol/usd',
+  xrp: 'xrp/usd',
+};
+
+interface ActiveWindow {
+  slug: string;
+  symbol: string; // Chainlink symbol e.g. 'btc/usd'
+  startTime: number; // ms epoch
+  endTime: number; // ms epoch
+  high: number;
+  low: number;
+}
+
+const ACTIVE_WINDOWS_REFRESH_MS = 60_000; // 60s
+
 /** Upstream message format from Polymarket live-data WS */
 interface PolymarketChainlinkMessage {
   connection_id?: string;
@@ -90,6 +110,10 @@ class CryptoChainlinkPriceService {
   private subscribedSymbols: Set<string> = new Set(SUPPORTED_SYMBOLS);
   // Latest price per symbol (for quick lookups)
   private latestPrices: Map<string, ChainlinkPricePoint> = new Map();
+
+  // Active contract windows: slug -> window info with price extremes
+  private activeWindows: Map<string, ActiveWindow> = new Map();
+  private activeWindowsTimer: NodeJS.Timeout | null = null;
 
   /**
    * Initialize the service: set up Redis subscription and connect to upstream WS.
@@ -136,7 +160,111 @@ class CryptoChainlinkPriceService {
       this.updateCount = 0;
     }, 10000);
 
+    // Start tracking active contract windows for price_high/price_low
+    this.startActiveWindowsTracking();
+
     this.connect();
+  }
+
+  /**
+   * Periodically refresh active contract windows from DB and flush price extremes.
+   */
+  private startActiveWindowsTracking(): void {
+    const run = async () => {
+      await this.flushActiveWindows();
+      await this.refreshActiveWindows();
+    };
+    run().catch(() => {});
+    this.activeWindowsTimer = setInterval(() => {
+      run().catch(() => {});
+    }, ACTIVE_WINDOWS_REFRESH_MS);
+  }
+
+  /**
+   * Query DB for currently active short-term crypto markets and populate activeWindows map.
+   */
+  private async refreshActiveWindows(): Promise<void> {
+    let client;
+    try {
+      client = await connectWithRetry(2, 200);
+      const res = await client.query(
+        `SELECT slug, asset, start_time, end_date, price_high, price_low
+         FROM crypto_markets
+         WHERE start_time <= NOW() AND end_date > NOW()
+           AND timeframe IN ('5m', '15m', '1h', '4h', 'daily')`
+      );
+
+      const newSlugs = new Set<string>();
+      for (const row of res.rows) {
+        const symbol = ASSET_TO_CHAINLINK_SYMBOL[row.asset];
+        if (!symbol) continue;
+
+        const slug = row.slug as string;
+        newSlugs.add(slug);
+
+        const existing = this.activeWindows.get(slug);
+        if (existing) continue; // Already tracking, don't reset extremes
+
+        // Get initial price from latest known price for this symbol
+        const latest = this.latestPrices.get(symbol);
+        const initPrice = latest?.price ?? 0;
+        const dbHigh = row.price_high != null ? Number(row.price_high) : initPrice;
+        const dbLow = row.price_low != null ? Number(row.price_low) : (initPrice || Infinity);
+
+        this.activeWindows.set(slug, {
+          slug,
+          symbol,
+          startTime: new Date(row.start_time).getTime(),
+          endTime: new Date(row.end_date).getTime(),
+          high: dbHigh,
+          low: dbLow,
+        });
+      }
+
+      // Remove windows that are no longer active
+      for (const slug of this.activeWindows.keys()) {
+        if (!newSlugs.has(slug)) {
+          this.activeWindows.delete(slug);
+        }
+      }
+    } catch (err) {
+      logger.debug({
+        message: 'Chainlink: failed to refresh active windows',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      client?.release();
+    }
+  }
+
+  /**
+   * Flush price_high/price_low for all tracked active windows to DB.
+   */
+  private async flushActiveWindows(): Promise<void> {
+    if (this.activeWindows.size === 0) return;
+
+    let client;
+    try {
+      client = await connectWithRetry(2, 200);
+      for (const [slug, w] of this.activeWindows) {
+        if (w.high === 0 && w.low === Infinity) continue; // No data yet
+        await client.query(
+          `UPDATE crypto_markets SET
+             price_high = GREATEST(COALESCE(price_high, -1e18), $2),
+             price_low = LEAST(COALESCE(price_low, 1e18), $3),
+             updated_at = NOW()
+           WHERE slug = $1`,
+          [slug, w.high, w.low]
+        );
+      }
+    } catch (err) {
+      logger.debug({
+        message: 'Chainlink: failed to flush active windows',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      client?.release();
+    }
   }
 
   private connect(): void {
@@ -387,6 +515,15 @@ class CryptoChainlinkPriceService {
     this.updateCount++;
     this.lastPriceAt = Date.now();
 
+    // Update price extremes for active contract windows matching this symbol
+    const now = Date.now();
+    for (const [, w] of this.activeWindows) {
+      if (w.symbol === symbol && now >= w.startTime && now < w.endTime) {
+        if (price > w.high) w.high = price;
+        if (w.low === Infinity || price < w.low) w.low = price;
+      }
+    }
+
     // Publish to Redis for all HTTP workers — no batching, zero latency
     const broadcastMsg: CryptoChainlinkPriceBroadcastMessage = {
       type: 'chainlink_price_update',
@@ -504,6 +641,13 @@ class CryptoChainlinkPriceService {
       clearInterval(this.diagnosticTimer);
       this.diagnosticTimer = null;
     }
+    if (this.activeWindowsTimer) {
+      clearInterval(this.activeWindowsTimer);
+      this.activeWindowsTimer = null;
+    }
+    // Final flush before shutdown
+    this.flushActiveWindows().catch(() => {});
+    this.activeWindows.clear();
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);

@@ -258,6 +258,7 @@ router.get('/', async (req: Request, res: Response) => {
  *                     $ref: '#/components/schemas/FrontendGame'
  */
 router.get('/frontend', async (req: Request, res: Response) => {
+  const t0 = Date.now();
   try {
     const { sport, live, includeEnded, page, limit } = req.query;
 
@@ -292,6 +293,8 @@ router.get('/frontend', async (req: Request, res: Response) => {
       return !NON_SPORTS_BLACKLIST.has(firstSlugPart);
     });
 
+    const fetchMs = Date.now() - t0;
+    res.setHeader('X-Fetch-Ms', String(fetchMs));
     return res.json({
       success: true,
       count: filteredGames.length,

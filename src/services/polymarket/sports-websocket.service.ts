@@ -35,11 +35,11 @@ export class SportsWebSocketService {
    */
   async connect(): Promise<void> {
     if (this.isConnecting || this.isConnected) {
-      logger.warn({
-        message: 'Sports WebSocket already connecting or connected',
-        isConnecting: this.isConnecting,
-        isConnected: this.isConnected,
-      });
+      // logger.warn({
+      //   message: 'Sports WebSocket already connecting or connected',
+      //   isConnecting: this.isConnecting,
+      //   isConnected: this.isConnected,
+      // });
       return;
     }
 
@@ -48,10 +48,10 @@ export class SportsWebSocketService {
     this.isConnected = false;
 
     try {
-      logger.info({
-        message: 'Connecting to Sports WebSocket',
-        url: SPORTS_WS_URL,
-      });
+      // logger.info({
+      //   message: 'Connecting to Sports WebSocket',
+      //   url: SPORTS_WS_URL,
+      // });
 
       this.ws = new WebSocket(SPORTS_WS_URL, {
         headers: {
@@ -82,10 +82,10 @@ export class SportsWebSocketService {
       this.isConnected = true;
       this.reconnectAttempts = 0;
 
-      logger.info({
-        message: 'Sports WebSocket connected',
-        url: SPORTS_WS_URL,
-      });
+      // logger.info({
+      //   message: 'Sports WebSocket connected',
+      //   url: SPORTS_WS_URL,
+      // });
     });
 
     this.ws.on('message', (data: WebSocket.Data) => {
@@ -276,13 +276,13 @@ export class SportsWebSocketService {
     }
 
     // Log non-ping messages to debug what the websocket is sending
-    if (msg.type !== 'ping') {
-      logger.info({
-        message: 'Sports WebSocket message received',
-        messageType: msg.type || msg.event || msg.action || 'unknown',
-        messageKeys: Object.keys(msg),
-      });
-    }
+    // if (msg.type !== 'ping') {
+    //   logger.info({
+    //     message: 'Sports WebSocket message received',
+    //     messageType: msg.type || msg.event || msg.action || 'unknown',
+    //     messageKeys: Object.keys(msg),
+    //   });
+    // }
   }
 
   /**

@@ -25,6 +25,8 @@ import {
   getEventIdByGameId,
   getGamesByGameIdFromCache,
   hasGamesInCache,
+  setGamesRefreshInProgress,
+  clearGamesRefreshInProgress,
 } from './redis-games-cache.service';
 import {
   publishGamesBroadcast,
@@ -73,6 +75,8 @@ export function registerOnRefreshEnded(callback: () => void): () => void {
 export function notifyGamesRefreshStarting(): void {
   refreshInProgressCount++;
   if (refreshInProgressCount === 1) {
+    // Cross-worker: CLOB worker checks this before flush (prevents deadlock)
+    setGamesRefreshInProgress().catch(() => {});
     for (const cb of onRefreshStartingCallbacks) {
       try {
         cb();
@@ -90,6 +94,7 @@ export function notifyGamesRefreshEnded(): void {
   if (refreshInProgressCount <= 0) return;
   refreshInProgressCount--;
   if (refreshInProgressCount === 0) {
+    clearGamesRefreshInProgress().catch(() => {});
     for (const cb of onRefreshEndedCallbacks) {
       try {
         cb();

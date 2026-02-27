@@ -7,10 +7,11 @@ import { Router, Request, Response } from 'express';
 import { logger } from '../config/logger';
 import { geoDetectMiddleware, requireKalshiRegion } from '../middleware/geo-detect.middleware';
 import { executeKalshiBuy, executeKalshiSell } from '../services/kalshi/kalshi-trading.service';
-import { getKalshiPositions } from '../services/kalshi/kalshi-positions.service';
+import { getKalshiPositions, getKalshiPositionsFromDb, getKalshiCurrentPrice } from '../services/kalshi/kalshi-positions.service';
 import { dflowMetadataService } from '../services/dflow/dflow-metadata.service';
-import { redeemKalshiPosition, getRedeemablePositions } from '../services/kalshi/kalshi-redemption.service';
+import { redeemKalshiPositionByMint, redeemKalshiPosition, getRedeemablePositions } from '../services/kalshi/kalshi-redemption.service';
 import { getUserByPrivyId } from '../services/privy/user.service';
+import { getSolanaAddressForKalshiUser } from '../services/privy/kalshi-user.service';
 import { handleOnrampWebhook } from '../services/onramp/onramp-webhook.service';
 import { subscribeToKalshiUserBroadcast } from '../services/redis-cluster-broadcast.service';
 import { pool, getDatabaseConfig } from '../config/database';
@@ -41,21 +42,39 @@ router.get('/available-markets', async (_req: Request, res: Response) => {
 
 router.post('/buy', async (req: Request, res: Response) => {
   if (!KALSHI_ENABLED) return res.status(503).json({ success: false, error: 'Kalshi trading disabled' });
+  const traceId = `kalshi_buy_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  logger.info({
+    message: '[KALSHI_TRACE] Step 1: Frontend payload received',
+    traceId,
+    step: '1_frontend_payload',
+    direction: 'buy',
+    body: req.body,
+    usdcAmountUsd: req.body.usdcAmount ? (Number(req.body.usdcAmount) / 1e6).toFixed(6) : null,
+  });
   const { privyUserId, kalshiTicker, outcome, usdcAmount, slippageBps } = req.body;
   if (!privyUserId || !kalshiTicker || !outcome || !usdcAmount) {
     return res.status(400).json({ success: false, error: 'Missing required fields' });
   }
-  const result = await executeKalshiBuy({ privyUserId, kalshiTicker, outcome, usdcAmount, slippageBps });
+  const result = await executeKalshiBuy({ privyUserId, kalshiTicker, outcome, usdcAmount, slippageBps }, traceId);
   return res.status(result.success ? 200 : 400).json(result);
 });
 
 router.post('/sell', async (req: Request, res: Response) => {
   if (!KALSHI_ENABLED) return res.status(503).json({ success: false, error: 'Kalshi trading disabled' });
+  const traceId = `kalshi_sell_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  logger.info({
+    message: '[KALSHI_TRACE] Step 1: Frontend payload received',
+    traceId,
+    step: '1_frontend_payload',
+    direction: 'sell',
+    body: req.body,
+    tokenAmountShares: req.body.tokenAmount ? (Number(req.body.tokenAmount) / 1e6).toFixed(6) : null,
+  });
   const { privyUserId, kalshiTicker, outcome, tokenAmount, slippageBps } = req.body;
   if (!privyUserId || !kalshiTicker || !outcome || !tokenAmount) {
     return res.status(400).json({ success: false, error: 'Missing required fields' });
   }
-  const result = await executeKalshiSell({ privyUserId, kalshiTicker, outcome, tokenAmount, slippageBps });
+  const result = await executeKalshiSell({ privyUserId, kalshiTicker, outcome, tokenAmount, slippageBps }, traceId);
   return res.status(result.success ? 200 : 400).json(result);
 });
 
@@ -78,8 +97,7 @@ router.get('/history', async (req: Request, res: Response) => {
 router.get('/positions', async (req: Request, res: Response) => {
   const privyUserId = req.query.privyUserId as string;
   if (!privyUserId) return res.status(400).json({ success: false, error: 'Missing privyUserId' });
-  const user = await getUserByPrivyId(privyUserId);
-  const solanaAddress = (user as any)?.solanaWalletAddress;
+  const solanaAddress = await getSolanaAddressForKalshiUser(privyUserId);
   if (!solanaAddress) return res.json({ positions: [] });
   const positions = await getKalshiPositions(solanaAddress);
   return res.json({ positions });
@@ -87,7 +105,7 @@ router.get('/positions', async (req: Request, res: Response) => {
 
 /**
  * GET /api/kalshi-trading/portfolio
- * Portfolio summary for Kalshi (USDC balance + positions cost basis).
+ * Portfolio summary for Kalshi (USDC balance + total market value of positions).
  * Use when platform toggle is kalshi - display instead of Polymarket portfolio.
  */
 router.get('/portfolio', async (req: Request, res: Response) => {
@@ -95,7 +113,7 @@ router.get('/portfolio', async (req: Request, res: Response) => {
   if (!privyUserId) return res.status(400).json({ success: false, error: 'Missing privyUserId' });
   const user = await getUserByPrivyId(privyUserId);
   let balance = parseFloat(user?.kalshiUsdcBalance ?? '0') || 0;
-  const solanaAddress = (user as any)?.solanaWalletAddress;
+  const solanaAddress = await getSolanaAddressForKalshiUser(privyUserId);
 
   if (solanaAddress) {
     const onChainBalance = await getSolanaUsdcBalance(solanaAddress);
@@ -106,14 +124,24 @@ router.get('/portfolio', async (req: Request, res: Response) => {
     balance = onChainNum;
   }
 
-  const positions = solanaAddress ? await getKalshiPositions(solanaAddress) : [];
-  const positionsCost = positions.reduce((sum, p) => sum + parseFloat(p.totalCostUsdc || '0'), 0);
-  const portfolio = balance + positionsCost;
+  // Use DB positions (instant) instead of on-chain RPC (slow)
+  const positions = await getKalshiPositionsFromDb(privyUserId);
+  // Total market value of positions: shares × current price (cents/100). Redeemable = $1/share.
+  const positionsValuePromises = positions.map(async (p) => {
+    const shares = parseFloat(p.tokenBalanceHuman || '0') || 0;
+    if (shares <= 0) return 0;
+    if (p.isRedeemable) return shares; // Winning outcome = $1 per share
+    const priceCents = await getKalshiCurrentPrice(p.kalshiTicker, p.outcome);
+    if (priceCents == null) return 0;
+    return shares * (priceCents / 100);
+  });
+  const positionsValues = await Promise.all(positionsValuePromises);
+  const positionsValue = positionsValues.reduce((sum, v) => sum + v, 0);
 
   return res.json({
     success: true,
-    portfolio,
     balance: String(balance),
+    positionsValue,
     positions,
     totalPositions: positions.length,
   });
@@ -127,17 +155,19 @@ router.get('/positions/redeemable', async (req: Request, res: Response) => {
 });
 
 router.post('/redeem', async (req: Request, res: Response) => {
+  if (!KALSHI_ENABLED) return res.status(503).json({ success: false, error: 'Kalshi trading disabled' });
   const { privyUserId, outcomeMint } = req.body;
   if (!privyUserId || !outcomeMint) return res.status(400).json({ success: false, error: 'Missing privyUserId or outcomeMint' });
-  const result = await redeemKalshiPosition(privyUserId, outcomeMint);
+  const result = await redeemKalshiPositionByMint(privyUserId, outcomeMint);
   return res.status(result.success ? 200 : 400).json(result);
 });
 
 router.post('/redeem/all', async (req: Request, res: Response) => {
+  if (!KALSHI_ENABLED) return res.status(503).json({ success: false, error: 'Kalshi trading disabled' });
   const { privyUserId } = req.body;
   if (!privyUserId) return res.status(400).json({ success: false, error: 'Missing privyUserId' });
   const positions = await getRedeemablePositions(privyUserId);
-  const results = await Promise.all(positions.map((p: any) => redeemKalshiPosition(privyUserId, p.outcome_mint)));
+  const results = await Promise.all(positions.map((p: any) => redeemKalshiPositionByMint(privyUserId, p.outcome_mint)));
   const successCount = results.filter((r) => r.success).length;
   return res.json({ success: true, redeemed: successCount, total: positions.length });
 });
@@ -148,7 +178,7 @@ router.get('/balance', async (req: Request, res: Response) => {
   const user = await getUserByPrivyId(privyUserId);
 
   // Always use on-chain balance as source of truth (Alchemy Solana webhooks are unreliable)
-  const solanaAddress = (user as any)?.solanaWalletAddress;
+  const solanaAddress = await getSolanaAddressForKalshiUser(privyUserId);
   if (solanaAddress) {
     const onChainBalance = await getSolanaUsdcBalance(solanaAddress);
     const dbBalance = parseFloat(user?.kalshiUsdcBalance ?? '0') || 0;
@@ -174,7 +204,8 @@ router.get('/balance/stream', async (req: Request, res: Response) => {
   try {
     const user = await getUserByPrivyId(privyUserId);
     if (!user) return res.status(404).json({ success: false, error: 'User not found' });
-    if (!(user as any).solanaWalletAddress) return res.status(400).json({ success: false, error: 'No Solana wallet' });
+    const solanaAddress = await getSolanaAddressForKalshiUser(privyUserId);
+    if (!solanaAddress) return res.status(400).json({ success: false, error: 'No Solana wallet' });
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');

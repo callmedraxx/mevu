@@ -10,7 +10,25 @@ import { ClobOrderBookUpdate, ClobWebSocketMessage } from './polymarket.types';
 const CLOB_WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
 /** Interval (ms) for client-side ping to prevent idle timeout (1006) */
-const PING_INTERVAL_MS = 25_000;
+const PING_INTERVAL_MS = 10_000;
+
+/**
+ * Polymarket enforces an undocumented limit of ~500 instruments per WebSocket connection.
+ * Beyond 500, initial snapshots are skipped and updates become unreliable.
+ * We shard subscriptions across multiple connections, each handling ≤ MAX_ASSETS_PER_CONNECTION.
+ */
+const MAX_ASSETS_PER_CONNECTION = 500;
+
+/** Represents one WebSocket connection and its assigned assets */
+interface WsShard {
+  ws: WebSocket;
+  assets: string[];
+  pingInterval: NodeJS.Timeout | null;
+  reconnectTimer: NodeJS.Timeout | null;
+  isConnected: boolean;
+  destroyed: boolean;
+  shardIndex: number;
+}
 
 export class ClobWebSocketService {
   private ws: WebSocket | null = null;
@@ -28,6 +46,8 @@ export class ClobWebSocketService {
   private orderBookUpdateCallbacks: Set<(updates: ClobOrderBookUpdate[]) => void> = new Set();
   private pendingSubscriptions: string[] = []; // Store subscriptions to re-apply after reconnect
   private addAssetsTimer: NodeJS.Timeout | null = null;
+  /** Additional WebSocket connections for assets beyond the first 500 */
+  private shards: WsShard[] = [];
 
   /**
    * Connect to the CLOB WebSocket endpoint
@@ -128,11 +148,10 @@ export class ClobWebSocketService {
     });
 
     this.ws.on('error', (error: Error) => {
-      // logger.error({
-//         message: 'CLOB WebSocket error',
-//         error: error.message,
-//         stack: error.stack,
-//       });
+      logger.error({
+        message: 'CLOB WebSocket error',
+        error: error.message,
+      });
     });
 
     this.ws.on('close', (code: number, reason: Buffer) => {
@@ -412,7 +431,7 @@ export class ClobWebSocketService {
     const merged = [...this.pendingSubscriptions, ...assetIds.filter((id) => !existing.has(id))];
     this.pendingSubscriptions = merged;
 
-    // Check if WebSocket is actually ready to send
+    // Check if primary WebSocket is actually ready to send
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       logger.warn({
         message: 'CLOB WebSocket not ready for subscription, will retry on reconnect',
@@ -423,19 +442,249 @@ export class ClobWebSocketService {
       return;
     }
 
-    // Send full merged list so pre-connect crypto tokens are included
-    const subscriptionMessage = {
-      assets_ids: this.pendingSubscriptions,
-      type: 'market',
-    };
-
     logger.info({
       message: 'Subscribing to CLOB assets',
       count: this.pendingSubscriptions.length,
       firstAsset: this.pendingSubscriptions[0]?.substring(0, 20) + '...',
     });
 
-    this.send(subscriptionMessage);
+    this.distributeSubscriptions(this.pendingSubscriptions);
+  }
+
+  /**
+   * Distribute assets across the primary WS and shard connections.
+   * Polymarket limits each connection to ~500 instruments.
+   * The primary `this.ws` gets the first chunk; additional chunks get their own connections.
+   */
+  private async distributeSubscriptions(allAssets: string[]): Promise<void> {
+    // Close existing shards before redistributing
+    this.closeShards();
+
+    const chunks: string[][] = [];
+    for (let i = 0; i < allAssets.length; i += MAX_ASSETS_PER_CONNECTION) {
+      chunks.push(allAssets.slice(i, i + MAX_ASSETS_PER_CONNECTION));
+    }
+
+    logger.info({
+      message: 'Distributing CLOB subscriptions across connections',
+      totalAssets: allAssets.length,
+      connectionCount: chunks.length,
+      assetsPerConnection: MAX_ASSETS_PER_CONNECTION,
+    });
+
+    // First chunk goes to the primary connection
+    if (chunks.length > 0 && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.send({
+        assets_ids: chunks[0],
+        type: 'market',
+      });
+      logger.info({
+        message: 'CLOB primary connection subscribed',
+        assets: chunks[0].length,
+      });
+    }
+
+    // Remaining chunks each get a new shard connection
+    for (let i = 1; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      try {
+        const shard = await this.createShard(chunk, i);
+        this.shards.push(shard);
+      } catch (err) {
+        logger.error({
+          message: `Failed to create CLOB shard connection ${i}`,
+          error: err instanceof Error ? err.message : String(err),
+          assets: chunk.length,
+        });
+      }
+    }
+
+    logger.info({
+      message: 'CLOB subscription distribution complete',
+      totalAssets: allAssets.length,
+      primaryAssets: chunks[0]?.length ?? 0,
+      shardCount: this.shards.length,
+    });
+  }
+
+  private static readonly SHARD_MAX_RECONNECT = 5;
+  private static readonly SHARD_RECONNECT_BASE_MS = 5000;
+
+  /**
+   * Create a shard WebSocket connection for a chunk of assets.
+   * Reuses the same message handling pipeline as the primary connection.
+   * Automatically reconnects on abnormal closure (up to SHARD_MAX_RECONNECT times).
+   */
+  private createShard(assets: string[], shardIndex: number): Promise<WsShard> {
+    const shard: WsShard = {
+      ws: null as any,
+      assets,
+      pingInterval: null,
+      reconnectTimer: null,
+      isConnected: false,
+      destroyed: false,
+      shardIndex,
+    };
+
+    const connectShard = (attempt: number = 0): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        if (shard.destroyed) return resolve();
+
+        const ws = new WebSocket(CLOB_WS_URL, {
+          headers: {
+            'Origin': 'https://polymarket.com',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+          },
+        });
+
+        shard.ws = ws;
+
+        const timeout = setTimeout(() => {
+          ws.removeAllListeners();
+          try { ws.close(); } catch {}
+          reject(new Error(`Shard ${shardIndex} connection timeout`));
+        }, 15000);
+
+        ws.once('open', () => {
+          clearTimeout(timeout);
+          shard.isConnected = true;
+
+          // Start ping keepalive
+          if (shard.pingInterval) clearInterval(shard.pingInterval);
+          shard.pingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) ws.ping();
+          }, PING_INTERVAL_MS);
+
+          // Subscribe to this shard's assets
+          ws.send(JSON.stringify({ assets_ids: assets, type: 'market' }));
+
+          logger.info({
+            message: `CLOB shard ${shardIndex} connected and subscribed`,
+            assets: assets.length,
+            attempt,
+          });
+
+          resolve();
+        });
+
+        ws.on('message', (data: WebSocket.Data) => {
+          try {
+            // Handle text PING on the shard's own WS (parseMessage would
+            // incorrectly respond via this.ws — the primary connection)
+            const raw = Buffer.isBuffer(data) ? data.toString('utf8') : typeof data === 'string' ? data : String(data);
+            if (raw === 'PING' || raw.trim() === 'PING') {
+              if (ws.readyState === WebSocket.OPEN) ws.send('PONG');
+              return;
+            }
+            const message = this.parseMessage(data);
+            this.handleMessage(message);
+          } catch {}
+        });
+
+        ws.on('error', (error: Error) => {
+          logger.error({ message: `CLOB shard ${shardIndex} error`, error: error.message });
+        });
+
+        ws.on('close', (code: number) => {
+          shard.isConnected = false;
+          if (shard.pingInterval) { clearInterval(shard.pingInterval); shard.pingInterval = null; }
+
+          if (code === 1000 || shard.destroyed) return;
+
+          logger.warn({ message: `CLOB shard ${shardIndex} closed, will reconnect`, code, assets: assets.length });
+
+          // Schedule reconnect with exponential backoff
+          const nextAttempt = attempt + 1;
+          if (nextAttempt <= ClobWebSocketService.SHARD_MAX_RECONNECT) {
+            const delay = ClobWebSocketService.SHARD_RECONNECT_BASE_MS * Math.pow(2, Math.min(nextAttempt - 1, 4));
+            logger.info({
+              message: `Scheduling CLOB shard ${shardIndex} reconnect`,
+              attempt: nextAttempt,
+              delayMs: delay,
+            });
+            shard.reconnectTimer = setTimeout(() => {
+              shard.reconnectTimer = null;
+              if (!shard.destroyed) {
+                connectShard(nextAttempt).catch((err) => {
+                  logger.error({ message: `CLOB shard ${shardIndex} reconnect failed`, error: err instanceof Error ? err.message : String(err) });
+                });
+              }
+            }, delay);
+          } else {
+            logger.error({ message: `CLOB shard ${shardIndex} max reconnect attempts reached`, attempts: nextAttempt });
+          }
+        });
+
+        ws.on('ping', (data: Buffer) => {
+          if (ws.readyState === WebSocket.OPEN) ws.pong(data);
+        });
+
+        ws.once('error', (error: Error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+    };
+
+    return connectShard(0).then(() => shard);
+  }
+
+  /** Close all shard connections and clear the list */
+  private closeShards(): void {
+    for (const shard of this.shards) {
+      shard.destroyed = true;
+      if (shard.pingInterval) { clearInterval(shard.pingInterval); shard.pingInterval = null; }
+      if (shard.reconnectTimer) { clearTimeout(shard.reconnectTimer); shard.reconnectTimer = null; }
+      if (shard.ws) {
+        shard.ws.removeAllListeners();
+        try { shard.ws.close(1000, 'Shard closing'); } catch {}
+      }
+    }
+    if (this.shards.length > 0) {
+      logger.info({ message: 'Closed CLOB shard connections', count: this.shards.length });
+    }
+    this.shards = [];
+  }
+
+  /**
+   * Replace the full subscription list (prunes stale tokens from ended games).
+   * Called during full game refreshes where we have the authoritative list of active assets.
+   * Triggers a reconnect if the list changed.
+   */
+  replaceSubscriptions(assetIds: string[]): void {
+    if (!assetIds || assetIds.length === 0) return;
+
+    const oldSize = this.pendingSubscriptions.length;
+    const oldSet = new Set(this.pendingSubscriptions);
+    const newSet = new Set(assetIds);
+
+    // Check if the list actually changed
+    const added = assetIds.filter(id => !oldSet.has(id));
+    const removed = [...oldSet].filter(id => !newSet.has(id));
+
+    if (added.length === 0 && removed.length === 0) return; // No change
+
+    this.pendingSubscriptions = assetIds;
+
+    logger.info({
+      message: 'CLOB subscriptions replaced (pruned stale tokens)',
+      oldCount: oldSize,
+      newCount: assetIds.length,
+      added: added.length,
+      removed: removed.length,
+    });
+
+    // Reconnect to apply new subscription list
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      if (this.addAssetsTimer) {
+        clearTimeout(this.addAssetsTimer);
+        this.addAssetsTimer = null;
+      }
+      this.addAssetsTimer = setTimeout(() => {
+        this.addAssetsTimer = null;
+        this.forceReconnect();
+      }, 200);
+    }
   }
 
   /**
@@ -466,6 +715,7 @@ export class ClobWebSocketService {
    */
   disconnect(): void {
     this.clearPingInterval();
+    this.closeShards();
     if (this.ws) {
       this.ws.close(1000, 'Client disconnect');
       this.ws = null;
@@ -630,85 +880,64 @@ export class ClobWebSocketService {
   }
 
   /**
-   * Add assets to the CLOB subscription.
-   * Merges into pendingSubscriptions, then forces a CLOB WS reconnect.
+   * Add assets to the pending subscription list (passive merge, no reconnect).
    *
-   * Polymarket's CLOB WS locks subscriptions after the initial message —
-   * subsequent subscription messages on the same connection are ignored.
-   * The only reliable way to add new tokens is to reconnect and re-subscribe
-   * with the full list. Uses a 200ms debounce to batch rapid calls.
+   * The CLOB WS subscription is managed centrally by subscribeToAllGames() which
+   * calls replaceSubscriptions() with the authoritative list. This method only
+   * merges tokens into pendingSubscriptions so they survive the next reconnect.
+   * New tokens will be picked up on the next scheduled refresh cycle.
    */
   addAssets(assetIds: string[]): void {
     if (!assetIds || assetIds.length === 0) return;
 
-    // Merge into pendingSubscriptions (for reconnect recovery)
     const existing = new Set(this.pendingSubscriptions);
     const newAssets = assetIds.filter((id) => !existing.has(id));
-    if (newAssets.length === 0) return; // Already subscribed to all
+    if (newAssets.length === 0) return;
 
     this.pendingSubscriptions = [...this.pendingSubscriptions, ...newAssets];
-
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      logger.warn({
-        message: 'CLOB WebSocket not ready for addAssets, will subscribe on reconnect',
-        newAssetCount: newAssets.length,
-      });
-      return;
-    }
-
-    // Debounce: batch rapid addAssets calls (e.g. orderbook + price service both call for same market)
-    if (this.addAssetsTimer) return; // Already scheduled
-    this.addAssetsTimer = setTimeout(() => {
-      this.addAssetsTimer = null;
-      this.forceReconnect();
-    }, 200);
   }
 
   /**
    * Force a reconnect to re-subscribe with updated pendingSubscriptions.
    *
-   * Uses a **hot-swap** strategy to avoid disrupting existing streams:
-   * 1. Keep old WS alive and forwarding data via its 'message' handler.
-   * 2. Open a NEW connection in parallel.
-   * 3. Subscribe on the new connection with the full token list.
-   * 4. Swap this.ws to the new connection.
-   * 5. Close the old connection.
-   *
-   * During the overlap window both connections fire callbacks — downstream
-   * services deduplicate (lastPublishedPrices / idempotent orderbook events)
-   * so this is harmless.
+   * Uses a **close-then-open** strategy to prevent duplicate connections to
+   * Polymarket (which can cause the server to drop the newer connection with 1006).
+   * The brief sub-second gap is acceptable — downstream services dedup and
+   * the next price event re-syncs state.
    */
   private async forceReconnect(): Promise<void> {
     logger.info({
-      message: 'CLOB WS: hot-swap reconnect for updated subscriptions',
+      message: 'CLOB WS: reconnect for updated subscriptions',
       totalAssets: this.pendingSubscriptions.length,
     });
 
-    // 1. Save old connection — it keeps forwarding data while we set up the new one.
+    // Close all shard connections (they'll be recreated after reconnect)
+    this.closeShards();
+
+    // 1. Close old connection first to avoid duplicate connections
     const oldWs = this.ws;
     const oldPingInterval = this.pingInterval;
 
-    // Detach lifecycle handlers from old WS so a spurious close doesn't trigger
-    // scheduleReconnect while we're swapping. The 'message' handler stays active
-    // so callbacks keep firing during the transition.
     if (oldWs) {
-      oldWs.removeAllListeners('close');
-      oldWs.removeAllListeners('error');
+      oldWs.removeAllListeners();
+      try { oldWs.close(1000, 'Reconnecting with updated subscriptions'); } catch {}
+    }
+    if (oldPingInterval) {
+      clearInterval(oldPingInterval);
     }
 
-    // 2. Reset instance state so connect() creates a fresh connection on this.ws.
+    // 2. Reset instance state so connect() creates a fresh connection
     this.ws = null;
     this.pingInterval = null;
     this.isConnected = false;
     this.isConnecting = false;
     this.reconnectAttempts = 0;
 
-    let swapSucceeded = false;
     try {
-      // 3. Connect creates a new this.ws with full event handlers.
+      // 3. Open new connection
       await this.connect();
 
-      // 4. Subscribe on the new connection with the complete token list.
+      // 4. Subscribe with the complete token list
       if (this.pendingSubscriptions.length > 0) {
         await new Promise(resolve => setTimeout(resolve, 300));
         logger.info({
@@ -718,28 +947,15 @@ export class ClobWebSocketService {
         this.subscribeToAssets(this.pendingSubscriptions);
       }
 
-      swapSucceeded = true;
       logger.info({
-        message: 'CLOB WS: hot-swap complete',
+        message: 'CLOB WS: reconnect complete',
         totalAssets: this.pendingSubscriptions.length,
       });
     } catch (error) {
       logger.error({
-        message: 'CLOB WS: hot-swap failed, scheduling retry',
+        message: 'CLOB WS: reconnect failed, scheduling retry',
         error: error instanceof Error ? error.message : String(error),
       });
-    }
-
-    // 5. Clean up old connection (data has been flowing through it until this point).
-    if (oldWs) {
-      oldWs.removeAllListeners();
-      try { oldWs.close(4000, 'Hot swap complete'); } catch {}
-    }
-    if (oldPingInterval) {
-      clearInterval(oldPingInterval);
-    }
-
-    if (!swapSucceeded) {
       this.scheduleReconnect();
     }
   }

@@ -88,7 +88,7 @@ export class KalshiTickerMapper {
           });
         });
         
-        logger.info({ message: 'Kalshi ticker mapper Redis connected' });
+        //logger.info({ message: 'Kalshi ticker mapper Redis connected' });
       } catch (error) {
         logger.debug({
           message: 'Kalshi ticker mapper Redis connection failed (will use local cache only)',
@@ -116,11 +116,11 @@ export class KalshiTickerMapper {
     // Start periodic refresh as fallback safety net
     this.startPeriodicRefresh();
 
-    logger.info({
-      message: 'Kalshi ticker mapper initialized',
-      cacheSize: this.tickerToMapping.size,
-      refreshIntervalMinutes: REFRESH_INTERVAL_MS / 60_000,
-    });
+    // logger.info({
+    //   message: 'Kalshi ticker mapper initialized',
+    //   cacheSize: this.tickerToMapping.size,
+    //   refreshIntervalMinutes: REFRESH_INTERVAL_MS / 60_000,
+    // });
   }
 
   /**
@@ -239,12 +239,12 @@ export class KalshiTickerMapper {
         }
       }
 
-      logger.info({
-        message: 'Kalshi ticker mapper cache refreshed',
-        tickerCount: this.tickerToMapping.size,
-        gameCount: this.gameIdToTickers.size,
-        durationMs: Date.now() - startTime,
-      });
+      // logger.info({
+      //   message: 'Kalshi ticker mapper cache refreshed',
+      //   tickerCount: this.tickerToMapping.size,
+      //   gameCount: this.gameIdToTickers.size,
+      //   durationMs: Date.now() - startTime,
+      // });
     } catch (error) {
       logger.error({
         message: 'Kalshi ticker mapper cache refresh failed',
@@ -355,11 +355,11 @@ export class KalshiTickerMapper {
       this.removeMapping(ticker);
     }
 
-    logger.debug({
-      message: 'Kalshi ticker mapper LRU eviction',
-      evictedCount: sorted.length,
-      remainingSize: this.tickerToMapping.size,
-    });
+    // logger.debug({
+    //   message: 'Kalshi ticker mapper LRU eviction',
+    //   evictedCount: sorted.length,
+    //   remainingSize: this.tickerToMapping.size,
+    // });
   }
 
   /**

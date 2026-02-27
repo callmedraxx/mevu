@@ -5,13 +5,17 @@
 
 import { fetchAndStorePositions } from '../positions/positions.service';
 import {
-  getKalshiPositions,
+  getKalshiPositionsFromDb,
   getKalshiAvgEntryFromTrades,
   getKalshiCurrentPrice,
+  getGameSlugsForKalshiTickers,
+  syncKalshiPositionsOnChain,
 } from '../kalshi/kalshi-positions.service';
 import { getUserByPrivyId } from '../privy/user.service';
+import { getSolanaAddressForKalshiUser } from '../privy/kalshi-user.service';
 import { UserPosition } from '../positions/positions.types';
 import { PositionsQueryParams } from '../positions/positions.types';
+import { logger } from '../../config/logger';
 
 export type UnifiedPositionPlatform = 'polymarket' | 'kalshi';
 
@@ -41,6 +45,8 @@ export interface UnifiedPosition {
   /** Kalshi-only: outcome YES | NO for sell */
   kalshiOutcome?: string;
   eventSlug?: string;
+  /** Polymarket game slug for navigation (Kalshi: when ticker is matched to live_game) */
+  gameSlug?: string;
   privyUserId?: string;
   proxyWalletAddress?: string;
 }
@@ -58,13 +64,24 @@ export async function getUnifiedPositions(
   if (!user) return [];
 
   const wantsPoly = platform === 'all' || platform === 'polymarket';
-  const wantsKalshi = (platform === 'all' || platform === 'kalshi') && !!(user as any).solanaWalletAddress;
-  const solanaAddress = (user as any).solanaWalletAddress;
+  const wantsKalshiData = platform === 'all' || platform === 'kalshi';
+  // Use getSolanaAddressForKalshiUser — has fallback to kalshi_trades_history when users.solana_wallet_address is null
+  const solanaAddress = wantsKalshiData
+    ? await getSolanaAddressForKalshiUser(privyUserId)
+    : null;
+  const wantsKalshi = wantsKalshiData;
 
   const [polyPositions, kalshiPositions] = await Promise.all([
     wantsPoly ? fetchAndStorePositions(privyUserId, positionsParams).catch(() => [] as UserPosition[]) : Promise.resolve([] as UserPosition[]),
-    wantsKalshi ? getKalshiPositions(solanaAddress) : Promise.resolve([] as Awaited<ReturnType<typeof getKalshiPositions>>),
+    wantsKalshi ? getKalshiPositionsFromDb(privyUserId) : Promise.resolve([] as Awaited<ReturnType<typeof getKalshiPositionsFromDb>>),
   ]);
+
+  // Background on-chain sync for Kalshi (don't block response)
+  if (wantsKalshi && solanaAddress) {
+    syncKalshiPositionsOnChain(privyUserId, solanaAddress).catch((err) =>
+      logger.warn({ message: 'Background Kalshi position sync failed', error: err instanceof Error ? err.message : String(err) })
+    );
+  }
 
   const results: UnifiedPosition[] = [];
 
@@ -92,6 +109,10 @@ export async function getUnifiedPositions(
     });
   }
 
+  // Batch lookup Kalshi ticker → Polymarket game slug (for navigation to GameDetailV2)
+  const kalshiTickers = kalshiPositions.map((p) => p.kalshiTicker);
+  const tickerToGameSlug = await getGameSlugsForKalshiTickers(kalshiTickers);
+
   for (const p of kalshiPositions) {
     const sizeNum = parseFloat(p.tokenBalanceHuman);
     const avgCents =
@@ -103,10 +124,13 @@ export async function getUnifiedPositions(
     const initialValue = avgCents != null ? (sizeNum * (avgCents / 100)).toFixed(2) : p.totalCostUsdc;
     const cashPnlNum = parseFloat(currentValue) - parseFloat(initialValue);
     const pnlPercent = parseFloat(initialValue) > 0 ? (cashPnlNum / parseFloat(initialValue)) * 100 : 0;
+    const gameSlug = tickerToGameSlug.get(p.kalshiTicker);
+    // Use game slug for slug/eventSlug when matched — enables correct GameDetailV2 navigation from profile
+    const navSlug = gameSlug ?? p.kalshiTicker;
     results.push({
       id: p.outcomeMint,
       title: p.marketTitle,
-      slug: p.kalshiTicker,
+      slug: navSlug,
       eventId: p.kalshiTicker,
       conditionId: '',
       asset: p.outcomeMint,
@@ -119,12 +143,14 @@ export async function getUnifiedPositions(
       currentValue,
       cashPnl: cashPnlNum.toFixed(2),
       percentPnl: pnlPercent.toFixed(1),
-      redeemable: false,
+      redeemable: p.isRedeemable ?? false,
       endDate: '',
       platform: 'kalshi',
       kalshiTicker: p.kalshiTicker,
       tokenAmount: p.tokenBalance,
       kalshiOutcome: p.outcome,
+      eventSlug: navSlug,
+      gameSlug: gameSlug ?? undefined,
     });
   }
 

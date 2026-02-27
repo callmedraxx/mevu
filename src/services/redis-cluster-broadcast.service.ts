@@ -32,6 +32,7 @@ const CRYPTO_CHAINLINK_SUBSCRIBE_CHANNEL = 'crypto:chainlink:subscribe';
 
 let redisPub: Redis | null = null;
 let redisSub: Redis | null = null;
+let redisHealthPingInterval: NodeJS.Timeout | null = null;
 const gamesCallbacks: Set<(msg: unknown) => void> = new Set();
 const activityCallbacks: Set<(msg: unknown) => void> = new Set();
 const kalshiPricesCallbacks: Set<(msg: unknown) => void> = new Set();
@@ -65,7 +66,8 @@ export function initRedisClusterBroadcast(): boolean {
       commandTimeout: 15000,
       enableOfflineQueue: true,
       retryStrategy: (times: number) => {
-        if (times > 10) return null;
+        // Allow more retries for Docker/network blips (was 10, ~30s total)
+        if (times > 30) return null;
         return Math.min(times * 500, 5000);
       },
       // Only reconnect on READONLY (cluster failover). TCP errors are handled by retryStrategy.
@@ -134,6 +136,35 @@ export function initRedisClusterBroadcast(): boolean {
     });
 
     redisSub.subscribe(GAMES_CHANNEL, ACTIVITY_CHANNEL, KALSHI_PRICES_CHANNEL, KALSHI_PRICES_ACTIVITY_CHANNEL, DEPOSITS_PROGRESS_CHANNEL, DEPOSITS_BALANCE_CHANNEL, PORTFOLIO_UPDATE_CHANNEL, KALSHI_USER_CHANNEL, CRYPTO_PRICES_CHANNEL, CRYPTO_CLOB_SUBSCRIBE_CHANNEL, CRYPTO_ORDERBOOK_CHANNEL, CRYPTO_ORDERBOOK_SUBSCRIBE_CHANNEL, CRYPTO_CHAINLINK_PRICES_CHANNEL, CRYPTO_CHAINLINK_SUBSCRIBE_CHANNEL);
+
+    // Health ping: detect dead TCP connections (Docker/network) that ioredis doesn't detect.
+    // On ping failure, disconnect to trigger retryStrategy reconnect.
+    const REDIS_HEALTH_PING_MS = 30000;
+    redisHealthPingInterval = setInterval(() => {
+      if (!redisSub && !redisPub) return;
+      const pingWithTimeout = (r: Redis, label: string) => {
+        if (!r || r.status === 'end') return;
+        Promise.race([
+          r.ping(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('ping timeout')), 5000)
+          ),
+        ])
+          .catch((err) => {
+            logger.warn({
+              message: 'Redis cluster broadcast: health ping failed, forcing reconnect',
+              label,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            try {
+              r.disconnect(true);
+            } catch {}
+          });
+      };
+      if (redisSub) pingWithTimeout(redisSub, 'sub');
+      if (redisPub) pingWithTimeout(redisPub, 'pub');
+    }, REDIS_HEALTH_PING_MS);
+
     return true;
   } catch (error) {
     logger.warn({
@@ -148,6 +179,11 @@ function publish(channel: string, payload: unknown): void {
   if (!redisPub) return;
   // Skip if Redis is not ready (connecting, reconnecting, etc.)
   if (redisPub.status !== 'ready') {
+    logger.warn({
+      message: 'Redis cluster broadcast: dropping publish (Redis not ready)',
+      channel,
+      status: redisPub.status,
+    });
     return;
   }
   redisPub.publish(channel, JSON.stringify(payload)).catch((err) =>
@@ -558,6 +594,10 @@ export function publishCryptoChainlinkSubscribe(message: CryptoChainlinkSubscrib
 }
 
 export async function shutdownRedisClusterBroadcast(): Promise<void> {
+  if (redisHealthPingInterval) {
+    clearInterval(redisHealthPingInterval);
+    redisHealthPingInterval = null;
+  }
   if (redisPub) {
     await redisPub.quit();
     redisPub = null;
@@ -581,3 +621,4 @@ export async function shutdownRedisClusterBroadcast(): Promise<void> {
   cryptoChainlinkPricesCallbacks.clear();
   cryptoChainlinkSubscribeCallbacks.clear();
 }
+

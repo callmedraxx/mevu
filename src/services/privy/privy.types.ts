@@ -66,7 +66,9 @@ export interface UserProfile {
   id: string;
   privyUserId: string;
   username: string;
+  /** EVM/Polygon embedded wallet (0x...) — Polymarket deposits, NOT Solana */
   embeddedWalletAddress: string;
+  /** Polymarket proxy/Safe (0x...) — CLOB positions, NOT embedded or Solana */
   proxyWalletAddress: string | null;
   sessionSignerEnabled: boolean;
   usdcApprovalEnabled: boolean;
@@ -74,9 +76,11 @@ export interface UserProfile {
   onboardingCompleted: boolean;
   createdAt: Date;
   updatedAt: Date;
-  /** Kalshi/Solana fields (migration 039) */
+  /** Kalshi/Solana fields — Solana chain only (base58), NOT proxy or embedded */
   tradingRegion?: TradingRegion | null;
+  /** Solana wallet (base58) for Kalshi/DFlow — distinct from proxy_wallet and embedded_wallet */
   solanaWalletAddress?: string | null;
+  /** Privy wallet ID for Solana wallet — used for signAndSendSolanaTransaction */
   solanaWalletId?: string | null;
   kalshiOnboardingCompleted?: boolean;
   kalshiUsdcBalance?: string;

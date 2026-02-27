@@ -155,12 +155,12 @@ export class CryptoLivePriceWebSocketService {
         timestamp: Date.now(),
       });
 
-      logger.info({
-        message: 'Crypto Live Price WS: client subscribed',
-        symbol: normalizedSymbol,
-        historySize: history.length,
-        clientCount: this.symbolClients.get(normalizedSymbol)?.size || 0,
-      });
+      // logger.info({
+      //   message: 'Crypto Live Price WS: client subscribed',
+      //   symbol: normalizedSymbol,
+      //   historySize: history.length,
+      //   clientCount: this.symbolClients.get(normalizedSymbol)?.size || 0,
+      // });
     } else if (msg.type === 'ping') {
       this.sendToClient(ws, { type: 'pong', timestamp: Date.now() });
     }
@@ -189,7 +189,7 @@ export class CryptoLivePriceWebSocketService {
   private setupRedisSubscription(): void {
     if (!initRedisClusterBroadcast()) return;
 
-    logger.info({ message: 'Crypto Live Price WS: subscribing to Redis chainlink prices channel' });
+    //logger.info({ message: 'Crypto Live Price WS: subscribing to Redis chainlink prices channel' });
 
     this.redisUnsubscribe = subscribeToCryptoChainlinkPrices(
       (msg: CryptoChainlinkPriceBroadcastMessage) => {
@@ -209,12 +209,12 @@ export class CryptoLivePriceWebSocketService {
         const clients = this.symbolClients.get(symbol);
         if (!clients || clients.size === 0) return;
 
-        logger.debug({
-          message: 'Chainlink price -> frontend',
-          symbol,
-          price: price.toFixed(2),
-          clientCount: clients.size,
-        });
+        // logger.debug({
+        //   message: 'Chainlink price -> frontend',
+        //   symbol,
+        //   price: price.toFixed(2),
+        //   clientCount: clients.size,
+        // });
 
         const data = JSON.stringify({
           type: 'price_update',

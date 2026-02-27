@@ -14,6 +14,8 @@ interface RequestResult {
   workerId?: string;
   requestId: number;
   endpoint: string;
+  /** Server-reported fetch time (X-Fetch-Ms) - time spent in getFrontendGamesFromDatabase */
+  fetchMs?: number;
 }
 
 interface EndpointSummary {
@@ -30,6 +32,8 @@ interface EndpointSummary {
   p99: number;
   statusCounts: Record<string, number>;
   workerCounts: Record<string, number>;
+  /** Server fetch times (when X-Fetch-Ms present) */
+  fetchMsStats?: { min: number; avg: number; max: number; sampleCount: number };
 }
 
 const BASE_URL = process.env.BASE_URL || 'https://dev.api.mevu.com';
@@ -37,6 +41,8 @@ const ORIGIN = process.env.ORIGIN || 'https://app.mevu.com';
 const REQUESTS_PER_ENDPOINT = Number(process.env.REQUESTS || '500');
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || '30000');
 const CONCURRENCY = Number(process.env.CONCURRENCY || '50');
+/** When set (e.g. SINGLE_ENDPOINT=crypto-markets), only run that endpoint */
+const SINGLE_ENDPOINT = process.env.SINGLE_ENDPOINT?.trim() || '';
 
 // Test user/game identifiers
 const PRIVY_ID = 'did:privy:cmj921f4201dql40c3nubss93';
@@ -48,7 +54,19 @@ const CLOB_TOKEN_IDS = [
   '19410395034837125469891059433041444992924948482142738591910808764491644279863',
 ];
 
+const CRYPTO_MARKET_SLUG = 'what-price-will-bitcoin-hit-in-february-2026';
+
 const ENDPOINTS: EndpointConfig[] = [
+  {
+    name: 'crypto-markets',
+    url: `${BASE_URL}/api/crypto-markets?page=1&limit=50`,
+    requestCount: REQUESTS_PER_ENDPOINT,
+  },
+  {
+    name: 'crypto-markets-detail',
+    url: `${BASE_URL}/api/crypto-markets/detail/${CRYPTO_MARKET_SLUG}`,
+    requestCount: REQUESTS_PER_ENDPOINT,
+  },
   {
     name: 'games/frontend',
     url: `${BASE_URL}/api/games/frontend`,
@@ -101,20 +119,35 @@ const ENDPOINTS: EndpointConfig[] = [
   },
 ];
 
+const ACTIVE_ENDPOINTS = SINGLE_ENDPOINT
+  ? ENDPOINTS.filter((e) => e.name === SINGLE_ENDPOINT)
+  : ENDPOINTS;
+
+if (ACTIVE_ENDPOINTS.length === 0) {
+  console.error(`No endpoints match SINGLE_ENDPOINT="${SINGLE_ENDPOINT}". Valid names: ${ENDPOINTS.map((e) => e.name).join(', ')}`);
+  process.exit(1);
+}
+
+/** Endpoints where we want identical URLs to test request coalescing (no cache busting) */
+const COALESCE_ENDPOINTS = new Set(['games/frontend', 'crypto-markets']);
+
 async function runSingleRequest(
   endpoint: EndpointConfig,
   index: number,
 ): Promise<RequestResult> {
   const start = Date.now();
   
-  // Add unique query param for cache busting
-  const uniqueUrl = `${endpoint.url}${endpoint.url.includes('?') ? '&' : '?'}_t=${Date.now()}_${index}_${Math.random().toString(36).substring(7)}`;
+  // Skip cache busting for coalescing endpoints - identical URLs let server coalesce concurrent requests
+  const url = COALESCE_ENDPOINTS.has(endpoint.name)
+    ? endpoint.url
+    : `${endpoint.url}${endpoint.url.includes('?') ? '&' : '?'}_t=${Date.now()}_${index}_${Math.random().toString(36).substring(7)}`;
   
   try {
-    const res = await axios.get(uniqueUrl, {
+    const res = await axios.get(url, {
       timeout: TIMEOUT_MS,
       validateStatus: () => true,
       headers: {
+        'Accept': 'application/json',
         'Origin': ORIGIN,
         'Referer': `${ORIGIN}/`,
         'User-Agent': `LoadTest/1.0 ${endpoint.name}/${index}`,
@@ -129,6 +162,8 @@ async function runSingleRequest(
                      res.headers['x-served-by'] || 
                      res.headers['x-instance-id'] ||
                      undefined;
+    const fetchMsHeader = res.headers['x-fetch-ms'];
+    const fetchMs = fetchMsHeader ? parseInt(String(fetchMsHeader), 10) : undefined;
 
     if (!ok) {
       console.error(`[${endpoint.name}][${index}] HTTP ${res.status} in ${durationMs}ms`);
@@ -141,6 +176,7 @@ async function runSingleRequest(
       workerId,
       requestId: index,
       endpoint: endpoint.name,
+      fetchMs,
     };
   } catch (err: unknown) {
     const durationMs = Date.now() - start;
@@ -198,6 +234,16 @@ function calculateSummary(name: string, results: RequestResult[]): EndpointSumma
     }
   }
 
+  const fetchMsValues = results.map(r => r.fetchMs).filter((v): v is number => typeof v === 'number');
+  const fetchMsStats = fetchMsValues.length > 0
+    ? {
+        min: Math.min(...fetchMsValues),
+        avg: fetchMsValues.reduce((a, b) => a + b, 0) / fetchMsValues.length,
+        max: Math.max(...fetchMsValues),
+        sampleCount: fetchMsValues.length,
+      }
+    : undefined;
+
   return {
     name,
     totalRequests: results.length,
@@ -212,6 +258,7 @@ function calculateSummary(name: string, results: RequestResult[]): EndpointSumma
     p99,
     statusCounts,
     workerCounts,
+    fetchMsStats,
   };
 }
 
@@ -236,6 +283,10 @@ function printSummary(summary: EndpointSummary): void {
       .join(', ');
     console.log(`  Workers: ${workerStr}`);
   }
+  if (summary.fetchMsStats) {
+    const f = summary.fetchMsStats;
+    console.log(`  Server fetch (X-Fetch-Ms): min=${f.min}ms, avg=${f.avg.toFixed(0)}ms, max=${f.max}ms (n=${f.sampleCount})`);
+  }
 }
 
 async function runAllEndpointsSimultaneously(): Promise<void> {
@@ -247,9 +298,10 @@ async function runAllEndpointsSimultaneously(): Promise<void> {
   console.log(`Requests per endpoint: ${REQUESTS_PER_ENDPOINT}`);
   console.log(`Concurrency per endpoint: ${CONCURRENCY}`);
   console.log(`Timeout: ${TIMEOUT_MS}ms`);
+  if (SINGLE_ENDPOINT) console.log(`Single endpoint mode: ${SINGLE_ENDPOINT}`);
   console.log('');
   console.log('Endpoints:');
-  for (const ep of ENDPOINTS) {
+  for (const ep of ACTIVE_ENDPOINTS) {
     console.log(`  - ${ep.name}: ${ep.url}`);
   }
   console.log('='.repeat(70));
@@ -258,7 +310,7 @@ async function runAllEndpointsSimultaneously(): Promise<void> {
   const startAll = Date.now();
   
   // Create promises for all endpoints running in parallel
-  const endpointPromises = ENDPOINTS.map(async (endpoint) => {
+  const endpointPromises = ACTIVE_ENDPOINTS.map(async (endpoint) => {
     const results: RequestResult[] = [];
     const numBatches = Math.ceil(endpoint.requestCount / CONCURRENCY);
     
